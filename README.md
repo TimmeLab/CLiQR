@@ -6,13 +6,20 @@ This repository contains the Python code for running our capacitive lickometry s
 
 ## Installation
 
-I haven't spent as much time making this easily installable as I'd like to yet, sorry! 
-
 First, if you're on Windows (which is what we are using to make things easy on undergrads/grad students
 who need to run the system), you'll have to install drivers for the FT232H boards. The recommended 
 method is Zadig, and we roughly followed the steps outlined here: https://learn.adafruit.com/circuitpython-on-any-computer-with-ft232h/windows
 
-Next, I manage my Python environments with pyenv-virtualenv on the command line: https://github.com/pyenv/pyenv-virtualenv
+The easiest installation option is to use miniforge: https://github.com/conda-forge/miniforge/releases
+
+After installation on Windows, use the Miniforge Prompt start menu entry and navigate to the directory where you've cloned this repo. On Mac/Linux it should automatically add conda to your path, and you can use your normal terminal. Then enter the commands:
+```
+conda env create --file environment.yml
+conda activate cliqr
+jupyter-lab
+```
+
+Alternatively (on Unix-based systems), I manage my Python environments with pyenv-virtualenv on the command line: https://github.com/pyenv/pyenv-virtualenv
 
 To install the environment, I run:
 ```
