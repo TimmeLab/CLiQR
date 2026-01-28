@@ -8,7 +8,7 @@ This repository contains the Python code for running our capacitive lickometry s
 
 First, if you're on Windows (which is what we are using to make things easy on undergrads/grad students
 who need to run the system), you'll have to install drivers for the FT232H boards. The recommended 
-method is Zadig, and we roughly followed the steps outlined here: https://learn.adafruit.com/circuitpython-on-any-computer-with-ft232h/windows
+method is Zadig (https://zadig.akeo.ie/), and we roughly followed the steps outlined here: https://learn.adafruit.com/circuitpython-on-any-computer-with-ft232h/windows
 
 Clone this repository (or download the .zip and extract), then run the following commands from inside the new directory.
 
