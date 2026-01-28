@@ -10,6 +10,8 @@ First, if you're on Windows (which is what we are using to make things easy on u
 who need to run the system), you'll have to install drivers for the FT232H boards. The recommended 
 method is Zadig, and we roughly followed the steps outlined here: https://learn.adafruit.com/circuitpython-on-any-computer-with-ft232h/windows
 
+Clone this repository (or download the .zip and extract), then run the following commands from inside the new directory.
+
 The easiest installation option is to use miniforge: https://github.com/conda-forge/miniforge/releases
 
 After installation on Windows, use the Miniforge Prompt start menu entry and navigate to the directory where you've cloned this repo. On Mac/Linux it should automatically add conda to your path, and you can use your normal terminal. Then enter the commands:
@@ -23,8 +25,8 @@ Alternatively (on Unix-based systems), I manage my Python environments with pyen
 
 To install the environment, I run:
 ```
-pyenv virtualenv 3.13 lickometry # creates a new environment called lickometry on Python 3.13
-pyenv activate lickometry
+pyenv virtualenv 3.13 cliqr # creates a new environment called lickometry on Python 3.13
+pyenv activate cliqr
 pip install -r requirements.txt
 ```
 Once the environment is configured and active, you'll need to set serial numbers for the FT232H boards
@@ -39,3 +41,10 @@ so you can either use the same serials or modify the notebook. To change the ser
 modify the serial_number_sensor_map dictionary to tell the system which cages go with which board.
 
 Then to run the system, just use the command jupyter-lab and navigate to the DataRecording.ipynb notebook.
+
+On Windows, a desktop shortcut can be created with the following link (to easily start the system for those not
+comfortable with the command line):
+```
+C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -c "cd ~/CLiQR; jupyter-lab"
+```
+The path "~/CLiQR" will need to match the directory where you cloned the repository.
