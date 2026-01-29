@@ -55,6 +55,10 @@
 if isequal(rawFiles,0)
     disp('No raw files selected.')
     return
+% If we have a return type of 'char', only one file was selected. Handle
+% that here
+elseif isequal(class(rawFiles), 'char')
+    rawFiles = {rawFiles};
 end
 nFiles = length(rawFiles);
 
@@ -77,6 +81,7 @@ nSensors = length(sensors);
 % Load the data
 data = cell([nFiles,nSensors,10]);
 f = waitbar(0,'Loading Raw Data');
+
 for iFile = 1:nFiles
     for iSensor = 1:nSensors
         for iBoard = 0:3
@@ -176,7 +181,7 @@ for iFile = 1:nFiles
         T = data{iFile,iSensor,9};
         
         % Because the capacitance values are discretized, we can focus only
-        % only the thresholds between the discrete values.
+        % on the thresholds between the discrete values.
         uniqVals = unique(cap);
         if length(uniqVals) > 3
             thresholds = mean([uniqVals(1:(end - 1))';uniqVals(2:end)']);

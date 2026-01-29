@@ -7,17 +7,9 @@
 a recording."""
 
 
-import os
-from io import StringIO
 import h5py
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import scipy.signal as scs
-import scipy.optimize as sco
-from scipy.stats import pearsonr
-import ipywidgets as widgets
 
 def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
 
@@ -107,10 +99,90 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
         except KeyError as e:
             print(f"Missing key in data_dict: {e}")
 
-    # Trying a mix of using raw trace and Hilbert envelope to find licks
+    basic_algorithm(data_by_animal, filtered_h5f, logfile)
+
+def basic_algorithm(data_by_animal, filtered_h5f, logfile):
+    """Basic algorithm based on thresholding"""
     for (animal, data) in data_by_animal.items():
-        # if animal in ['A1', 'A2', 'A3', 'A4', 'A5', 'A6']: continue
-        # if animal != 'A9': continue
+        fs = data['fs']
+        trace = data['cap_data']
+        times = data['time_data']
+
+        max_lick_time = 1. / 6. # in seconds
+
+        peak_info = {}
+
+        # Because the capacitance values are discretized, we can focus only
+        # on the thresholds between the discrete values
+        unique_vals = np.unique(trace)
+        if len(unique_vals) > 3: # We need at least 3 different values for the algorithm
+            # Get thresholds between each unique capacitance value
+            thresholds = np.hstack([
+                unique_vals[:-2].reshape(-1,1),
+                unique_vals[1:].reshape(-1,1),
+            ])
+            thresholds = np.mean(thresholds, axis=1)
+
+            n_peaks = np.zeros((len(thresholds),))
+            peak_bins = np.zeros((len(thresholds),1))
+
+            for i_thr in range(2, len(thresholds)+1):
+                # Identify peaks below threshold. 1 marks the time bin just before a
+                # peak starts (the last bin that isn't in the peak), -1 marks the time
+                # bin just before a peak ends (the last bin in the peak)
+                peak_trans = np.diff((trace < thresholds[i_thr]).astype(float))
+                # Add 1 so we are getting the actual start of the lick, not the time
+                # 1 sample before
+                peak_starts = np.argwhere(peak_trans == 1) + 1
+                peak_ends = np.argwhere(peak_trans == -1)
+
+                # Handle the first and last time point separately
+                if trace[0] < thresholds(i_thr):
+                    peak_starts = np.insert(peak_starts, 0, 1)
+                if trace[-1] < thresholds(i_thr):
+                    peak_ends = np.append(peak_starts, len(trace))
+                
+                # Remove peaks that are below threshold for too long (set by max_lick_time)
+                peak_t = times[peak_ends] - times[peak_starts]
+                good_peaks = (peak_t < max_lick_time)
+
+                # Only look at peaks that are at least two thresholds deep
+                i_peak = 1
+                while i_peak <= len(good_peaks):
+                    # If we don't cross the 2-deep threshold, remove that peak from the "good" list
+                    if np.count_nonzero(trace[peak_starts[i_peak]:peak_ends[i_peak]] < thresholds[i_thr - 2]) == 0:
+                        # Delete the entry at index i_peak (and since we don't increment the next in the list 
+                        # on our next while loop)
+                        good_peaks = np.delete(good_peaks, i_peak, 0)
+                    else:
+                        # It was a good peak still, increment i_peak
+                        i_peak += 1
+
+                # Number of total good peaks with this threshold
+                n_peaks[i_thr] = len(good_peaks)
+
+                # Record the peak time bins
+                temp_peak_times = np.zeros((len(good_peaks),))
+                for i_peak in range(len(good_peaks)):
+                    peak_profile = trace[peak_starts[good_peaks[i_peak]]:peak_ends[good_peaks[i_peak]]]
+                    temp_peak_times[i_peak] = np.argwhere(peak_profile == peak_profile.min())[0] + peak_starts[good_peaks[i_peak]] - 1
+                peak_bins[i_thr] = temp_peak_times
+
+            peak_info[animal] = {
+                    1: np.vstack([thresholds, n_peaks]),
+                    2: peak_bins,
+            }
+
+            i_thr = np.argwhere(peak_info[animal][1][1,:] == peak_info[animal][1][1,:].max())[0]
+            data[animal]['lick_times'] = times[animal][peak_info[animal][2][i_thr]]
+            data[animal]['num_licks'] = len(data[animal]['lick_times'])
+
+        save_filtered_data(data, animal, filtered_h5f, logfile)
+
+
+def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
+    """Trying a mix of using raw trace and Hilbert envelope to find licks"""
+    for (animal, data) in data_by_animal.items():
         fs = data['fs']
         trace = data['cap_data']
 
@@ -151,9 +223,9 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
         if len(lick_idxs) < 3:
             data['lick_indices'] = []
             data['lick_times'] = []
-            save_filtered_data(data, animal, filtered_h5f, logfile)
             print(f'No licks recorded for {animal}')
             continue
+
         for i, idx in enumerate(lick_idxs):
             # Only check to the right on the first loop and left on the last:
             if i == 0: 
