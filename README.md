@@ -48,3 +48,10 @@ comfortable with the command line):
 C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -c "cd ~/CLiQR; jupyter-lab"
 ```
 The path "~/CLiQR" will need to match the directory where you cloned the repository.
+
+## Tips
+In the JupyterLab settings, it's probably a good idea to rebind any shortcuts that do not have multiple keystrokes.
+For instance, by default, pressing 1 while having a cell selected (but not in the text editing mode), will change it
+to be a markdown heading. The same is true for other digits up to 6, I think. Also, pressing 'm' changes it to plain markdown.
+While it has only happened once, we did have to restart the GUI once because of these shortcuts, and that messed up the last
+section of data. I just went through and rebound them to require CTRL + 'key'.
