@@ -62,6 +62,17 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
                         f"{board_id} {sensor_id} likely had a false start/stop"
                         ", the stop time is less than 1000 seconds after start"
                     )
+                    try:
+                        sensor_data['start_time'] = sensor_data['start_time1']
+                        sensor_data['stop_time'] = sensor_data['stop_time1']
+                        print(f"Adjusted start and stop times for {board_id} {sensor_id}")
+                    except:
+                        try:
+                            sensor_data['start_time'] = sensor_data['start_time2']
+                            sensor_data['stop_time'] = sensor_data['stop_time2']
+                            print(f"Adjusted start and stop times for {board_id} {sensor_id}")
+                        except:
+                            print("No other start/stop times recorded :(")
 
                 sensor_data['time_data'] = (
                     sensor_data['time_data'][start_idx:stop_idx] -
@@ -149,7 +160,9 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
                 good_peaks = np.argwhere(peak_t.squeeze() < max_lick_time)
 
                 # Check if we have any good peaks to start with, if not just move on
-                if 0 in good_peaks.shape: continue
+                if 0 in good_peaks.shape:
+                    peak_bins[i_thr] = []
+                    continue
                 # We need good_peaks to be 1-dim
                 if good_peaks.shape[0] > 1:
                     good_peaks = good_peaks.squeeze()
@@ -193,6 +206,12 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
 
             i_thr = np.argwhere(peak_info[animal]['thr_and_peaks'][1,:] == peak_info[animal]['thr_and_peaks'][1,:].max())[0]
             i_thr = int(i_thr)
+            if i_thr == 0:
+                # We didn't have any actual licks recorded in any of the potential thresholds if we make it here
+                continue
+                # data['num_licks'] = 0
+                # data['lick_times'] = []
+                # data['lick_indices'] = []
             pb_ = peak_info[animal]['peak_bins'][i_thr]
             if len(pb_) == 1: 
                 pb_ = int(pb_)
@@ -201,7 +220,10 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
                 data['lick_times'] = times[pb_]
             data['num_licks'] = len(data['lick_times'])
             data['lick_indices'] = pb_
-
+        else:
+            # Didn't have more than 3 separate capacitance values, so probably nothing was recorded
+            continue
+        print(f"Animal {animal} had {data['num_licks']} licks detected")
         save_filtered_data(data, animal, filtered_h5f, logfile)
 
 
@@ -295,9 +317,14 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
 
 def save_filtered_data(data, animal, filtered_h5f, logfile):
     grp = filtered_h5f.create_group(animal)
-    # If we don't have lick indices, we won't have times
-    grp.create_dataset('lick_times', data=data['lick_times'])
-    grp.create_dataset('lick_indices', data=data['lick_indices'])
+    # We need to check each of these things to make sure they were actually populated
+    try:
+        grp.create_dataset('lick_times', data=data['lick_times'])
+        grp.create_dataset('lick_indices', data=data['lick_indices'])
+    except KeyError as e:
+        with open(logfile, 'a') as lf:
+            lf.write(f"Caught KeyError {e}, volumes not recorded for {animal}\n")
+        print(f'Caught KeyError {e}, no licks recorded for {animal}')
     try:
         grp.create_dataset('consumed_vol', data=data['consumed_vol'])
     except KeyError as e:
