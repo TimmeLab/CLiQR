@@ -28,8 +28,12 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
     # Loop through all boards and sensors and truncate at start_time and
     # stop_time, then subtract the first time point from the data
     for board_id, board_data in data_dict.items():
+        if board_id == 'comments': continue
         for sensor_id, sensor_data in board_data.items():
-            # If the user didn't press the start button for the sensor
+            # Initialize with the start and stop indices indicating the entire time series
+            start_idx = 0
+            stop_idx = -1
+			# If the user didn't press the start button for the sensor
             if 'start_time' not in sensor_data.keys():
                 sensor_data['fs'] = (
                         len(sensor_data['cap_data']) /
@@ -43,6 +47,10 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
                     sensor_data['consumed_vol'] = (
                         sensor_data['start_vol'] - sensor_data['stop_vol']
                     )
+                # if no start or stop times are recorded, trim the first and last ~10 minutes
+                start_idx = 56 * 60 * 10
+            if 'stop_idx' not in sensor_data.keys():
+                stop_idx = -1 * 56 * 60 * 10 # trim the last ~10 minutes for the stop time
             else:
                 start_idx = np.argmin(
                     np.abs(
@@ -67,6 +75,8 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
                         sensor_data['stop_time'] = sensor_data['stop_time1']
                         print(f"Adjusted start and stop times for {board_id} {sensor_id}")
                     except:
+                        # TODO I really need to handle this better, in case someone starts and stops
+                        # a bunch of times, for some reason
                         try:
                             sensor_data['start_time'] = sensor_data['start_time2']
                             sensor_data['stop_time'] = sensor_data['stop_time2']
@@ -74,22 +84,22 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
                         except:
                             print("No other start/stop times recorded :(")
 
-                sensor_data['time_data'] = (
-                    sensor_data['time_data'][start_idx:stop_idx] -
-                        sensor_data['start_time']
-                )
-                sensor_data['cap_data'] = (
-                    sensor_data['cap_data'][start_idx:stop_idx]
-                )
-                sensor_data['fs'] = (
-                    (stop_idx - start_idx) /
-                        (sensor_data['stop_time'] - sensor_data['start_time'])
-                )
-                
-                if 'stop_vol' in sensor_data.keys():
-                    sensor_data['consumed_vol'] = (
-                        sensor_data['start_vol'] - sensor_data['stop_vol']
-                    )
+            sensor_data['time_data'] = (
+                sensor_data['time_data'][start_idx:stop_idx] -
+                    sensor_data['time_data'][start_idx]
+			)
+            sensor_data['cap_data'] = (
+                sensor_data['cap_data'][start_idx:stop_idx]
+			)
+            sensor_data['fs'] = (
+				(stop_idx - start_idx) /
+					(sensor_data['time_data'][stop_idx] - sensor_data['time_data'][start_idx])
+			)
+			
+            if 'stop_vol' in sensor_data.keys():
+                sensor_data['consumed_vol'] = (
+					sensor_data['start_vol'] - sensor_data['stop_vol']
+				)
 
     # Reorganize the data to be by animal ID, agnostic wrt any board/sensor numbering
     data_by_animal = {}
@@ -115,7 +125,7 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
 def basic_algorithm(data_by_animal, filtered_h5f, logfile):
     """Basic algorithm based on thresholding"""
     for (animal, data) in data_by_animal.items():
-        print(f"Animal ID {animal}")
+        #print(f"Animal ID {animal}")
         trace = data['cap_data']
         times = data['time_data']
 
