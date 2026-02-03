@@ -11,8 +11,9 @@ import h5py
 import numpy as np
 import scipy.signal as scs
 
-def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
-
+def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix={}):
+    """This organizes the data by animal and handles some common issues relating to
+    recording start/stop times, volumes, and weights"""
     data_dict = {}
     # We only expect up to 3 nested levels based on the DataRecording notebook
     for k,v in raw_h5f.items():
@@ -35,6 +36,8 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
             stop_idx = -1
 			# If the user didn't press the start button for the sensor
             if 'start_time' not in sensor_data.keys():
+                print("Warning: start_time not recorded. Create a time fix Excel sheet for more accurate start/stop timings.")
+                # Missing start_time here, so assume we're missing stop_time also
                 sensor_data['fs'] = (
                         len(sensor_data['cap_data']) /
                         (
@@ -47,9 +50,17 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
                     sensor_data['consumed_vol'] = (
                         sensor_data['start_vol'] - sensor_data['stop_vol']
                     )
-                # if no start or stop times are recorded, trim the first and last ~10 minutes
+                # if no start or stop times are recorded, trim the first and last ~10 minutes (assuming 56 Hz sampling)
                 start_idx = 56 * 60 * 10
-            if 'stop_idx' not in sensor_data.keys():
+                stop_idx = -start_idx
+            elif 'stop_time' not in sensor_data.keys():
+                print("Warning: stop_time not recorded. Create a time fix Excel sheet for more accurate start/stop timings.")
+                # Only missing stop_time here
+                start_idx = np.argmin(
+                    np.abs(
+                        sensor_data['time_data'] - sensor_data['start_time']
+                    )
+                )
                 stop_idx = -1 * 56 * 60 * 10 # trim the last ~10 minutes for the stop time
             else:
                 start_idx = np.argmin(
@@ -93,7 +104,7 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile):
 			)
             sensor_data['fs'] = (
 				(stop_idx - start_idx) /
-					(sensor_data['time_data'][stop_idx] - sensor_data['time_data'][start_idx])
+					(sensor_data['time_data'][-1] - sensor_data['time_data'][0])
 			)
 			
             if 'stop_vol' in sensor_data.keys():
