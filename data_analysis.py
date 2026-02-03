@@ -13,9 +13,11 @@ import numpy as np
 import scipy.signal as scs
 
 
-def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None):
+def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold'):
     """This organizes the data by animal and handles some common issues relating to
-    recording start/stop times, volumes, and weights"""
+    recording start/stop times, volumes, and weights. Current algorithm choices:
+        - basic_threshold
+        - hilbert (Hilbert envelope threshold)"""
     data_dict = {}
     # We only expect up to 3 nested levels based on the DataRecording notebook
     for k,v in raw_h5f.items():
@@ -85,6 +87,11 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
 					sensor_data['start_vol'] - sensor_data['stop_vol']
 				)
 
+            # Add in datasets to indicate which start/stop indices we actually used in the analysis
+            sensor_data['used_start_idx'] = start_idx
+            sensor_data['used_stop_idx'] = stop_idx
+
+
     # Reorganize the data to be by animal ID, agnostic wrt any board/sensor numbering
     data_by_animal = {}
     for idx,row in sensor_animal_map.iterrows():
@@ -104,7 +111,10 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
         except KeyError as e:
             print(f"Missing key in data_dict: {e}")
 
-    basic_algorithm(data_by_animal, filtered_h5f, logfile)
+    if algorithm == 'basic_threshold':
+        basic_algorithm(data_by_animal, filtered_h5f, logfile)
+    elif algorithm == 'hilbert':
+        hilbert_algorithm(data_by_animal, filtered_h5f, logfile)
 
 def basic_algorithm(data_by_animal, filtered_h5f, logfile):
     """Basic algorithm based on thresholding"""
@@ -315,6 +325,8 @@ def save_filtered_data(data, animal, filtered_h5f, logfile):
     try:
         grp.create_dataset('lick_times', data=data['lick_times'])
         grp.create_dataset('lick_indices', data=data['lick_indices'])
+        grp.create_dataset('used_start_idx', data=data['used_start_idx'])
+        grp.create_dataset('used_stop_idx', data=data['used_stop_idx'])
     except KeyError as e:
         with open(logfile, 'a') as lf:
             lf.write(f"Caught KeyError {e}, volumes not recorded for {animal}\n")
