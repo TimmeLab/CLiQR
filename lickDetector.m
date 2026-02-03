@@ -55,8 +55,6 @@
 if isequal(rawFiles,0)
     disp('No raw files selected.')
     return
-% If we have a return type of 'char', only one file was selected. Handle
-% that here
 elseif isequal(class(rawFiles), 'char')
     rawFiles = {rawFiles};
 end
@@ -81,7 +79,6 @@ nSensors = length(sensors);
 % Load the data
 data = cell([nFiles,nSensors,10]);
 f = waitbar(0,'Loading Raw Data');
-
 for iFile = 1:nFiles
     for iSensor = 1:nSensors
         for iBoard = 0:3
@@ -109,18 +106,22 @@ if isempty(recLength)
 end
 recLength = str2double(cell2mat(recLength))*60; % Convert to seconds.
 
-% Look for time log errors from short recordings
-potentialTimeErrorFlag = 0;
+% Look for time log errors from short recordings or missing time data
+potentialTimeErrorFlag = zeros(nFiles,nSensors);
 for iFile = 1:nFiles
     for iSensor = 1:nSensors
         if (data{iFile,iSensor,4} - data{iFile,iSensor,3}) < recLength
-            potentialTimeErrorFlag = 1;
+            potentialTimeErrorFlag(iFile,iSensor) = 1;
+        elseif isempty(data{iFile,iSensor,3})
+            potentialTimeErrorFlag(iFile,iSensor) = 1;
+        elseif isempty(data{iFile,iSensor,4})
+            potentialTimeErrorFlag(iFile,iSensor) = 1;
         end
     end
 end
 
 % Inform the user of the error
-if potentialTimeErrorFlag == 1
+if sum(potentialTimeErrorFlag,"all") > 0
     f = msgbox('Some recordings were too short. Plots from recordings that are too short will be shown. Create a time fix file.');
     uiwait(f)
 
@@ -128,7 +129,7 @@ if potentialTimeErrorFlag == 1
     % correct them. If all times are good, no plots will be produced.
     for iFile = 1:nFiles
         for iSensor = 1:nSensors
-            if (data{iFile,iSensor,4} - data{iFile,iSensor,3}) < recLength
+            if potentialTimeErrorFlag(iFile,iSensor) == 1
                 figure
                 h = plot(data{iFile,iSensor,2},data{iFile,iSensor,1});
                 title(strcat('File: ',num2str(iFile),', Sensor: ',num2str(iSensor)))
@@ -181,7 +182,7 @@ for iFile = 1:nFiles
         T = data{iFile,iSensor,9};
         
         % Because the capacitance values are discretized, we can focus only
-        % on the thresholds between the discrete values.
+        % only the thresholds between the discrete values.
         uniqVals = unique(cap);
         if length(uniqVals) > 3
             thresholds = mean([uniqVals(1:(end - 1))';uniqVals(2:end)']);
@@ -251,8 +252,16 @@ volConsumed = NaN([nFiles,nSensors]);
 animWeight = NaN([nFiles,nSensors]);
 for iFile = 1:nFiles
     for iSensor = 1:nSensors
-        volConsumed(iFile,iSensor) = data{iFile,iSensor,5} - data{iFile,iSensor,6};
-        animWeight(iFile,iSensor) = data{iFile,iSensor,7};
+        try
+            volConsumed(iFile,iSensor) = data{iFile,iSensor,5} - data{iFile,iSensor,6};
+        catch
+            warning(strcat('File ',num2str(iFile),' - Sensor ',num2str(iSensor),' has missing volume data!'))
+        end
+        try
+            animWeight(iFile,iSensor) = data{iFile,iSensor,7};
+        catch
+            warning(strcat('File ',num2str(iFile),' - Sensor ',num2str(iSensor),' has missing animal weight data!'))
+        end
     end
 end
 
@@ -322,6 +331,8 @@ lickTimes = lickTimes';
 animWeight = animWeight';
 volConsumed = volConsumed';
 nLicks = nLicks';
+capValues = data(:,:,8);
+capTime = data(:,:,9);
 
 % Ask the user where to save the file
 [file,location] = uiputfile('','Save File');
@@ -329,7 +340,7 @@ nLicks = nLicks';
 % Save the file
 if ~isempty(file)
     [filepath,file,ext] = fileparts(strcat(location,file));
-    save(strcat(location,file,'.mat'),'lickTimes','animWeight','volConsumed','nLicks','exclude','rawFiles','sipperLabels','sensors')
+    save(strcat(location,file,'.mat'),'lickTimes','animWeight','volConsumed','nLicks','exclude','rawFiles','sipperLabels','sensors','capValues','capTime')
 end
 
 
