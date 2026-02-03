@@ -7,11 +7,13 @@
 a recording."""
 
 
+import re
 import h5py
 import numpy as np
 import scipy.signal as scs
 
-def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix={}):
+
+def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None):
     """This organizes the data by animal and handles some common issues relating to
     recording start/stop times, volumes, and weights"""
     data_dict = {}
@@ -34,66 +36,37 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix={}):
             # Initialize with the start and stop indices indicating the entire time series
             start_idx = 0
             stop_idx = -1
-			# If the user didn't press the start button for the sensor
-            if 'start_time' not in sensor_data.keys():
-                print("Warning: start_time not recorded. Create a time fix Excel sheet for more accurate start/stop timings.")
-                # Missing start_time here, so assume we're missing stop_time also
-                sensor_data['fs'] = (
-                        len(sensor_data['cap_data']) /
-                        (
-                            sensor_data['time_data'][-1] -
-                                sensor_data['time_data'][0]
-                        )
-                )
-                # But they still recorded volume for some reason
-                if 'stop_vol' in sensor_data.keys():
-                    sensor_data['consumed_vol'] = (
-                        sensor_data['start_vol'] - sensor_data['stop_vol']
-                    )
-                # if no start or stop times are recorded, trim the first and last ~10 minutes (assuming 56 Hz sampling)
-                start_idx = 56 * 60 * 10
-                stop_idx = -start_idx
-            elif 'stop_time' not in sensor_data.keys():
-                print("Warning: stop_time not recorded. Create a time fix Excel sheet for more accurate start/stop timings.")
-                # Only missing stop_time here
-                start_idx = np.argmin(
-                    np.abs(
-                        sensor_data['time_data'] - sensor_data['start_time']
-                    )
-                )
-                stop_idx = -1 * 56 * 60 * 10 # trim the last ~10 minutes for the stop time
-            else:
-                start_idx = np.argmin(
-                    np.abs(
-                        sensor_data['time_data'] - sensor_data['start_time']
-                    )
-                )
-                stop_idx = np.argmin(
-                    np.abs(
-                        sensor_data['time_data'] - sensor_data['stop_time']
-                    )
-                )
-                
-                if (
-                    sensor_data['stop_time']-sensor_data['start_time'] <= 1000
-                ):
-                    print(
-                        f"{board_id} {sensor_id} likely had a false start/stop"
-                        ", the stop time is less than 1000 seconds after start"
-                    )
-                    try:
-                        sensor_data['start_time'] = sensor_data['start_time1']
-                        sensor_data['stop_time'] = sensor_data['stop_time1']
-                        print(f"Adjusted start and stop times for {board_id} {sensor_id}")
-                    except:
-                        # TODO I really need to handle this better, in case someone starts and stops
-                        # a bunch of times, for some reason
-                        try:
-                            sensor_data['start_time'] = sensor_data['start_time2']
-                            sensor_data['stop_time'] = sensor_data['stop_time2']
-                            print(f"Adjusted start and stop times for {board_id} {sensor_id}")
-                        except:
-                            print("No other start/stop times recorded :(")
+            # Determine which start time keys we have
+            pattern = re.compile(r'^start_time(\d+)?$')
+            matches = {}
+            for k in sensor_data.keys():
+                m = pattern.match(k)
+                if m:
+                    num = int(m.group(1)) if m.group(1) else -1
+                    matches[num] = k
+            if matches:
+                num = -np.inf
+                for n in matches.keys():
+                    if n > num: num = n
+                last_start = matches[num]
+                start_time = sensor_data[last_start][()]
+                # Try the stop_time corresponding to the start_time above
+                try:
+                    stop_time = sensor_data['stop' + last_start[5:]][()]
+                except KeyError:
+                    # Stop time wasn't recorded (likely clicked stop all button too soon)
+                    stop_time = sensor_data['time_data'][-1]
+            else: # no start time recorded
+                print(f"Warning: no start/stop times recorded for {board_id} {sensor_id}, create a time fix file or we will default to the entire trace.")
+                start_time = sensor_data['time_data'][0] # start at beginning
+                stop_time = sensor_data['time_data'][-1] # stop at end
+            total_recording_time = stop_time - start_time
+            start_idx = np.argmin(
+                np.abs(sensor_data['time_data'] - start_time)
+            )
+            stop_idx = np.argmin(
+                np.abs(sensor_data['time_data'] - stop_time)
+            )
 
             sensor_data['time_data'] = (
                 sensor_data['time_data'][start_idx:stop_idx] -
