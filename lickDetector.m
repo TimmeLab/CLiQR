@@ -85,8 +85,26 @@ for iFile = 1:nFiles
             try
                 data{iFile,iSensor,1} = h5read(strcat(dataDir,rawFiles{iFile}),strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)),"/cap_data"));
                 data{iFile,iSensor,2} = h5read(strcat(dataDir,rawFiles{iFile}),strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)),"/time_data"));
-                data{iFile,iSensor,3} = h5read(strcat(dataDir,rawFiles{iFile}),strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)),"/start_time"));
-                data{iFile,iSensor,4} = h5read(strcat(dataDir,rawFiles{iFile}),strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)),"/stop_time"));
+                % Find the start_time and stop_time from the last start/stop on that sensor
+                filePath = strcat(dataDir,rawFiles{iFile});
+                groupPath = strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)));
+                [startKey, stopKey] = getLatestStartStopKeys(filePath, groupPath);
+                if isempty(startKey)
+                    warning(strcat("Warning: no start/stop times recorded for ", groupPath, ". Defaulting to entire trace."));
+                    data{iFile,iSensor,3} = data{iFile,iSensor,2}(1);
+                    data{iFile,iSensor,4} = data{iFile,iSensor,2}(end);
+                else
+                    data{iFile,iSensor,3} = h5read(filePath, strcat(groupPath,"/",startKey));
+                    if isempty(stopKey)
+                        data{iFile,iSensor,4} = data{iFile,iSensor,2}(end);
+                    else
+                        try
+                            data{iFile,iSensor,4} = h5read(filePath, strcat(groupPath,"/",stopKey));
+                        catch
+                            data{iFile,iSensor,4} = data{iFile,iSensor,2}(end);
+                        end
+                    end
+                end
                 data{iFile,iSensor,5} = h5read(strcat(dataDir,rawFiles{iFile}),strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)),"/start_vol"));
                 data{iFile,iSensor,6} = h5read(strcat(dataDir,rawFiles{iFile}),strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)),"/stop_vol"));
                 data{iFile,iSensor,7} = h5read(strcat(dataDir,rawFiles{iFile}),strcat("/board_FT232H",num2str(iBoard),"/sensor_",num2str(sensors(iSensor)),"/weight"));
@@ -321,9 +339,6 @@ else
 end
 
 
-
-
-
 %% Package the lick data for the user
 
 % Transpose the data files to match the sipper labels
@@ -344,4 +359,40 @@ if ~isempty(file)
 end
 
 
+function [startKey, stopKey] = getLatestStartStopKeys(filePath, groupPath)
+% Return the start_time/stop_time dataset names with the largest integer suffix.
+% If no start_time datasets exist, returns empty strings.
+    info = h5info(filePath, groupPath);
+    dsNames = {info.Datasets.Name};
+    startPattern = "^start_time(\d+)?$";
+    bestNum = -inf;
+    startKey = '';
+    for i = 1:numel(dsNames)
+        nm = dsNames{i};
+        tok = regexp(nm, startPattern, "tokens", "once");
+        if ~isempty(tok)
+            if isempty(tok{1})
+                num = -1; % plain start_time
+            else
+                num = str2double(tok{1});
+            end
+            if num > bestNum
+                bestNum = num;
+                startKey = nm;
+            end
+        end
+    end
 
+    if isempty(startKey)
+        stopKey = '';
+        return;
+    end
+
+    % Prefer stop_time with matching suffix, e.g., start_time3 -> stop_time3
+    stopKeyCandidate = strcat("stop", startKey(6:end)); % replace "start" with "stop"
+    if any(strcmp(dsNames, stopKeyCandidate))
+        stopKey = stopKeyCandidate;
+    else
+        stopKey = '';
+    end
+end
