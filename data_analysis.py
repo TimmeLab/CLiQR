@@ -111,10 +111,14 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
         except KeyError as e:
             print(f"Missing key in data_dict: {e}")
 
+    # Flag to track if we had any animals without necessary data recorded
+    missing_data = False
     if algorithm == 'basic_threshold':
-        basic_algorithm(data_by_animal, filtered_h5f, logfile)
+        missing_data = basic_algorithm(data_by_animal, filtered_h5f, logfile)
     elif algorithm == 'hilbert':
-        hilbert_algorithm(data_by_animal, filtered_h5f, logfile)
+        missing_data = hilbert_algorithm(data_by_animal, filtered_h5f, logfile)
+    return missing_data
+
 
 def basic_algorithm(data_by_animal, filtered_h5f, logfile):
     """Basic algorithm based on thresholding"""
@@ -234,7 +238,9 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
             # Didn't have more than 3 separate capacitance values, so probably nothing was recorded
             continue
         print(f"Animal {animal} had {data['num_licks']} licks detected")
-        save_filtered_data(data, animal, filtered_h5f, logfile)
+        missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
+        if missing_data: return True
+    return False # no missing data
 
 
 def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
@@ -323,9 +329,13 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
         num_licks = len(lick_times)
         data['num_licks'] = num_licks
         print(f"Animal {animal} had {num_licks} licks detected")
-        save_filtered_data(data, animal, filtered_h5f, logfile)
+        missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
+        if missing_data: return missing_data
+    return False # no data missing
 
 def save_filtered_data(data, animal, filtered_h5f, logfile):
+    missing_data = False # flag to track if we missed any weights or volumes
+
     grp = filtered_h5f.create_group(animal)
     # We need to check each of these things to make sure they were actually populated
     try:
@@ -339,18 +349,23 @@ def save_filtered_data(data, animal, filtered_h5f, logfile):
         with open(logfile, 'a') as lf:
             lf.write(f"Caught KeyError {e}, volumes not recorded for {animal}\n")
         print(f'Caught KeyError {e}, no licks recorded for {animal}')
+        missing_data = True
     try:
         grp.create_dataset('consumed_vol', data=data['consumed_vol'])
     except KeyError as e:
         with open(logfile, 'a') as lf:
             lf.write(f"Caught KeyError {e}, volumes not recorded for {animal}\n")
         print(f'Caught KeyError {e}, volumes were likely not recorded for {animal}')
+        missing_data = True
     try:
         grp.create_dataset('weight', data=data['weight'])
     except KeyError as e:
         with open(logfile, 'a') as lf:
             lf.write(f"Caught KeyError {e}, weight not recorded for {animal}\n")
         print(f'Caught KeyError {e}, weight was likely not recorded for {animal}')
+        missing_data = True
+
+    return missing_data
 #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
 #                                 MIT License                                 #
 #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
