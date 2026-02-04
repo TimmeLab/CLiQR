@@ -329,6 +329,8 @@ def save_filtered_data(data, animal, filtered_h5f, logfile):
     grp = filtered_h5f.create_group(animal)
     # We need to check each of these things to make sure they were actually populated
     try:
+        grp.create_dataset('cap_data', data=data['cap_data'])
+        grp.create_dataset('time_data', data=data['time_data'])
         grp.create_dataset('lick_times', data=data['lick_times'])
         grp.create_dataset('lick_indices', data=data['lick_indices'])
         grp.create_dataset('used_start_idx', data=data['used_start_idx'])
