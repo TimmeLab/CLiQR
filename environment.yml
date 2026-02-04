@@ -15,5 +15,6 @@ dependencies:
     - pyftdi==0.56.0
     - scipy==1.16.3
     - openpyxl==3.1.5
+    - statsmodels
     - ipympl
     - panel
