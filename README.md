@@ -42,13 +42,7 @@ modify the serial_number_sensor_map dictionary to tell the system which cages go
 
 Then to run the system, just use the command jupyter-lab and navigate to the DataRecording.ipynb notebook.
 
-On Windows, a desktop shortcut can be created with the following link (to easily start the system for those not
-comfortable with the command line):
-```
-C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -c "cd ~/CLiQR; jupyter-lab"
-```
-The path "~/CLiQR" will need to match the directory where you cloned the repository.
-
+On Windows, a desktop shortcut can be created with a link to start_cliqr.bat to start the system without any CLI interaction.
 ## Tips
 In the JupyterLab settings, it's probably a good idea to rebind any shortcuts that do not have multiple keystrokes.
 For instance, by default, pressing 1 while having a cell selected (but not in the text editing mode), will change it
