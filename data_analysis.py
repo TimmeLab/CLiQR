@@ -13,7 +13,7 @@ import numpy as np
 import scipy.signal as scs
 
 
-def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold'):
+def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold', recording_length=2*60*60):
     """This organizes the data by animal and handles some common issues relating to
     recording start/stop times, volumes, and weights. Current algorithm choices:
         - basic_threshold
@@ -71,16 +71,29 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
             )
 
             sensor_data['time_data'] = (
-                sensor_data['time_data'][start_idx:stop_idx] -
+                sensor_data['time_data'][start_idx:stop_idx+1] -
                     sensor_data['time_data'][start_idx]
 			)
             sensor_data['cap_data'] = (
-                sensor_data['cap_data'][start_idx:stop_idx]
+                sensor_data['cap_data'][start_idx:stop_idx+1]
 			)
             sensor_data['fs'] = (
 				(stop_idx - start_idx) /
 					(sensor_data['time_data'][-1] - sensor_data['time_data'][0])
 			)
+
+            # Check if we still have at least recording_length
+            remaining_time = sensor_data['time_data'][-1] - sensor_data['time_data'][0]
+            if remaining_time < recording_length:
+                print(f"Warning: {board_id} {sensor_id} was left with only {remaining_time} seconds of recording after trimming to recorded start/stop times. Consider a time fix file.")
+            else:
+                # Now we trim any excess to the desired recording length (from the end)
+                revised_stop_idx = np.argmin(
+                    np.abs(sensor_data['time_data'] - recording_length)
+                )
+                sensor_data['time_data'] = sensor_data['time_data'][:revised_stop_idx]
+                sensor_data['cap_data'] = sensor_data['cap_data'][:revised_stop_idx]
+
 			
             if 'stop_vol' in sensor_data.keys():
                 sensor_data['consumed_vol'] = (
@@ -158,7 +171,7 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
                 if trace[-1] < thr:
                     peak_ends = np.r_[peak_ends, len(trace) - 1]
 
-                # If we still have no peaks (or mismatched start/end), skip.
+                # If we still have no peaks, skip
                 if peak_starts.size == 0 or peak_ends.size == 0:
                     peak_bins[i_thr] = np.array([], dtype=int)
                     n_peaks[i_thr] = 0
