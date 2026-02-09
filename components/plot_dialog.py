@@ -64,7 +64,7 @@ def TestPlotDialog():
             ax.plot(cap_data, linewidth=1.5, color='#2196F3')
             ax.set_xlabel('Sample', fontsize=12)
 
-        ax.set_ylabel('Capacitance (ADC units)', fontsize=12)
+        ax.set_ylabel('Capacitance (picofarads)', fontsize=12)
         ax.set_title(f'Sensor {sensor_id}{animal_text} - Last {len(cap_data)} Samples', fontsize=14)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
