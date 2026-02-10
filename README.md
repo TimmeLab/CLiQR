@@ -1,51 +1,153 @@
-# Capacitive Lickometry System
+# CLiQR - Capacitive Lick Quantification in Rodents
 ### Created for the Timme Lab at University of Cincinnati
 ### Author: Christopher Parker
 
-This repository contains the Python code for running our capacitive lickometry system.
+This repository contains the software for running our capacitive lickometry system, which records rodent licking behavior using MPR121 capacitive touch sensors connected via FT232H USB-to-I2C boards.
+
+## System Overview
+
+**CLiQR** provides a web-based GUI for data recording and Jupyter notebooks for data analysis:
+- **recording_gui.py** - Standalone Solara web GUI for recording (primary interface)
+- **DataAnalysis.ipynb** - Jupyter notebook for batch analysis and visualization
+- **DataRecording.ipynb** - Legacy notebook interface (deprecated, kept for reference)
 
 ## Installation
 
-First, if you're on Windows (which is what we are using to make things easy on undergrads/grad students
-who need to run the system), you'll have to install drivers for the FT232H boards. The recommended 
-method is Zadig (https://zadig.akeo.ie/), and we roughly followed the steps outlined here: https://learn.adafruit.com/circuitpython-on-any-computer-with-ft232h/windows
+### Windows Driver Setup (Required for Windows)
 
-Clone this repository (or download the .zip and extract), then run the following commands from inside the new directory.
+Before first use on Windows, you must install drivers for the FT232H boards using Zadig:
+1. Download Zadig from https://zadig.akeo.ie/
+2. Follow the steps outlined here: https://learn.adafruit.com/circuitpython-on-any-computer-with-ft232h/windows
 
-The easiest installation option is to use miniforge: https://github.com/conda-forge/miniforge/releases
+### Software Installation
 
-After installation on Windows, use the Miniforge Prompt start menu entry and navigate to the directory where you've cloned this repo. On Mac/Linux it should automatically add conda to your path, and you can use your normal terminal. Then enter the commands:
-```
+Clone this repository (or download and extract the .zip file).
+
+**Option 1 - Miniforge (recommended for Windows):**
+
+Download and install Miniforge: https://github.com/conda-forge/miniforge/releases
+
+On Windows, use the "Miniforge Prompt" from the Start menu. On Mac/Linux, use your normal terminal. Then run:
+```bash
 conda env create --file environment.yml
+conda activate cliqr
+```
+
+**Option 2 - pyenv-virtualenv (Unix-based systems):**
+
+Install pyenv-virtualenv: https://github.com/pyenv/pyenv-virtualenv
+
+Then run:
+```bash
+pyenv virtualenv 3.13 cliqr
+pyenv activate cliqr
+pip install -r requirements.txt
+```
+
+### Hardware Setup (One-Time Configuration)
+
+The FT232H boards must be assigned serial numbers so the system can identify them consistently, even if USB ports end up being shuffled somehow. Connect boards **ONE AT A TIME** and run:
+
+```bash
+python set_ft232h_serial.py FT232H0
+```
+
+Repeat for each board, using serial numbers FT232H0 through FT232H3. These serial numbers map to sensors 1-24 as defined in `utils/state.py`. If you use different serial numbers, update the `SERIAL_NUMBER_SENSOR_MAP` constant.
+
+## Running the System
+
+### Data Recording
+
+**Option 1 - Command Line:**
+```bash
+conda activate cliqr  # or: pyenv activate cliqr
+solara run recording_gui.py
+```
+
+The GUI will open in your default web browser at http://localhost:8765
+
+**Option 2 - Windows Desktop Shortcut:**
+
+Hold Shift and right-click start_cliqr.bat, then select Send To -> Desktop (create shortcut). You can then rename the desktop shortcut as you wish, I have just called it "CLiQR." Double-click the shortcut to launch the GUI without using the command line. Note, this shortcut will only work if you used the miniforge3 installation instructions.
+
+### Recording Workflow
+
+1. **Initialize Hardware** - Click "Initialize Hardware" to detect and connect to FT232H boards
+2. **Upload Layout File** - Drag and drop a layout CSV file mapping sensor positions to animal IDs (see `layouts/default_layout.csv` for format)
+3. **Enter Animal Weights** - Enter weights in grams for each animal before recording
+4. **Start Session** - Click "START RECORDING" to begin the recording session
+5. **Start Individual Sensors** - Click START on each sensor card to begin recording for that animal
+6. **Test Sensors** - Use the TEST button to view recent data and confirm sensors are working
+7. **Enter Start Volumes** - After starting each sensor, enter the initial sipper volume in mL in the Start Vol box
+8. **Stop Individual Sensors** - Click STOP when done recording each animal
+9. **Enter Stop Volumes** - After stopping each sensor, enter the final sipper volume in mL in the Stop Vol box
+10. **End Session** - Click "STOP RECORDING" to end the session and save all data to HDF5
+
+**Important Notes:**
+- All volume/weight data and any comments in the Comments box are written to the HDF5 file when you click "STOP RECORDING"
+- Data is saved to the "Lickometry Data" directory by default
+- Each session creates a timestamped HDF5 file: `raw_data_YYYY-MM-DD_HH-MM-SS.h5`
+
+### Data Analysis
+
+For batch analysis of recorded data:
+```bash
 conda activate cliqr
 jupyter-lab
 ```
 
-Alternatively (on Unix-based systems), I manage my Python environments with pyenv-virtualenv on the command line: https://github.com/pyenv/pyenv-virtualenv
+Open `DataAnalysis.ipynb` and follow the instructions to analyze multiple recording sessions.
 
-To install the environment, I run:
-```
-pyenv virtualenv 3.13 cliqr # creates a new environment called lickometry on Python 3.13
-pyenv activate cliqr
-pip install -r requirements.txt
-```
-Once the environment is configured and active, you'll need to set serial numbers for the FT232H boards
-so we can tell which is which even if the USB plugs get shuffled (which would change the ftdi://... address,
-and could cause confusion). I've included the script set_ft232h_serial.py for this purpose. The FT232H boards
-should be plugged in ONE AT A TIME and the script can be run as follows:
-```
-python set_ft232h_serial.py FT232H0 # FT232H0 is the new serial number for the board
-```
-I have used the serial numbers FT232H0 through FT232H3 in our lab (and hence in the DataRecording.ipynb notebook),
-so you can either use the same serials or modify the notebook. To change the serial numbers used, you'll need to
-modify the serial_number_sensor_map dictionary to tell the system which cages go with which board.
+## Layout File Format
 
-Then to run the system, just use the command jupyter-lab and navigate to the DataRecording.ipynb notebook.
+Layout files map sensor numbers (1-24) to animal IDs. The file should be CSV format with no header:
 
-On Windows, a desktop shortcut can be created with a link to start_cliqr.bat to start the system without any CLI interaction.
-## Tips
-In the JupyterLab settings, it's probably a good idea to rebind any shortcuts that do not have multiple keystrokes.
-For instance, by default, pressing 1 while having a cell selected (but not in the text editing mode), will change it
-to be a markdown heading. The same is true for other digits up to 6, I think. Also, pressing 'm' changes it to plain markdown.
-While it has only happened once, we did have to restart the GUI once because of these shortcuts, and that messed up the last
-section of data. I just went through and rebound them to require CTRL + 'key'.
+```
+1,A1
+2,A2
+3,A3
+...
+24,A24
+```
+
+A default template is provided at `layouts/default_layout.csv`.
+
+## Troubleshooting
+
+**"No FT232H boards found"**
+- Check USB connections
+- Verify Zadig drivers are installed (Windows)
+- Try different USB ports
+
+**Recording not starting**
+- Ensure hardware is initialized first
+- Check that layout file has been uploaded
+- Verify output directory permissions
+
+**Sensor shows no data**
+- Use the TEST button to check if sensor is responding
+- Check physical connections to MPR121 boards
+- Ensure FT232H boards are in I2C mode (there is a small switch on the board)
+
+For more details, see `DEPLOYMENT.md` and `TEST_MOCK_MODE.md`.
+
+## System Architecture
+
+The system supports 24 sensors arranged in a 4×6 grid (matching the physical rack layout):
+- 4 FT232H boards (FT232H0-3)
+- 4 MPR121 capacitive touch sensors (one per board)
+- 6 sensors per board (using every other channel: 1, 3, 5, 7, 9, 11)
+
+Data is recorded at approximately 56 Hz and saved in HDF5 format with the structure:
+```
+/board_{serial_number}/sensor_{sensor_id}/
+    ├── cap_data       # Capacitance readings
+    ├── time_data      # Timestamps
+    ├── start_time     # Recording start timestamp
+    ├── stop_time      # Recording stop timestamp
+    ├── start_vol      # Initial sipper volume (mL)
+    ├── stop_vol       # Final sipper volume (mL)
+    └── weight         # Animal weight (g)
+```
+
+Multiple start/stop cycles per sensor are supported with numbered suffixes: `start_time1`, `start_time2`, etc.
