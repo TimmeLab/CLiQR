@@ -21,7 +21,7 @@ Before first use on Windows, you must install drivers for the FT232H boards usin
 
 ### Software Installation
 
-Clone this repository (or download and extract the .zip file), then navigate to the directory in your terminal.
+Clone this repository (or download and extract the .zip file).
 
 **Option 1 - Miniforge (recommended for Windows):**
 
@@ -46,7 +46,7 @@ pip install -r requirements.txt
 
 ### Hardware Setup (One-Time Configuration)
 
-The FT232H boards must be assigned serial numbers so the system can identify them consistently, even if USB connections change. Connect boards **ONE AT A TIME** and run:
+The FT232H boards must be assigned serial numbers so the system can identify them consistently, even if USB ports end up being shuffled somehow. Connect boards **ONE AT A TIME** and run:
 
 ```bash
 python set_ft232h_serial.py FT232H0
@@ -68,7 +68,7 @@ The GUI will open in your default web browser at http://localhost:8765
 
 **Option 2 - Windows Desktop Shortcut:**
 
-Double-click `start_cliqr.bat` to launch the GUI without using the command line.
+Hold Shift and right-click start_cliqr.bat, then select Send To -> Desktop (create shortcut). You can then rename the desktop shortcut as you wish, I have just called it "CLiQR." Double-click the shortcut to launch the GUI without using the command line. Note, this shortcut will only work if you used the miniforge3 installation instructions.
 
 ### Recording Workflow
 
@@ -78,14 +78,13 @@ Double-click `start_cliqr.bat` to launch the GUI without using the command line.
 4. **Start Session** - Click "START RECORDING" to begin the recording session
 5. **Start Individual Sensors** - Click START on each sensor card to begin recording for that animal
 6. **Test Sensors** - Use the TEST button to view recent data and confirm sensors are working
-7. **Enter Start Volumes** - After starting each sensor, enter the initial sipper volume in mL (can be entered while recording)
+7. **Enter Start Volumes** - After starting each sensor, enter the initial sipper volume in mL in the Start Vol box
 8. **Stop Individual Sensors** - Click STOP when done recording each animal
-9. **Enter Stop Volumes** - After stopping each sensor, enter the final sipper volume in mL
+9. **Enter Stop Volumes** - After stopping each sensor, enter the final sipper volume in mL in the Stop Vol box
 10. **End Session** - Click "STOP RECORDING" to end the session and save all data to HDF5
 
 **Important Notes:**
-- Volume and weight inputs can be edited at any time during the session
-- All volume/weight data is written to the HDF5 file when you click "STOP RECORDING"
+- All volume/weight data and any comments in the Comments box are written to the HDF5 file when you click "STOP RECORDING"
 - Data is saved to the "Lickometry Data" directory by default
 - Each session creates a timestamped HDF5 file: `raw_data_YYYY-MM-DD_HH-MM-SS.h5`
 
@@ -128,6 +127,7 @@ A default template is provided at `layouts/default_layout.csv`.
 **Sensor shows no data**
 - Use the TEST button to check if sensor is responding
 - Check physical connections to MPR121 boards
+- Ensure FT232H boards are in I2C mode (there is a small switch on the board)
 
 For more details, see `DEPLOYMENT.md` and `TEST_MOCK_MODE.md`.
 
@@ -138,7 +138,7 @@ The system supports 24 sensors arranged in a 4×6 grid (matching the physical ra
 - 4 MPR121 capacitive touch sensors (one per board)
 - 6 sensors per board (using every other channel: 1, 3, 5, 7, 9, 11)
 
-Data is recorded at approximately 50 Hz and saved in HDF5 format with the structure:
+Data is recorded at approximately 56 Hz and saved in HDF5 format with the structure:
 ```
 /board_{serial_number}/sensor_{sensor_id}/
     ├── cap_data       # Capacitance readings
