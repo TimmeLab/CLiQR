@@ -13,7 +13,7 @@ This repository contains the software for running our capacitive lickometry syst
 
 ## Installation
 
-### Windows Driver Setup (Required for Windows)
+### Windows Driver Setup
 
 Before first use on Windows, you must install drivers for the FT232H boards using Zadig:
 1. Download Zadig from https://zadig.akeo.ie/
@@ -116,8 +116,8 @@ A default template is provided at `layouts/default_layout.csv`.
 
 **"No FT232H boards found"**
 - Check USB connections
-- Verify Zadig drivers are installed (Windows)
-- Try different USB ports
+- Verify libusbK drivers are installed (Windows) or libusb is installed (Unix-based)
+- Try different USB ports or USB-C cables (not all USB cables are created alike!)
 
 **Recording not starting**
 - Ensure hardware is initialized first
@@ -135,7 +135,7 @@ For more details, see `DEPLOYMENT.md` and `TEST_MOCK_MODE.md`.
 
 The system supports 24 sensors arranged in a 4×6 grid (matching the physical rack layout):
 - 4 FT232H boards (FT232H0-3)
-- 4 MPR121 capacitive touch sensors (one per board)
+- 4 MPR121 capacitive touch sensors (one per FT232H board)
 - 6 sensors per board (using every other channel: 1, 3, 5, 7, 9, 11)
 
 Data is recorded at approximately 56 Hz and saved in HDF5 format with the structure:
