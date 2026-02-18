@@ -253,6 +253,7 @@ def SensorCard(sensor_id: int):
                 label="Start Vol (mL)",
                 value=sensor.start_volume,
                 on_value=set_start_vol,
+                continuous_update=True,
                 style={"width": "100%"}
             )
 
@@ -266,6 +267,7 @@ def SensorCard(sensor_id: int):
                 label="Stop Vol (mL)",
                 value=sensor.stop_volume,
                 on_value=set_stop_vol,
+                continuous_update=True,
                 style={"width": "100%"}
             )
 
@@ -279,6 +281,7 @@ def SensorCard(sensor_id: int):
                 label="Weight (g)",
                 value=sensor.weight,
                 on_value=set_weight,
+                continuous_update=True,
                 style={"width": "100%"}
             )
 

@@ -57,6 +57,7 @@ def Page():
                     label="",
                     value=state.comments.value,
                     on_value=state.comments.set,
+                    continuous_update=True,
                     rows=6
                 )
 
