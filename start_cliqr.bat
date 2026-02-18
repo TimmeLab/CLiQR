@@ -10,6 +10,8 @@ echo.
 
 REM Activate the conda environment
 echo Activating environment...
+set "MF=%USERPROFILE%\AppData\Local\miniforge3"
+call "%MF%\Scripts\activate.bat" "%MF%"
 call conda activate cliqr
 if errorlevel 1 (
     echo ERROR: Could not activate 'cliqr' environment
