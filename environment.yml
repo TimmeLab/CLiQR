@@ -6,7 +6,7 @@ dependencies:
   - python=3.13
   - pip
   - pip:
-    - jupyterlab
+    - jupyterlab==4.5.6
     - h5py==3.13.0
     - ipywidgets==8.1.7
     - matplotlib==3.10.8
@@ -15,7 +15,8 @@ dependencies:
     - pyftdi==0.56.0
     - scipy==1.16.3
     - openpyxl==3.1.5
-    - statsmodels
-    - ipympl
-    - panel
-    - solara
+    - statsmodels==0.14.6
+    - ipympl==0.10.0
+    - panel==1.8.10
+    - solara==1.57.3
+    - starlette==0.36.3
