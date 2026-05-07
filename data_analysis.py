@@ -126,6 +126,7 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
 
     # Flag to track if we had any animals without necessary data recorded
     missing_data = False
+    _run_optimal_threshold(data_by_animal)
     if algorithm == 'basic_threshold':
         missing_data = basic_algorithm(data_by_animal, filtered_h5f, logfile)
     elif algorithm == 'hilbert':
@@ -136,7 +137,6 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
 def basic_algorithm(data_by_animal, filtered_h5f, logfile):
     """Basic algorithm based on thresholding"""
     for (animal, data) in data_by_animal.items():
-        #print(f"Animal ID {animal}")
         trace = data['cap_data']
         times = data['time_data']
 
@@ -267,6 +267,7 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
         bl, al = scs.butter(8, 12, btype='low', fs=fs)
         filtered_data = scs.filtfilt(bh, ah, trace)
         filtered_data = scs.filtfilt(bl, al, filtered_data)
+        # TODO: revisit number of filter passes and their effect on lick detection accuracy
         filtered_data = [scs.filtfilt(bh, ah, filtered_data) for _ in range(6)][-1]
         filtered_data = [scs.filtfilt(bl, al, filtered_data) for _ in range(6)][-1]
 
@@ -290,10 +291,7 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
             if not lick_idxs or (idx - lick_idxs[-1]) > min_dist:
                 lick_idxs.append(idx)
 
-        # At most 500 ms between licks. This is probably overly permissive,
-        # but we need some way to say 
-        # "it's impossible to tell if a single lick is really a lick"
-        # convert to timestamps
+        # At most 500 ms between licks — isolated licks with no neighbors within that window are excluded
         max_dist = int(0.5 * fs)
         lick_idxs_ = []
         if len(lick_idxs) < 3:
@@ -338,13 +336,89 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
         data['lick_times'] = lick_times
         data['lick_indices'] = lick_idxs
 
-        # print(f"lick_times: {lick_times}")
         num_licks = len(lick_times)
         data['num_licks'] = num_licks
         print(f"Animal {animal} had {num_licks} licks detected")
         missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
         if missing_data: return missing_data
     return False # no data missing
+
+def _optimize_simple_threshold(data_by_animal, n_steps=200):
+    """Grid-search threshold fraction f ∈ [0, 1] of each animal's dynamic range
+    that maximizes R² between per-animal lick count and volume consumed."""
+    animals = [a for a in data_by_animal
+               if 'consumed_vol' in data_by_animal[a]
+               and len(data_by_animal[a].get('cap_data', [])) > 0]
+    if len(animals) < 3:
+        return 0.5  # not enough data; fall back to midpoint
+
+    vols = np.array([data_by_animal[a]['consumed_vol'] for a in animals])
+    traces = [data_by_animal[a]['cap_data'] for a in animals]
+
+    fractions = np.linspace(0.01, 0.99, n_steps)
+    r2_vals = np.full(n_steps, np.nan)
+
+    for k, frac in enumerate(fractions):
+        counts = np.zeros(len(animals))
+        for j, trace in enumerate(traces):
+            thr = trace.min() + frac * (trace.max() - trace.min())
+            below = (trace < thr).astype(np.int8)
+            counts[j] = np.sum(np.diff(below) == 1)
+        if np.std(counts) == 0 or np.std(vols) == 0:
+            continue
+        r2_vals[k] = np.corrcoef(counts, vols)[0, 1] ** 2
+
+    best_k = int(np.nanargmax(r2_vals))
+    return fractions[best_k]
+
+
+def _run_optimal_threshold(data_by_animal):
+    """Add optimal threshold lick detection to each animal's data dict.
+    Threshold fraction (of each animal's dynamic range) is optimized to maximize
+    R² between lick count and volume consumed. Every downward crossing counts as one lick."""
+    opt_frac = _optimize_simple_threshold(data_by_animal)
+    print(f"Optimal threshold: fraction = {opt_frac:.3f} of each animal's dynamic range")
+
+    for animal, data in data_by_animal.items():
+        trace = data['cap_data']
+        times = data['time_data']
+        thr = float(trace.min() + opt_frac * (trace.max() - trace.min()))
+        below = (trace < thr).astype(np.int8)
+        lick_starts = np.where(np.diff(below) == 1)[0] + 1
+        data['optimal_lick_times'] = times[lick_starts]
+        data['optimal_lick_indices'] = lick_starts
+
+
+def compute_bout_structure(lick_times, ibi_threshold=0.25, min_licks=3):
+    """Compute ILIs and bout structure from an array of lick timestamps.
+    A bout requires >= min_licks licks with all consecutive ILIs < ibi_threshold (seconds).
+    Returned ILIs are within-bout only."""
+    if len(lick_times) < min_licks:
+        return {
+            'ILIs': np.array([]),
+            'bout_lick_counts': np.array([], dtype=int),
+            'bout_durations': np.array([]),
+            'bout_start_times': np.array([]),
+        }
+    all_ILIs = np.diff(lick_times)
+    bout_boundaries = np.where(all_ILIs >= ibi_threshold)[0]
+    bout_start_idxs = np.r_[0, bout_boundaries + 1]
+    bout_end_idxs = np.r_[bout_boundaries, len(lick_times) - 1]
+    lick_counts = bout_end_idxs - bout_start_idxs + 1
+
+    valid = lick_counts >= min_licks
+    bout_start_idxs = bout_start_idxs[valid]
+    bout_end_idxs = bout_end_idxs[valid]
+    lick_counts = lick_counts[valid]
+
+    within_ILIs = [all_ILIs[s:e] for s, e in zip(bout_start_idxs, bout_end_idxs)]
+    return {
+        'ILIs': np.concatenate(within_ILIs) if within_ILIs else np.array([]),
+        'bout_lick_counts': lick_counts.astype(int),
+        'bout_durations': lick_times[bout_end_idxs] - lick_times[bout_start_idxs],
+        'bout_start_times': lick_times[bout_start_idxs],
+    }
+
 
 def save_filtered_data(data, animal, filtered_h5f, logfile):
     missing_data = False # flag to track if we missed any weights or volumes
@@ -363,6 +437,22 @@ def save_filtered_data(data, animal, filtered_h5f, logfile):
             lf.write(f"Caught KeyError {e}, volumes not recorded for {animal}\n")
         print(f'Caught KeyError {e}, no licks recorded for {animal}')
         missing_data = True
+    try:
+        grp.create_dataset('optimal_lick_times', data=data.get('optimal_lick_times', np.array([])))
+        grp.create_dataset('optimal_lick_indices', data=data.get('optimal_lick_indices', np.array([], dtype=int)))
+        metrics = compute_bout_structure(data['lick_times'], ibi_threshold=1., min_licks=2)
+        grp.create_dataset('ILIs', data=metrics['ILIs'])
+        grp.create_dataset('bout_lick_counts', data=metrics['bout_lick_counts'])
+        grp.create_dataset('bout_durations', data=metrics['bout_durations'])
+        grp.create_dataset('bout_start_times', data=metrics['bout_start_times'])
+        opt_metrics = compute_bout_structure(data.get('optimal_lick_times', np.array([])), ibi_threshold=1., min_licks=2)
+        grp.create_dataset('optimal_ILIs', data=opt_metrics['ILIs'])
+        grp.create_dataset('optimal_bout_lick_counts', data=opt_metrics['bout_lick_counts'])
+        grp.create_dataset('optimal_bout_durations', data=opt_metrics['bout_durations'])
+        grp.create_dataset('optimal_bout_start_times', data=opt_metrics['bout_start_times'])
+    except Exception as e:
+        with open(logfile, 'a') as lf:
+            lf.write(f"Warning: could not save supplementary metrics for {animal}: {e}\n")
     try:
         grp.create_dataset('consumed_vol', data=data['consumed_vol'])
     except KeyError as e:
