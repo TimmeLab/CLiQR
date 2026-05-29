@@ -240,13 +240,19 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
             i_thr = int(np.where(peaks_row == max_peaks)[0][0])
 
             pb_ = peak_info[animal]['peak_bins'][i_thr]
-            if len(pb_) == 1:
-                pb_ = int(pb_)
-                data['lick_times'] = np.array(times[pb_]).reshape(1,)
+            lick_times_arr = times[pb_]
+
+            # Keep only licks with at least one neighbor within 0.5s
+            if len(lick_times_arr) >= 2:
+                diffs = np.abs(lick_times_arr[:, None] - lick_times_arr[None, :])
+                np.fill_diagonal(diffs, np.inf)
+                keep = diffs.min(axis=1) <= 1.0
+                data['lick_times'] = lick_times_arr[keep]
+                data['lick_indices'] = pb_[keep]
             else:
-                data['lick_times'] = times[pb_]
+                data['lick_times'] = np.array([])
+                data['lick_indices'] = np.array([], dtype=int)
             data['num_licks'] = int(len(data['lick_times']))
-            data['lick_indices'] = pb_
         else:
             # Didn't have more than 3 separate capacitance values, so probably nothing was recorded
             continue
