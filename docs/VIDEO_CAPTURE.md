@@ -65,6 +65,21 @@ to map video PTS to Unix time directly from the bookmark — no sipper-step
 detection needed for recordings made this way. Legacy data (e.g. ACG-26-3)
 still uses `detect_sipper_step` / `establish_alignment`.
 
+### Analysis: synced video
+
+`video/sync_video.py` turns a recorded session into review media:
+
+- `make_sync_video_from_hdf5(raw_h5, sensor_id, video_path, frame_offsets_path, output_path, lick_times=...)`
+  trims the video to the sensor's `start_time`/`stop_time` window (via the
+  bookmark) and renders an MP4 with the video on the left and the capacitive
+  trace on the right. The trace is zoomed to ±1 s around the current time, with
+  the current time fixed at center and the window sliding; detected licks are
+  marked in red. Output frame rate matches the source video.
+- `trim_video(...)` alone writes just the trimmed recording-window MP4.
+
+Call it from `DataAnalysis.ipynb` after lick detection, passing the absolute
+lick times for the camera sensor.
+
 ## Troubleshooting
 
 - **"✗ Not reachable":** verify the Pi server is running, host/IP is correct,
