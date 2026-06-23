@@ -50,12 +50,19 @@ class Picamera2Backend:
     def _on_frame(self, request):
         metadata = request.get_metadata()
         timestamp = metadata.get("SensorTimestamp", 0)
+        # TODO: Change to write relative nanoseconds (timestamp - first_frame_SensorTimestamp)
+        # and add 2-line header (frame count and first_frame_SensorTimestamp) for
+        # compatibility with false_positive_analysis.load_frame_offsets().
+        # Pending validation on Pi.
         self._pts_fh.write(f"{timestamp}\n")
         self._frame_count += 1
 
     def bookmark(self, sensor_id) -> dict:
         metadata = self._picam2.capture_metadata()
         pts = metadata.get("SensorTimestamp", 0) / 1e9
+        # TODO: Change to report pts as relative seconds (relative to session start /
+        # first_frame_SensorTimestamp) for consistency with alignment_from_bookmark()
+        # and the planned .txt format change. Pending validation on Pi.
         return {
             "frame_index": self._frame_count,
             "pts": pts,

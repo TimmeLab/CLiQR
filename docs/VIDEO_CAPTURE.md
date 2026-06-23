@@ -53,10 +53,9 @@ MP4 + `.txt` on `STOP_SESSION`, and serves files on `GET_FILE`.
 ## Output
 
 - `<session>.mp4` — H.264 video.
-- `<session>.txt` — per-frame `SensorTimestamp` (numpy.loadtxt-compatible),
-  consumed by `false_positive_analysis.load_frame_offsets()`.
+- `<session>.txt` — **Pending format change:** Currently writes raw absolute `SensorTimestamp` values (nanoseconds, one per line, no header). For compatibility with `false_positive_analysis.load_frame_offsets()`, this must be changed to: 2-line header + per-frame offsets in relative nanoseconds (offset = `SensorTimestamp - first_frame_SensorTimestamp`). This change is pending validation on the Pi and will be implemented as part of on-device backend improvements.
 - HDF5 datasets per camera sensor: `video_frame_index`, `video_pts`,
-  `video_filename` (cycle-suffixed like `start_time`).
+  `video_filename` (cycle-suffixed like `start_time`). **Note:** `video_pts` is currently reported as absolute seconds; it must be changed to relative seconds (seconds since video start) for consistency with the planned `.txt` format.
 
 ## Analysis
 
@@ -79,6 +78,11 @@ still uses `detect_sipper_step` / `establish_alignment`.
 
 Call it from `DataAnalysis.ipynb` after lick detection, passing the absolute
 lick times for the camera sensor.
+
+## Known limitations / pending work
+
+- **Frame-offset `.txt` format and `video_pts` base:** The current backend writes absolute `SensorTimestamp` nanoseconds (no header) and reports absolute `video_pts` seconds. These must be changed to relative values (relative nanoseconds and relative seconds, respectively) to establish consistency with `false_positive_analysis.load_frame_offsets()` and `alignment_from_bookmark()`. This change is deferred pending on-device testing and validation on the Pi.
+- **picamera2 backend:** Not yet hardware-validated on production Pi systems. Initial testing on development hardware only.
 
 ## Troubleshooting
 

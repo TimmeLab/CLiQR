@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import os
 import time
+import threading
 import pandas as pd
 from dataclasses import replace
 from utils import state
@@ -83,12 +84,12 @@ def start_recording():
 
     recording_task = asyncio.create_task(run_recording())
 
-    # Optionally start concurrent Pi video pre-roll (non-blocking).
+    # Optionally start concurrent Pi video pre-roll with short timeout (non-blocking).
     global camera_client
     camera_client = None
     if state.camera_enabled.value:
         try:
-            camera_client = state.make_camera_client()
+            camera_client = state.make_camera_client(timeout=2.0)
             video_base = os.path.splitext(os.path.basename(full_path))[0]
             resp = camera_client.start_session(video_base)
             if resp.get("ok"):
@@ -160,21 +161,29 @@ def stop_recording():
     if recording_task and not recording_task.done():
         recording_task.cancel()
 
-    # Stop the camera and copy its files back (non-blocking, best-effort).
+    # Stop the camera and copy its files back in a background thread so GUI
+    # doesn't block during multi-MB file transfer.
     global camera_client
     if state.camera_enabled.value and camera_client is not None:
-        try:
-            resp = camera_client.stop_session()
-            if resp.get("ok"):
-                names = [f["name"] for f in resp.get("files", [])]
-                fetched = camera_client.fetch_files(names, state.output_directory.value)
-                state.add_log_message(
-                    f"Camera stopped; copied {len(fetched)} file(s)")
-            else:
-                state.add_log_message(
-                    f"WARNING: Camera stop failed: {resp.get('error')}")
-        except Exception as exc:
-            state.add_log_message(f"WARNING: Camera stop error: {exc}")
+        _client = camera_client
+        _out_dir = state.output_directory.value
+
+        def _camera_stop_and_fetch(client, out_dir):
+            try:
+                resp = client.stop_session()
+                if resp.get("ok"):
+                    names = [f["name"] for f in resp.get("files", [])]
+                    fetched = client.fetch_files(names, out_dir)
+                    state.add_log_message(
+                        f"Camera stopped; copied {len(fetched)} file(s)")
+                else:
+                    state.add_log_message(
+                        f"WARNING: Camera stop failed: {resp.get('error')}")
+            except Exception as exc:
+                state.add_log_message(f"WARNING: Camera stop error: {exc}")
+
+        threading.Thread(target=_camera_stop_and_fetch, args=(_client, _out_dir),
+                         daemon=True).start()
     camera_client = None
 
     # Update state

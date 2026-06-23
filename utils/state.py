@@ -160,10 +160,16 @@ camera_video_filename = solara.reactive("")
 """Video filename reported by the Pi at session start."""
 
 
-def make_camera_client():
-    """Build the appropriate camera client based on mock/real state."""
+def make_camera_client(timeout=None):
+    """Build the appropriate camera client based on mock/real state.
+
+    Args:
+        timeout: Optional timeout in seconds for connection (ignored by mock).
+    """
     if camera_mock.value:
         from hardware.pi_camera_mock import MockPiCameraClient
         return MockPiCameraClient()
     from hardware.pi_camera import PiCameraClient
-    return PiCameraClient(camera_host.value, camera_port.value)
+    if timeout is None:
+        return PiCameraClient(camera_host.value, camera_port.value)
+    return PiCameraClient(camera_host.value, camera_port.value, timeout=timeout)
