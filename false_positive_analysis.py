@@ -353,13 +353,25 @@ def alignment_from_bookmark(start_time_abs, video_pts):
     """Build an alignment from a CLiQR video bookmark (frame PTS at sipper-in).
 
     The recording GUI records, at sipper insertion, the Unix start_time and the
-    concurrent video frame PTS. Their difference is a constant offset mapping
-    video PTS to absolute Unix seconds: abs = pts + offset.
+    concurrent video frame PTS. Their difference gives the video_start_unix_s
+    (the Unix timestamp when the video began): video_start = start_time_abs - video_pts.
 
-    Returns a dict {"offset": float, "method": "bookmark"} compatible with
-    video_relative_to_abs.
+    Returns a dict compatible with video_relative_to_abs(), with the same structure
+    as establish_alignment(). The bookmark frame's PTS equals start_time_abs, so:
+        video_start_unix_s = start_time_abs - video_pts
+    Drift correction is unavailable (only one anchor), so drift_corrected=False.
     """
-    return {"offset": float(start_time_abs) - float(video_pts), "method": "bookmark"}
+    video_start = float(start_time_abs) - float(video_pts)
+    return {
+        'video_start_unix_s':    video_start,
+        'sipper_in_hdf5_abs_s':  float(start_time_abs),
+        'sipper_out_hdf5_abs_s': None,
+        'drift_s':               None,
+        'drift_corrected':       False,
+        'step_magnitude':        None,
+        'removal_magnitude':     None,
+        'method':                'bookmark',
+    }
 
 
 def establish_alignment(sensor_data, sipper_in_video_s, sipper_out_video_s=None,
