@@ -132,3 +132,38 @@ DATA = 0x04
 # Recording parameters
 HISTORY_SIZE = 100  # Buffer size before HDF5 write
 NUM_CHANNELS = 6    # Channels per MPR121 (every other channel)
+
+
+# ============================================================================
+# Video Capture State (Pi camera)
+# ============================================================================
+
+camera_enabled = solara.reactive(False)
+"""Whether concurrent Pi video capture is active for this session."""
+
+camera_host = solara.reactive("raspberrypi.local")
+"""Hostname or IP of the Raspberry Pi camera server."""
+
+camera_port = solara.reactive(8770)
+"""TCP port of the Pi camera server."""
+
+camera_sensor_id = solara.reactive(None)
+"""Sensor ID (1-24) whose Start button bookmarks the video, or None."""
+
+camera_status = solara.reactive("unknown")
+"""Last known camera connection status string for the UI."""
+
+camera_mock = solara.reactive(False)
+"""Use the in-memory mock camera client (set by recording_gui_mock.py)."""
+
+camera_video_filename = solara.reactive("")
+"""Video filename reported by the Pi at session start."""
+
+
+def make_camera_client():
+    """Build the appropriate camera client based on mock/real state."""
+    if camera_mock.value:
+        from hardware.pi_camera_mock import MockPiCameraClient
+        return MockPiCameraClient()
+    from hardware.pi_camera import PiCameraClient
+    return PiCameraClient(camera_host.value, camera_port.value)
