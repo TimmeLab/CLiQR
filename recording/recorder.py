@@ -235,6 +235,41 @@ class SensorRecorder:
                     del group[weight_name]
                 group.create_dataset(weight_name, data=weight)
 
+    def _serial_for_sensor(self, sensor_id: int) -> str:
+        """Return the board serial number that owns the given sensor."""
+        from utils.state import SERIAL_NUMBER_SENSOR_MAP
+        import numpy as np
+
+        sn_idx = [sensor_id in sensors for sensors in SERIAL_NUMBER_SENSOR_MAP.values()]
+        return str(np.array(list(SERIAL_NUMBER_SENSOR_MAP.keys()))[sn_idx].item())
+
+    def write_video_metadata(self, sensor_id: int, frame_index=None, pts=None,
+                             video_filename=None, cycle=0):
+        """Write video bookmark metadata for a sensor's recording cycle.
+
+        Datasets mirror the start_time cycle-suffix convention:
+        cycle 0 -> "video_frame_index", cycle 1 -> "video_frame_index1", etc.
+        """
+        sn = self._serial_for_sensor(sensor_id)
+        suffix = "" if cycle == 0 else str(cycle)
+
+        with h5py.File(self.filename, "r+") as h5f:
+            group_path = f"board_{sn}/sensor_{sensor_id}"
+            if group_path not in h5f:
+                h5f[f"board_{sn}"].create_group(f"sensor_{sensor_id}")
+            group = h5f[group_path]
+
+            for base, value in (
+                (f"video_frame_index{suffix}", frame_index),
+                (f"video_pts{suffix}", pts),
+                (f"video_filename{suffix}", video_filename),
+            ):
+                if value is None:
+                    continue
+                if base in group:
+                    del group[base]
+                group.create_dataset(base, data=value)
+
     def write_comments(self, comments: str):
         """
         Write session comments to the HDF5 file.
