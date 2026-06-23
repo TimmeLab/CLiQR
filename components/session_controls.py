@@ -16,6 +16,9 @@ from recording.recorder import SensorRecorder
 current_recorder = None
 recording_task = None
 
+# Active Pi camera client for the current session (None when camera disabled)
+camera_client = None
+
 
 def start_recording():
     """Start a new recording session."""
@@ -80,6 +83,24 @@ def start_recording():
 
     recording_task = asyncio.create_task(run_recording())
 
+    # Optionally start concurrent Pi video pre-roll (non-blocking).
+    global camera_client
+    camera_client = None
+    if state.camera_enabled.value:
+        try:
+            camera_client = state.make_camera_client()
+            video_base = os.path.splitext(os.path.basename(full_path))[0]
+            resp = camera_client.start_session(video_base)
+            if resp.get("ok"):
+                state.camera_video_filename.set(resp.get("video_filename", ""))
+                state.add_log_message(
+                    f"Camera pre-roll started: {resp.get('video_filename')}")
+            else:
+                state.add_log_message(
+                    f"WARNING: Camera start failed: {resp.get('error')}")
+        except Exception as exc:
+            state.add_log_message(f"WARNING: Camera start error: {exc}")
+
     state.add_log_message(f"Recording session started - saving to: {full_path}")
 
 
@@ -138,6 +159,23 @@ def stop_recording():
     # Cancel the async task
     if recording_task and not recording_task.done():
         recording_task.cancel()
+
+    # Stop the camera and copy its files back (non-blocking, best-effort).
+    global camera_client
+    if state.camera_enabled.value and camera_client is not None:
+        try:
+            resp = camera_client.stop_session()
+            if resp.get("ok"):
+                names = [f["name"] for f in resp.get("files", [])]
+                fetched = camera_client.fetch_files(names, state.output_directory.value)
+                state.add_log_message(
+                    f"Camera stopped; copied {len(fetched)} file(s)")
+            else:
+                state.add_log_message(
+                    f"WARNING: Camera stop failed: {resp.get('error')}")
+        except Exception as exc:
+            state.add_log_message(f"WARNING: Camera stop error: {exc}")
+    camera_client = None
 
     # Update state
     state.recording_all.set(False)
