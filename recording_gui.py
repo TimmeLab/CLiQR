@@ -13,6 +13,7 @@ from components.hardware_status import HardwareStatusCard
 from components.session_controls import SessionControlsCard
 from components.sensor_card import SensorGrid
 from components.plot_dialog import TestPlotDialog
+from components.camera_controls import CameraControlsCard
 
 
 @solara.component
@@ -30,6 +31,9 @@ def Page():
 
         # Session Controls Section
         SessionControlsCard()
+
+        # Video Capture (Pi camera) Section
+        CameraControlsCard()
 
         # Sensor Grid
         SensorGrid()
