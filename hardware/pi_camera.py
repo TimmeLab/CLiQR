@@ -56,16 +56,32 @@ class PiCameraClient:
         try:
             with socket.create_connection((self.host, self.port), self.timeout) as sock:
                 sock.settimeout(self.timeout)
+                reader = sock.makefile("rb")
                 for name in names:
                     sock.sendall(protocol.encode_message(
                         protocol.make_request(protocol.GET_FILE, name=name)))
-                    header = protocol.decode_message(self._recv_line(sock))
+                    header_line = reader.readline()
+                    if not header_line:
+                        break
+                    header = protocol.decode_message(header_line)
                     if not header.get("ok"):
                         continue
-                    saved.append(self._recv_file(sock, dest / name, header["size"]))
+                    saved.append(self._recv_file_buffered(reader, dest / name, header["size"]))
         except Exception:
-            return saved
+            return [p for p in saved if p is not None]
         return [p for p in saved if p is not None]
+
+    @staticmethod
+    def _recv_file_buffered(reader, path: Path, size: int):
+        received = 0
+        with open(path, "wb") as fh:
+            while received < size:
+                chunk = reader.read(min(65536, size - received))
+                if not chunk:
+                    return None
+                fh.write(chunk)
+                received += len(chunk)
+        return path
 
     @staticmethod
     def _recv_file(sock: socket.socket, path: Path, size: int):
