@@ -3,7 +3,17 @@
 Holds no networking and no camera code: it maps decoded protocol requests
 to a camera backend and returns response dicts. This keeps the command
 logic unit-testable with a fake backend (no picamera2, no hardware).
+
+picamera2's encoder/FfmpegOutput pipeline is bound to the thread that calls
+start_recording: if that thread exits, the mp4 is never finalized. The TCP
+front-end is a ThreadingTCPServer and the desktop client opens a fresh
+connection per request, so each request would otherwise run on a throwaway
+handler thread that dies after responding. We therefore funnel every backend
+call through a single long-lived worker thread so the camera lifecycle is
+owned by one persistent thread.
 """
+from concurrent.futures import ThreadPoolExecutor
+
 from video import protocol
 
 
@@ -12,8 +22,13 @@ class CameraServer:
 
     def __init__(self, backend):
         self.backend = backend
+        # max_workers=1 -> one persistent thread owns every backend/camera call.
+        self._camera = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera")
 
     def handle(self, request: dict) -> dict:
+        return self._camera.submit(self._handle, request).result()
+
+    def _handle(self, request: dict) -> dict:
         cmd = request.get("cmd")
         try:
             if cmd == protocol.PING:

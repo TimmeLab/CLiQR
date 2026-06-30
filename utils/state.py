@@ -141,7 +141,7 @@ NUM_CHANNELS = 6    # Channels per MPR121 (every other channel)
 camera_enabled = solara.reactive(False)
 """Whether concurrent Pi video capture is active for this session."""
 
-camera_host = solara.reactive("raspberrypi.local")
+camera_host = solara.reactive("picamera0.local")
 """Hostname or IP of the Raspberry Pi camera server."""
 
 camera_port = solara.reactive(8770)
