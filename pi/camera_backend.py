@@ -10,6 +10,26 @@ picamera2 is imported lazily so this module only loads on the Pi.
 import time
 from pathlib import Path
 
+# imx708 fast readout mode: 1536x864 supports up to 120 fps. Locking both
+# FrameDurationLimits to 1e6/120 us pins the sensor to a fixed 120 fps (subject
+# to exposure headroom in low light).
+FAST_MODE_SIZE = (1536, 864)
+TARGET_FPS = 120
+_FRAME_DURATION_US = round(1_000_000 / TARGET_FPS)  # 8333 us
+
+
+def video_config_kwargs() -> dict:
+    """Kwargs for Picamera2.create_video_configuration to record 1536x864p120.
+
+    Pure (no picamera2 import) so the intended resolution/fps are testable
+    off-hardware.
+    """
+    return {
+        "main": {"size": FAST_MODE_SIZE},
+        "raw": {"size": FAST_MODE_SIZE},
+        "controls": {"FrameDurationLimits": (_FRAME_DURATION_US, _FRAME_DURATION_US)},
+    }
+
 
 class Picamera2Backend:
     def __init__(self, output_dir: str = "."):
@@ -33,7 +53,7 @@ class Picamera2Backend:
         from picamera2.outputs import FfmpegOutput
 
         self._picam2 = Picamera2()
-        config = self._picam2.create_video_configuration()
+        config = self._picam2.create_video_configuration(**video_config_kwargs())
         self._picam2.configure(config)
 
         self._video_path = self.output_dir / f"{name}.mp4"
