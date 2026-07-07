@@ -117,12 +117,26 @@ show_test_dialog = solara.reactive(False)
 # ============================================================================
 
 # Sensor mapping (same as in DataRecording.ipynb)
+# SERIAL_NUMBER_SENSOR_MAP = {
+#     "FT232H0": [1, 2, 3, 7, 8, 9],
+#     "FT232H1": [4, 5, 6, 10, 11, 12],
+#     "FT232H2": [13, 14, 15, 19, 20, 21],
+#     "FT232H3": [16, 17, 18, 22, 23, 24],
+# }
+# For the new DID rack, we now have 8 FT232H boards so
+# that cables don't have to be run so far and things are a bit
+# more organized
 SERIAL_NUMBER_SENSOR_MAP = {
-    "FT232H0": [1, 2, 3, 7, 8, 9],
-    "FT232H1": [4, 5, 6, 10, 11, 12],
-    "FT232H2": [13, 14, 15, 19, 20, 21],
-    "FT232H3": [16, 17, 18, 22, 23, 24],
+    "FT232H0": [1, 2, 3],
+    "FT232H1": [7, 8, 9],
+    "FT232H2": [4, 5, 6],
+    "FT232H3": [10, 11, 12],
+    "FT232H4": [13, 14, 15],
+    "FT232H5": [19, 20, 21],
+    "FT232H6": [16, 17, 18],
+    "FT232H7": [22, 23, 24],
 }
+
 
 # MPR121 register addresses
 SOFT_RESET = 0x80
