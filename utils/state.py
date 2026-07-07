@@ -145,7 +145,11 @@ DATA = 0x04
 
 # Recording parameters
 HISTORY_SIZE = 100  # Buffer size before HDF5 write
-NUM_CHANNELS = 6    # Channels per MPR121 (every other channel)
+# On the new 8-board rack each MPR121 has only 3 sensors wired, on
+# channels 1, 6 and 11. read_sensor_data reads these in this order and
+# maps them to the 3 sensor IDs for the board (see SERIAL_NUMBER_SENSOR_MAP).
+ACTIVE_CHANNELS = [1, 6, 11]  # MPR121 channels actually wired
+NUM_CHANNELS = len(ACTIVE_CHANNELS)  # Channels recorded per MPR121
 
 
 # ============================================================================

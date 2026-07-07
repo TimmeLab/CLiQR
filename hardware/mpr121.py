@@ -86,7 +86,7 @@ class MPR121Manager:
             Tuple of (time_data, cap_data, serial_number)
         """
         from collections import deque
-        from utils.state import NUM_CHANNELS
+        from utils.state import NUM_CHANNELS, ACTIVE_CHANNELS
 
         if serial_number not in self.controllers:
             raise ValueError(f"No controller found for {serial_number}")
@@ -98,24 +98,13 @@ class MPR121Manager:
         # Read 24 bytes (2 bytes for each of the 12 channels)
         raw_buffer = port.read_from(DATA, 24)
 
-        # We only record every other channel starting with channel 1
-        # (channels 1, 3, 5, 7, 9, 11 = 6 channels total)
-        if NUM_CHANNELS == 6:
-            for chan in range(12):
-                # Skip even channels
-                if chan % 2 == 0:
-                    continue
-
-                # Combine two bytes (little-endian)
-                value = raw_buffer[2 * chan] | (raw_buffer[2 * chan + 1] << 8)
-                local_cap_data.append(value)
-                local_time_data.append(time.time())
-        else:
-            # Record all 12 channels
-            for chan in range(12):
-                value = raw_buffer[2 * chan] | (raw_buffer[2 * chan + 1] << 8)
-                local_cap_data.append(value)
-                local_time_data.append(time.time())
+        # Only the wired channels (ACTIVE_CHANNELS = 1, 6, 11) are recorded.
+        # Order matches the 3 sensor IDs mapped to this board.
+        for chan in ACTIVE_CHANNELS:
+            # Combine two bytes (little-endian)
+            value = raw_buffer[2 * chan] | (raw_buffer[2 * chan + 1] << 8)
+            local_cap_data.append(value)
+            local_time_data.append(time.time())
 
         return local_time_data, local_cap_data, serial_number
 
