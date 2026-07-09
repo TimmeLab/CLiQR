@@ -10,23 +10,35 @@ picamera2 is imported lazily so this module only loads on the Pi.
 import time
 from pathlib import Path
 
-# imx708 fast readout mode: 1536x864 supports up to 120 fps. Locking both
-# FrameDurationLimits to 1e6/120 us pins the sensor to a fixed 120 fps (subject
-# to exposure headroom in low light).
-FAST_MODE_SIZE = (1536, 864)
+# imx708 fast readout mode: the sensor's 1536x864 mode runs at up to 120 fps.
+# Requesting a 1536x864 *raw* stream pins the sensor to that fast mode; locking
+# both FrameDurationLimits to 1e6/120 us then fixes it at 120 fps (subject to
+# exposure headroom in low light).
+#
+# The Pi 5 has no hardware H.264 encoder, so start_recording() runs libav's
+# software encoder. Encoding the full 1536x864 main stream at 120 fps saturates
+# the CPU and drops ~10-20% of frames (see docs/superpowers/specs/
+# 2026-07-08-framerate-bottleneck-diagnosis-design.md). Downscaling the encoded
+# main stream to 1280x720 and capping the bitrate keeps the encoder inside its
+# budget: measured drop-free over a 60 s run at 120 fps. Frame *capture* stays at
+# the sensor's native 1536x864/120; only the recorded video is downscaled.
+SENSOR_FAST_MODE_SIZE = (1536, 864)
+RECORD_SIZE = (1280, 720)
 TARGET_FPS = 120
+BITRATE = 3_000_000  # bits/s; keeps 720p120 software H.264 drop-free
 _FRAME_DURATION_US = round(1_000_000 / TARGET_FPS)  # 8333 us
 
 
 def video_config_kwargs() -> dict:
-    """Kwargs for Picamera2.create_video_configuration to record 1536x864p120.
+    """Kwargs for Picamera2.create_video_configuration.
 
-    Pure (no picamera2 import) so the intended resolution/fps are testable
-    off-hardware.
+    Encodes a 1280x720 main stream while the 1536x864 raw stream pins the
+    sensor to its fast 120 fps mode. Pure (no picamera2 import) so the intended
+    resolution/fps are testable off-hardware.
     """
     return {
-        "main": {"size": FAST_MODE_SIZE},
-        "raw": {"size": FAST_MODE_SIZE},
+        "main": {"size": RECORD_SIZE},
+        "raw": {"size": SENSOR_FAST_MODE_SIZE},
         "controls": {"FrameDurationLimits": (_FRAME_DURATION_US, _FRAME_DURATION_US)},
     }
 
@@ -62,7 +74,7 @@ class Picamera2Backend:
         self._frame_count = 0
         self._picam2.pre_callback = self._on_frame
 
-        self._encoder = H264Encoder()
+        self._encoder = H264Encoder(bitrate=BITRATE)
         self._picam2.start_recording(self._encoder, FfmpegOutput(str(self._video_path)))
         self._active = True
         return self._video_path.name

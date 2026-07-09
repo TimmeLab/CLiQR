@@ -1,10 +1,11 @@
-"""The Pi camera must be configured for its fast 1536x864p120 mode.
+"""The Pi camera captures in its fast 1536x864p120 sensor mode but records a
+downscaled 1280x720 stream so the Pi 5 software H.264 encoder can keep up.
 
 camera_backend builds the picamera2 config from a pure helper so the intended
 resolution and frame rate are testable off-hardware (picamera2 itself is
 imported lazily only on the Pi).
 """
-from pi.camera_backend import video_config_kwargs, TARGET_FPS
+from pi.camera_backend import video_config_kwargs, TARGET_FPS, BITRATE
 
 
 def test_target_fps_is_120():
@@ -18,7 +19,17 @@ def test_config_locks_frame_duration_for_120fps():
     assert lo == hi == 8333
 
 
-def test_config_uses_full_fast_mode_resolution():
+def test_raw_stream_pins_fast_sensor_mode():
+    # The 1536x864 raw stream forces the sensor's 120 fps fast readout mode.
     kwargs = video_config_kwargs()
-    assert kwargs["main"]["size"] == (1536, 864)
     assert kwargs["raw"]["size"] == (1536, 864)
+
+
+def test_main_stream_downscaled_for_encoder_budget():
+    # Encoded stream is 1280x720 so software H.264 stays drop-free at 120 fps.
+    kwargs = video_config_kwargs()
+    assert kwargs["main"]["size"] == (1280, 720)
+
+
+def test_bitrate_capped_for_drop_free_encode():
+    assert BITRATE == 3_000_000
