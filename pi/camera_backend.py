@@ -39,7 +39,11 @@ def video_config_kwargs() -> dict:
     return {
         "main": {"size": RECORD_SIZE},
         "raw": {"size": SENSOR_FAST_MODE_SIZE},
-        "controls": {"FrameDurationLimits": (_FRAME_DURATION_US, _FRAME_DURATION_US)},
+        "controls": {
+            "FrameDurationLimits": (_FRAME_DURATION_US, _FRAME_DURATION_US),
+            "AfMode": 0,
+            "LensPosition": 1000,
+        },
     }
 
 
