@@ -15,18 +15,19 @@ import h5py
 import numpy as np
 import pandas as pd
 
+from utils.state import SERIAL_NUMBER_SENSOR_MAP
+
 logger = logging.getLogger(__name__)
 
-# ── Sensor → board mapping (mirrors recording_gui / data_analysis hardcoding) ──
+# ── Sensor → board mapping ──
+# Derived from the single source of truth in utils.state so it can never drift
+# out of sync with the rack wiring the recorder actually writes to HDF5 (the
+# previous hardcoded copy still encoded the retired 4-board layout and produced
+# KeyErrors on 8-board recordings). The HDF5 groups are named "board_{serial}".
 SENSOR_BOARD_MAP = {
-    1: 'board_FT232H0', 2: 'board_FT232H0', 3: 'board_FT232H0',
-    7: 'board_FT232H0', 8: 'board_FT232H0', 9: 'board_FT232H0',
-    4: 'board_FT232H1', 5: 'board_FT232H1', 6: 'board_FT232H1',
-    10: 'board_FT232H1', 11: 'board_FT232H1', 12: 'board_FT232H1',
-    13: 'board_FT232H2', 14: 'board_FT232H2', 15: 'board_FT232H2',
-    19: 'board_FT232H2', 20: 'board_FT232H2', 21: 'board_FT232H2',
-    16: 'board_FT232H3', 17: 'board_FT232H3', 18: 'board_FT232H3',
-    22: 'board_FT232H3', 23: 'board_FT232H3', 24: 'board_FT232H3',
+    sensor: f"board_{serial}"
+    for serial, sensors in SERIAL_NUMBER_SENSOR_MAP.items()
+    for sensor in sensors
 }
 
 LABEL_BOUT_START   = 'Licking Bout Start'
@@ -129,13 +130,16 @@ def load_frame_offsets(txt_path):
     """
     Load Pi camera .txt timestamp file.
 
-    Line 1: absolute timestamp header (Pi clock — unreliable, discarded).
-    Line 2: description string (discarded).
-    Lines 3+: integer nanoseconds since video start, one per frame, 0-indexed.
+    Format written by pi/camera_backend.py:_on_frame — one integer per line,
+    no header, each the frame's absolute SensorTimestamp in nanoseconds (a
+    monotonic sensor clock, NOT Unix), 0-indexed by capture order. video/
+    sync_video.py reads the same file the same way. The absolute epoch cancels
+    downstream: alignment_from_bookmark() subtracts the bookmark's video_pts,
+    which is the same clock, so only elapsed time survives.
 
-    Returns numpy int64 array of per-frame ns offsets.
+    Returns numpy int64 array of per-frame absolute-ns timestamps.
     """
-    offsets = np.loadtxt(txt_path, skiprows=2, dtype=np.int64)
+    offsets = np.loadtxt(txt_path, dtype=np.int64)
     return offsets
 
 
@@ -327,10 +331,14 @@ def detect_sipper_step(cap_data, time_data, t_min, t_max, direction='down',
     # sustained handling dip (several seconds wide)
     win  = max(3, int(smooth_s * fs))
     half = win // 2
-    smoothed = np.array([
-        np.median(c_win[max(0, i - half):i + half + 1])
-        for i in range(n)
-    ])
+    # Centered rolling median, C-level (was an O(n*win) Python comprehension).
+    # window=2*half+1 with min_periods=1 reproduces the old clamped-edge windows.
+    smoothed = (
+        pd.Series(c_win)
+        .rolling(window=2 * half + 1, center=True, min_periods=1)
+        .median()
+        .to_numpy()
+    )
 
     # Minimum of smoothed trace = deepest point of handling dip
     dip_idx  = int(np.argmin(smoothed))
@@ -357,8 +365,17 @@ def alignment_from_bookmark(start_time_abs, video_pts):
     (the Unix timestamp when the video began): video_start = start_time_abs - video_pts.
 
     Returns a dict compatible with video_relative_to_abs(), with the same structure
-    as establish_alignment(). The bookmark frame's PTS equals start_time_abs, so:
+    as establish_alignment(). The bookmark was taken at the sensor start (Unix
+    start_time_abs), so:
         video_start_unix_s = start_time_abs - video_pts
+
+    NOTE: video_pts is stored in the SensorTimestamp clock (seconds), the SAME
+    clock as load_frame_offsets(). Do NOT "fix" this to a relative-seconds pts —
+    the large absolute epoch is intentional and cancels when video_relative_to_abs()
+    adds the frame's absolute offset back (abs = start_time_abs + (offset/1e9 -
+    video_pts)). Producer and both consumers (this and video/sync_video.py) must
+    keep using the same clock on both sides.
+
     Drift correction is unavailable (only one anchor), so drift_corrected=False.
     """
     video_start = float(start_time_abs) - float(video_pts)
