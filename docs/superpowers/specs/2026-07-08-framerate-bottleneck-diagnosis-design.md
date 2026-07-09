@@ -1,7 +1,7 @@
 # Frame-Rate Bottleneck Diagnosis & Fix — Design
 
 **Date:** 2026-07-08
-**Status:** Design approved, diagnosis in progress
+**Status:** Resolved — see Results below
 
 ## Problem
 
@@ -90,3 +90,51 @@ any console output) for analysis.
 A recording configuration with **zero (or <1%) dropped frames** at the highest
 fps the Pi 5 pipeline sustains, with `TARGET_FPS` set to match and the mechanism
 understood (not just empirically tuned).
+
+## Results
+
+Ran the ladder as isolated 30–60 s recordings on the Pi (Claude analyzed each
+`.txt`):
+
+- **Step 0** — Confirmed Pi 5, 4 cores, `libav_h264_encoder` (software H.264, no
+  hardware encode).
+- **Step 2 (encoder off)** — 120.12 fps, **0% drops**, max interval 8.33 ms.
+  Capture/CSI/callback sustain 120 fps perfectly. Every drop dies at the encoder.
+- **Step 3 (CPU)** — Encoder already multithreaded across ~3.4 of 4 cores, one
+  thread pegged at 100%. Machine is CPU-saturated by encode; "add threads" is not
+  a lever. Not memory-bound (214 MB RES, 14 GB free).
+- **Step 4 (resolution sweep, encoder on)** — 1536×864: 9.1% drops; 1280×720:
+  0.2%; 1024×576: 0%. Drops scale with pixel count, as expected for x264.
+- **Bitrate sweep at 1280×720, 60 s** — 3 Mbps: 0%; 6 Mbps: 0.29%; libav default:
+  0.79% with a 383 ms stall and an ffmpeg `Thread message queue blocking
+  (thread_queue_size 64)` warning — the mux input queue overflowing when encode
+  can't keep up. Lower bitrate drains the queue.
+
+**Root cause:** software H.264 (Pi 5 has no hardware encoder) at full
+1536×864/120 saturates the CPU; the ffmpeg mux queue backs up and drops frames
+in bursts.
+
+**Fix applied** (`pi/camera_backend.py`): encode a downscaled **1280×720** main
+stream at a **3 Mbps** cap, keeping the 1536×864 raw stream to pin the sensor's
+fast 120 fps mode. Capture stays native 1536×864/120; only the recorded video is
+downscaled.
+
+**Validation on the real pipeline** (full concurrent load — MPR121 racks,
+network, server — 70 s, `raw_data_2026-07-09_09-20-33`):
+
+| Metric | Before (1536×864, default br) | After (1280×720, 3 Mbps) |
+|---|---|---|
+| Effective fps | 104.4 | **119.7** |
+| Dropped frames | 13–20% | **0.24%** (28 / 8364) |
+| Worst stall | 1432 ms | **25 ms** (3 frames) |
+
+Success criterion met: <1% drops at a stable 120 fps, worst-case gap 25 ms.
+The camera server must be **restarted** after deploying config changes — a
+running server holds the old `camera_backend.py` in memory (this bit us once
+during validation).
+
+### Remaining levers (unused; only if drops reappear under harsher conditions)
+
+- Drop bitrate to 2 Mbps.
+- Go 1024×576 (was rock-solid 0% in the sweep).
+- Set the encoder-native `YUV420` main format to skip XBGR8888→YUV420 conversion.
