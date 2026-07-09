@@ -29,6 +29,24 @@ camera_client = None
 CAMERA_START_TIMEOUT = 10.0
 
 
+def _reset_sensor_lifecycle():
+    """Reset each sensor's recording lifecycle for a new session.
+
+    Each session writes a fresh HDF5 file, so recording cycles must restart at 0.
+    Without this the cycle counter carried over from the previous session and the
+    new session's first recording was written under a suffixed dataset name
+    (start_time1, video_pts1, ...) that the analysis, which reads cycle 0, could
+    not find. Animal IDs and volume/weight inputs are preserved.
+    """
+    sensors = state.sensor_states.value.copy()
+    for sid, s in sensors.items():
+        sensors[sid] = replace(
+            s, is_recording=False, status="idle",
+            recording_cycle=0, elapsed_seconds=0, start_time=0.0,
+        )
+    state.sensor_states.set(sensors)
+
+
 def _start_camera(video_base):
     """Start the Pi camera pre-roll for this session.
 
@@ -95,6 +113,9 @@ def start_recording():
     state.filename.set(full_path)
     state.recording_all.set(True)
     state.session_error.set("")  # Clear error on successful start
+
+    # Fresh file -> restart every sensor's recording cycle at 0.
+    _reset_sensor_lifecycle()
 
     # Create recorder instance
     from components.hardware_status import mpr121_manager
