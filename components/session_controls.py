@@ -17,8 +17,43 @@ from recording.recorder import SensorRecorder
 current_recorder = None
 recording_task = None
 
-# Active Pi camera client for the current session (None when camera disabled)
+# Active Pi camera client for the current session (None when camera disabled or
+# when the camera failed to start).
 camera_client = None
+
+# The Pi's START_SESSION does a full Picamera2 warmup (create + configure +
+# start_recording) before replying, which takes longer than a normal request;
+# use a generous timeout so a slow-but-successful start isn't misreported as a
+# failure. (The previous 2.0s override was shorter than the client default and
+# could time out mid-warmup.)
+CAMERA_START_TIMEOUT = 10.0
+
+
+def _start_camera(video_base):
+    """Start the Pi camera pre-roll for this session.
+
+    On success, sets the module-level camera_client and camera_video_filename.
+    On any failure, leaves camera_client None and clears camera_video_filename
+    so later per-sensor bookmarks are skipped cleanly and stop_recording does
+    not spawn a doomed stop/fetch against a session that never started.
+    """
+    global camera_client
+    camera_client = None
+    state.camera_video_filename.set("")
+
+    try:
+        client = state.make_camera_client(timeout=CAMERA_START_TIMEOUT)
+        resp = client.start_session(video_base)
+    except Exception as exc:
+        state.add_log_message(f"WARNING: Camera start error: {exc}")
+        return
+
+    if resp.get("ok"):
+        camera_client = client
+        state.camera_video_filename.set(resp.get("video_filename", ""))
+        state.add_log_message(f"Camera pre-roll started: {resp.get('video_filename')}")
+    else:
+        state.add_log_message(f"WARNING: Camera start failed: {resp.get('error')}")
 
 
 def start_recording():
@@ -84,23 +119,10 @@ def start_recording():
 
     recording_task = asyncio.create_task(run_recording())
 
-    # Optionally start concurrent Pi video pre-roll with short timeout (non-blocking).
-    global camera_client
-    camera_client = None
+    # Optionally start concurrent Pi video pre-roll.
     if state.camera_enabled.value:
-        try:
-            camera_client = state.make_camera_client(timeout=2.0)
-            video_base = os.path.splitext(os.path.basename(full_path))[0]
-            resp = camera_client.start_session(video_base)
-            if resp.get("ok"):
-                state.camera_video_filename.set(resp.get("video_filename", ""))
-                state.add_log_message(
-                    f"Camera pre-roll started: {resp.get('video_filename')}")
-            else:
-                state.add_log_message(
-                    f"WARNING: Camera start failed: {resp.get('error')}")
-        except Exception as exc:
-            state.add_log_message(f"WARNING: Camera start error: {exc}")
+        video_base = os.path.splitext(os.path.basename(full_path))[0]
+        _start_camera(video_base)
 
     state.add_log_message(f"Recording session started - saving to: {full_path}")
 
