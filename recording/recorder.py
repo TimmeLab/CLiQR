@@ -200,11 +200,7 @@ class SensorRecorder:
             cycle: Recording cycle number (0 for first, 1 for second, etc.)
         """
         # Find which board this sensor is on
-        from utils.state import SERIAL_NUMBER_SENSOR_MAP
-        import numpy as np
-
-        sn_idx = [sensor_id in sensors for sensors in SERIAL_NUMBER_SENSOR_MAP.values()]
-        sn = str(np.array(list(SERIAL_NUMBER_SENSOR_MAP.keys()))[sn_idx].item())
+        sn = self._serial_for_sensor(sensor_id)
 
         with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             group_path = f"board_{sn}/sensor_{sensor_id}"
@@ -302,14 +298,12 @@ class SensorRecorder:
             Tuple of (cap_data, time_data) lists, or (None, None) if no data available
         """
         from utils.state import SERIAL_NUMBER_SENSOR_MAP
-        import numpy as np
 
         # Find which board this sensor is on
-        sn_idx = [sensor_id in sensors for sensors in SERIAL_NUMBER_SENSOR_MAP.values()]
-        if not any(sn_idx):
+        if not any(sensor_id in sensors for sensors in SERIAL_NUMBER_SENSOR_MAP.values()):
             return None, None
 
-        sn = str(np.array(list(SERIAL_NUMBER_SENSOR_MAP.keys()))[sn_idx].item())
+        sn = self._serial_for_sensor(sensor_id)
 
         # Check if this sensor has data in the buffer
         if sn not in self.board_cap_data or sensor_id not in self.board_cap_data[sn]:

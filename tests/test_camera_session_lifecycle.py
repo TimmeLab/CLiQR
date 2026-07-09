@@ -93,3 +93,25 @@ def test_stop_session_releases_the_camera(tmp_path):
     backend.stop_session()
     assert cam.closed is True
     assert _FakeCamera._live == 0
+
+
+class _FakeRequest:
+    def __init__(self, ts_ns):
+        self._ts_ns = ts_ns
+
+    def get_metadata(self):
+        return {"SensorTimestamp": self._ts_ns}
+
+
+def test_bookmark_index_and_pts_describe_same_frame(tmp_path):
+    backend = _FakeBackend(output_dir=str(tmp_path))
+    backend.start_session("clip")
+    for ts_ns in (1_000_000, 2_000_000, 3_000_000):
+        backend._on_frame(_FakeRequest(ts_ns))
+
+    mark = backend.bookmark(sensor_id=5)
+
+    # 3 frames logged -> index 3, pts is the last logged frame's timestamp.
+    assert mark["frame_index"] == 3
+    assert mark["pts"] == 3_000_000 / 1e9
+    backend.stop_session()

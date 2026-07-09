@@ -82,15 +82,3 @@ class PiCameraClient:
                 fh.write(chunk)
                 received += len(chunk)
         return path
-
-    @staticmethod
-    def _recv_file(sock: socket.socket, path: Path, size: int):
-        received = 0
-        with open(path, "wb") as fh:
-            while received < size:
-                chunk = sock.recv(min(65536, size - received))
-                if not chunk:
-                    return None
-                fh.write(chunk)
-                received += len(chunk)
-        return path

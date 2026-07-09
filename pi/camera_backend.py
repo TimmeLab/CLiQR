@@ -54,6 +54,7 @@ class Picamera2Backend:
         self._pts_path = None
         self._video_path = None
         self._frame_count = 0
+        self._last_frame_ts_ns = 0
 
     @property
     def is_active(self) -> bool:
@@ -109,16 +110,19 @@ class Picamera2Backend:
         # Pending validation on Pi.
         self._pts_fh.write(f"{timestamp}\n")
         self._frame_count += 1
+        self._last_frame_ts_ns = timestamp
 
     def bookmark(self, sensor_id) -> dict:
-        metadata = self._picam2.capture_metadata()
-        pts = metadata.get("SensorTimestamp", 0) / 1e9
+        # frame_index and pts must describe the SAME frame: the most recent one
+        # the pre_callback logged. capture_metadata() would instead fetch (and
+        # block until) a newer frame, whose timestamp would not match
+        # frame_index, biasing the video<->trace anchor.
         # TODO: Change to report pts as relative seconds (relative to session start /
         # first_frame_SensorTimestamp) for consistency with alignment_from_bookmark()
         # and the planned .txt format change. Pending validation on Pi.
         return {
             "frame_index": self._frame_count,
-            "pts": pts,
+            "pts": self._last_frame_ts_ns / 1e9,
             "pi_monotonic": time.monotonic(),
         }
 
