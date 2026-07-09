@@ -59,12 +59,33 @@ class Picamera2Backend:
     def is_active(self) -> bool:
         return self._active
 
-    def start_session(self, name: str) -> str:
+    # picamera2 construction is funnelled through these hooks so the session
+    # lifecycle is testable off-hardware (a test backend overrides them).
+    def _create_camera(self):
         from picamera2 import Picamera2
-        from picamera2.encoders import H264Encoder
-        from picamera2.outputs import FfmpegOutput
+        return Picamera2()
 
-        self._picam2 = Picamera2()
+    def _create_encoder(self):
+        from picamera2.encoders import H264Encoder
+        return H264Encoder(bitrate=BITRATE)
+
+    def _create_output(self, video_path):
+        from picamera2.outputs import FfmpegOutput
+        return FfmpegOutput(str(video_path))
+
+    def _release_camera(self):
+        """Close and drop the camera so the device is released for reuse."""
+        if self._picam2 is not None:
+            try:
+                self._picam2.close()
+            finally:
+                self._picam2 = None
+
+    def start_session(self, name: str) -> str:
+        # Defensive: free any camera a prior session left held (e.g. a stop that
+        # never ran) so acquire() can't fail with "camera already in use".
+        self._release_camera()
+        self._picam2 = self._create_camera()
         config = self._picam2.create_video_configuration(**video_config_kwargs())
         self._picam2.configure(config)
 
@@ -74,8 +95,8 @@ class Picamera2Backend:
         self._frame_count = 0
         self._picam2.pre_callback = self._on_frame
 
-        self._encoder = H264Encoder(bitrate=BITRATE)
-        self._picam2.start_recording(self._encoder, FfmpegOutput(str(self._video_path)))
+        self._encoder = self._create_encoder()
+        self._picam2.start_recording(self._encoder, self._create_output(self._video_path))
         self._active = True
         return self._video_path.name
 
@@ -102,9 +123,16 @@ class Picamera2Backend:
         }
 
     def stop_session(self) -> list:
-        self._picam2.stop_recording()
-        self._pts_fh.close()
-        self._active = False
+        try:
+            self._picam2.stop_recording()
+        finally:
+            # Always release the device and close the file, even if
+            # stop_recording raised, so the next session can acquire the camera.
+            self._release_camera()
+            if self._pts_fh is not None:
+                self._pts_fh.close()
+                self._pts_fh = None
+            self._active = False
         files = []
         for path in (self._video_path, self._pts_path):
             files.append({"name": path.name, "size": path.stat().st_size})
