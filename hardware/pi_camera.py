@@ -48,6 +48,10 @@ class PiCameraClient:
     def stop_session(self) -> dict:
         return self._request(protocol.make_request(protocol.STOP_SESSION))
 
+    def snapshot(self) -> dict:
+        """Grab one still JPEG (base64 in the reply) for an alignment check."""
+        return self._request(protocol.make_request(protocol.SNAPSHOT))
+
     def fetch_files(self, names, dest_dir: str) -> list:
         """Download each named file via GET_FILE into dest_dir. Returns paths."""
         dest = Path(dest_dir)

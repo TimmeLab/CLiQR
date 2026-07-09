@@ -74,6 +74,33 @@ class Picamera2Backend:
         from picamera2.outputs import FfmpegOutput
         return FfmpegOutput(str(video_path))
 
+    def _capture_jpeg(self, cam):
+        """Capture one full-FOV still as JPEG bytes from an already-started cam."""
+        from io import BytesIO
+        buf = BytesIO()
+        cam.capture_file(buf, format="jpeg")
+        return buf.getvalue()
+
+    def snapshot(self) -> bytes:
+        """Grab one still JPEG for a pre-recording alignment check.
+
+        Idle-only: opens a throwaway camera, captures a full-FOV still at
+        RECORD_SIZE (so framing matches the recorded video), and releases the
+        device. Does not touch the session state; the server refuses SNAPSHOT
+        while a session is active, so self._picam2 is None here.
+        """
+        cam = self._create_camera()
+        try:
+            cam.configure(cam.create_still_configuration(main={"size": RECORD_SIZE}))
+            cam.start()
+            return self._capture_jpeg(cam)
+        finally:
+            try:
+                cam.stop()
+            except Exception:
+                pass
+            cam.close()
+
     def _release_camera(self):
         """Close and drop the camera so the device is released for reuse."""
         if self._picam2 is not None:

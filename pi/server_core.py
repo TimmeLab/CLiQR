@@ -47,6 +47,16 @@ class CameraServer:
                 mark = self.backend.bookmark(request.get("sensor_id"))
                 return protocol.make_ok(**mark)
 
+            if cmd == protocol.SNAPSHOT:
+                # Idle-only: the camera is busy while a session records.
+                if self.backend.is_active:
+                    return protocol.make_error(
+                        "cannot snapshot during active recording")
+                import base64
+                jpeg = self.backend.snapshot()
+                return protocol.make_ok(
+                    image=base64.b64encode(jpeg).decode("ascii"), format="jpeg")
+
             if cmd == protocol.STOP_SESSION:
                 if not self.backend.is_active:
                     return protocol.make_error("no active session")

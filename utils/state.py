@@ -177,6 +177,18 @@ camera_mock = solara.reactive(False)
 camera_video_filename = solara.reactive("")
 """Video filename reported by the Pi at session start."""
 
+show_snapshot_dialog = solara.reactive(False)
+"""Whether the camera test-snapshot dialog is open."""
+
+snapshot_image = solara.reactive("")
+"""Base64 JPEG of the most recent camera test snapshot (empty if none)."""
+
+snapshot_error = solara.reactive("")
+"""Error message from the most recent snapshot attempt (empty if none)."""
+
+snapshot_pending = solara.reactive(False)
+"""True while a test snapshot is being captured (camera opens ~1-2 s)."""
+
 
 def make_camera_client(timeout=None):
     """Build the appropriate camera client based on mock/real state.

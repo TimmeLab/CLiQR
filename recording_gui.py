@@ -13,7 +13,7 @@ from components.hardware_status import HardwareStatusCard
 from components.session_controls import SessionControlsCard
 from components.sensor_card import SensorGrid
 from components.plot_dialog import TestPlotDialog
-from components.camera_controls import CameraControlsCard
+from components.camera_controls import CameraControlsCard, SnapshotDialog
 
 
 @solara.component
@@ -67,6 +67,9 @@ def Page():
 
         # Test plot dialog (shows when test button is clicked)
         TestPlotDialog()
+
+        # Camera snapshot dialog (shows when Test snapshot is clicked)
+        SnapshotDialog()
 
 
 # Solara will automatically detect this component as the main page

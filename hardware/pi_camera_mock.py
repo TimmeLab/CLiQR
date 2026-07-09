@@ -6,6 +6,13 @@ indices so behavior is assertable.
 import time
 from pathlib import Path
 
+# A real 1x1 JPEG so the mock GUI's snapshot data URI renders a valid image.
+_TINY_JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRof"
+    "Hh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAAB"
+    "AAAAAAAAAAAAAAAAAAAAAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AfwD/2Q=="
+)
+
 
 class MockPiCameraClient:
     def __init__(self):
@@ -32,6 +39,9 @@ class MockPiCameraClient:
             "pts": self._frame_count / 30.0,
             "pi_monotonic": time.monotonic(),
         }
+
+    def snapshot(self) -> dict:
+        return {"ok": True, "image": _TINY_JPEG_B64, "format": "jpeg"}
 
     def stop_session(self) -> dict:
         self._active = False
