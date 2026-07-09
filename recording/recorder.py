@@ -5,6 +5,7 @@ This module implements the main recording loop that reads from all sensors
 and manages the buffered writes to HDF5 files.
 """
 import asyncio
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,13 @@ class SensorRecorder:
         self.recording = False
         self.loop_counter = 0
 
+        # HDF5 does not allow two concurrent open-for-write handles in one
+        # process. The periodic buffer flush runs on the recording task while
+        # metadata/bookmark writes are triggered from GUI event handlers on a
+        # different thread, so every file access is serialized through this lock
+        # to avoid "unable to lock file" errors and lost writes.
+        self._h5_lock = threading.Lock()
+
         # Initialize data buffers for each board and sensor
         self.board_time_data = {}
         self.board_cap_data = {}
@@ -50,7 +58,7 @@ class SensorRecorder:
 
     def initialize_hdf5_file(self):
         """Create the HDF5 file and initialize the group structure."""
-        with h5py.File(self.filename, "w") as h5f:
+        with self._h5_lock, h5py.File(self.filename, "w") as h5f:
             # Create groups for each board and sensor
             for sn in self.controllers.keys():
                 from utils.state import SERIAL_NUMBER_SENSOR_MAP
@@ -125,7 +133,7 @@ class SensorRecorder:
 
     def _write_initial_data(self):
         """Write the first batch of data to HDF5 (creates datasets)."""
-        with h5py.File(self.filename, "r+") as h5f:
+        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             for sn in self.controllers.keys():
                 from utils.state import SERIAL_NUMBER_SENSOR_MAP
                 sensors = SERIAL_NUMBER_SENSOR_MAP.get(sn, [])
@@ -152,7 +160,7 @@ class SensorRecorder:
         # Calculate the current size before this batch
         tmp_ctr = self.loop_counter - HISTORY_SIZE
 
-        with h5py.File(self.filename, "r+") as h5f:
+        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             for sn in self.controllers.keys():
                 from utils.state import SERIAL_NUMBER_SENSOR_MAP
                 sensors = SERIAL_NUMBER_SENSOR_MAP.get(sn, [])
@@ -198,7 +206,7 @@ class SensorRecorder:
         sn_idx = [sensor_id in sensors for sensors in SERIAL_NUMBER_SENSOR_MAP.values()]
         sn = str(np.array(list(SERIAL_NUMBER_SENSOR_MAP.keys()))[sn_idx].item())
 
-        with h5py.File(self.filename, "r+") as h5f:
+        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             group_path = f"board_{sn}/sensor_{sensor_id}"
 
             # Create the sensor group if it doesn't exist
@@ -253,7 +261,7 @@ class SensorRecorder:
         sn = self._serial_for_sensor(sensor_id)
         suffix = "" if cycle == 0 else str(cycle)
 
-        with h5py.File(self.filename, "r+") as h5f:
+        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             group_path = f"board_{sn}/sensor_{sensor_id}"
             if group_path not in h5f:
                 h5f[f"board_{sn}"].create_group(f"sensor_{sensor_id}")
@@ -277,7 +285,7 @@ class SensorRecorder:
         Args:
             comments: Comment text to save
         """
-        with h5py.File(self.filename, "r+") as h5f:
+        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             if "comments" in h5f:
                 del h5f["comments"]
             h5f.create_dataset("comments", data=comments)
