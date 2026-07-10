@@ -53,6 +53,20 @@ def video_config_kwargs() -> dict:
     }
 
 
+def encoder_kwargs() -> dict:
+    """Kwargs for the H.264 encoder.
+
+    On the Pi 5, picamera2 aliases H264Encoder to the libav software encoder,
+    whose framerate defaults to 30. x264 rate control budgets
+    bitrate/framerate bits per frame, so leaving the default while feeding
+    120 fps overshoots the target bitrate 4x (observed: a 2 h run ballooned
+    past 9 GB — ~12 Mb/s instead of 3 — and filled the disk). Passing the true
+    frame rate makes `bitrate` mean bits per second of wall time. Pure (no
+    picamera2 import) so it is testable off-hardware.
+    """
+    return {"bitrate": BITRATE, "framerate": TARGET_FPS}
+
+
 class Picamera2Backend:
     def __init__(self, output_dir: str = "."):
         self.output_dir = Path(output_dir)
@@ -78,7 +92,7 @@ class Picamera2Backend:
 
     def _create_encoder(self):
         from picamera2.encoders import H264Encoder
-        return H264Encoder(bitrate=BITRATE)
+        return H264Encoder(**encoder_kwargs())
 
     def _create_output(self, video_path):
         from picamera2.outputs import FfmpegOutput

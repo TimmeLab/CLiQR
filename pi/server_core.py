@@ -38,8 +38,17 @@ class CameraServer:
                 name = request.get("name")
                 if not name:
                     return protocol.make_error("START_SESSION requires 'name'")
+                # Reclaim disk space BEFORE recording starts: a crashed run
+                # never reaches the post-stop cleanup, so the leftover videos
+                # (including a crashed run's own) are deleted here, oldest
+                # first, until 5 GB is free. Best-effort, like the post-stop
+                # pass.
+                try:
+                    cleanup = self.backend.reclaim_disk_space()
+                except Exception:
+                    cleanup = {}
                 video_filename = self.backend.start_session(name)
-                return protocol.make_ok(video_filename=video_filename)
+                return protocol.make_ok(video_filename=video_filename, **cleanup)
 
             if cmd == protocol.BOOKMARK:
                 if not self.backend.is_active:

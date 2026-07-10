@@ -5,7 +5,8 @@ camera_backend builds the picamera2 config from a pure helper so the intended
 resolution and frame rate are testable off-hardware (picamera2 itself is
 imported lazily only on the Pi).
 """
-from pi.camera_backend import video_config_kwargs, TARGET_FPS, BITRATE
+from pi.camera_backend import (
+    video_config_kwargs, encoder_kwargs, TARGET_FPS, BITRATE)
 
 
 def test_target_fps_is_120():
@@ -33,3 +34,14 @@ def test_main_stream_downscaled_for_encoder_budget():
 
 def test_bitrate_capped_for_drop_free_encode():
     assert BITRATE == 3_000_000
+
+
+def test_encoder_told_the_real_framerate():
+    # Pi 5's H264Encoder is libav software encoding whose framerate defaults
+    # to 30. x264 rate control budgets bitrate/framerate bits PER FRAME, so a
+    # 30 fps default fed 120 real fps overshoots 4x (12 Mb/s: a 2 h run
+    # ballooned past 9 GB and filled the disk). The encoder must be told the
+    # true frame rate so `bitrate` means what it says.
+    kwargs = encoder_kwargs()
+    assert kwargs["framerate"] == TARGET_FPS
+    assert kwargs["bitrate"] == BITRATE
