@@ -58,6 +58,7 @@ def _start_camera(video_base):
     global camera_client
     camera_client = None
     state.camera_video_filename.set("")
+    state.camera_disk_warning.set("")
 
     try:
         client = state.make_camera_client(timeout=CAMERA_START_TIMEOUT)
@@ -148,6 +149,29 @@ def start_recording():
     state.add_log_message(f"Recording session started - saving to: {full_path}")
 
 
+def _report_pi_disk_cleanup(resp):
+    """Surface the Pi's post-session disk cleanup (from STOP_SESSION reply).
+
+    The Pi deletes its oldest videos (never the one just recorded) until 5 GB
+    is free for the next run. low_disk means even that wasn't enough, so the
+    user must free space on the Pi manually — shown as a persistent GUI
+    warning, cleared at the next camera start.
+    """
+    deleted = resp.get("deleted", [])
+    if deleted:
+        state.add_log_message(
+            f"Pi deleted {len(deleted)} old video(s) to free disk space: "
+            + ", ".join(deleted))
+    if resp.get("low_disk"):
+        free_gb = resp.get("free_bytes", 0) / 1024 ** 3
+        message = (
+            f"Pi disk space low: only {free_gb:.1f} GB free even after "
+            "deleting old videos. Free up space on the Pi manually before "
+            "the next session, or the video may not fit.")
+        state.camera_disk_warning.set(message)
+        state.add_log_message(f"WARNING: {message}")
+
+
 def stop_recording():
     """Stop the current recording session."""
     global current_recorder, recording_task
@@ -219,6 +243,7 @@ def stop_recording():
                     fetched = client.fetch_files(names, out_dir)
                     state.add_log_message(
                         f"Camera stopped; copied {len(fetched)} file(s)")
+                    _report_pi_disk_cleanup(resp)
                 else:
                     state.add_log_message(
                         f"WARNING: Camera stop failed: {resp.get('error')}")

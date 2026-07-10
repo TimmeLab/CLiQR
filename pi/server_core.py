@@ -61,7 +61,15 @@ class CameraServer:
                 if not self.backend.is_active:
                     return protocol.make_error("no active session")
                 files = self.backend.stop_session()
-                return protocol.make_ok(files=files)
+                response = protocol.make_ok(files=files)
+                # Disk cleanup is best-effort: the stop succeeded and the
+                # desktop needs the file list to fetch the recording, so a
+                # cleanup error must not turn this reply into an error.
+                try:
+                    response.update(self.backend.reclaim_disk_space())
+                except Exception:
+                    pass
+                return response
 
             return protocol.make_error(f"unknown command: {cmd}")
         except Exception as exc:  # backend/hardware errors never crash the server

@@ -64,6 +64,9 @@ def CameraControlsCard():
                       on_value=state.camera_enabled.set,
                       disabled=state.recording_all.value)
 
+        if state.camera_disk_warning.value:
+            solara.Warning(f"⚠ {state.camera_disk_warning.value}")
+
         if state.camera_enabled.value:
             with solara.Row(style={"gap": "10px"}):
                 solara.InputText(label="Pi host/IP",

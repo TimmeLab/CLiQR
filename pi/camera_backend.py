@@ -7,6 +7,7 @@ sensor's Start click to a video frame.
 
 picamera2 is imported lazily so this module only loads on the Pi.
 """
+import shutil
 import time
 from pathlib import Path
 
@@ -22,6 +23,11 @@ from pathlib import Path
 # main stream to 1280x720 and capping the bitrate keeps the encoder inside its
 # budget: measured drop-free over a 60 s run at 120 fps. Frame *capture* stays at
 # the sensor's native 1536x864/120; only the recorded video is downscaled.
+# A session's video must always fit on disk: after each run, old recordings
+# are deleted (oldest first) until at least this much space is free for the
+# next session. Videos are otherwise kept as long as possible.
+MIN_FREE_BYTES = 5 * 1024 ** 3  # 5 GB
+
 SENSOR_FAST_MODE_SIZE = (1536, 864)
 RECORD_SIZE = (1280, 720)
 TARGET_FPS = 120
@@ -172,3 +178,40 @@ class Picamera2Backend:
         for path in (self._video_path, self._pts_path):
             files.append({"name": path.name, "size": path.stat().st_size})
         return files
+
+    def _disk_free_bytes(self) -> int:
+        return shutil.disk_usage(self.output_dir).free
+
+    def reclaim_disk_space(self) -> dict:
+        """Delete the oldest recordings until MIN_FREE_BYTES is free.
+
+        Never deletes the current session's video (self._video_path): the
+        desktop has not fetched it yet, and losing the run just recorded is
+        never worth the space. Each deleted video takes its companion .txt
+        timestamp file with it (useless without the frames it indexes).
+
+        Returns {"deleted": [names], "low_disk": bool, "free_bytes": int};
+        low_disk means even deleting every old video left < MIN_FREE_BYTES,
+        so the user must free space manually before the next session.
+        """
+        deleted = []
+        free = self._disk_free_bytes()
+        if free < MIN_FREE_BYTES:
+            candidates = sorted(
+                (p for p in self.output_dir.glob("*.mp4") if p != self._video_path),
+                key=lambda p: p.stat().st_mtime)
+            for mp4 in candidates:
+                if free >= MIN_FREE_BYTES:
+                    break
+                try:
+                    mp4.unlink()
+                    mp4.with_suffix(".txt").unlink(missing_ok=True)
+                except OSError:
+                    continue  # skip undeletable files; keep reclaiming
+                deleted.append(mp4.name)
+                free = self._disk_free_bytes()
+        return {
+            "deleted": deleted,
+            "low_disk": free < MIN_FREE_BYTES,
+            "free_bytes": free,
+        }

@@ -177,6 +177,10 @@ camera_mock = solara.reactive(False)
 camera_video_filename = solara.reactive("")
 """Video filename reported by the Pi at session start."""
 
+camera_disk_warning = solara.reactive("")
+"""Warning shown when the Pi is low on disk even after deleting old videos
+(the user must free up space manually before the next session)."""
+
 show_snapshot_dialog = solara.reactive(False)
 """Whether the camera test-snapshot dialog is open."""
 
