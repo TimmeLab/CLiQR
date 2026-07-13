@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import os
 import time
+import threading
 import pandas as pd
 from dataclasses import replace
 from utils import state
@@ -15,6 +16,66 @@ from recording.recorder import SensorRecorder
 # Global recorder instance
 current_recorder = None
 recording_task = None
+
+# Active Pi camera client for the current session (None when camera disabled or
+# when the camera failed to start).
+camera_client = None
+
+# The Pi's START_SESSION does a full Picamera2 warmup (create + configure +
+# start_recording) before replying, which takes longer than a normal request;
+# use a generous timeout so a slow-but-successful start isn't misreported as a
+# failure. (The previous 2.0s override was shorter than the client default and
+# could time out mid-warmup.)
+CAMERA_START_TIMEOUT = 10.0
+
+
+def _reset_sensor_lifecycle():
+    """Reset each sensor's recording lifecycle for a new session.
+
+    Each session writes a fresh HDF5 file, so recording cycles must restart at 0.
+    Without this the cycle counter carried over from the previous session and the
+    new session's first recording was written under a suffixed dataset name
+    (start_time1, video_pts1, ...) that the analysis, which reads cycle 0, could
+    not find. Animal IDs and volume/weight inputs are preserved.
+    """
+    sensors = state.sensor_states.value.copy()
+    for sid, s in sensors.items():
+        sensors[sid] = replace(
+            s, is_recording=False, status="idle",
+            recording_cycle=0, elapsed_seconds=0, start_time=0.0,
+        )
+    state.sensor_states.set(sensors)
+
+
+def _start_camera(video_base):
+    """Start the Pi camera pre-roll for this session.
+
+    On success, sets the module-level camera_client and camera_video_filename.
+    On any failure, leaves camera_client None and clears camera_video_filename
+    so later per-sensor bookmarks are skipped cleanly and stop_recording does
+    not spawn a doomed stop/fetch against a session that never started.
+    """
+    global camera_client
+    camera_client = None
+    state.camera_video_filename.set("")
+    state.camera_disk_warning.set("")
+
+    try:
+        client = state.make_camera_client(timeout=CAMERA_START_TIMEOUT)
+        resp = client.start_session(video_base)
+    except Exception as exc:
+        state.add_log_message(f"WARNING: Camera start error: {exc}")
+        return
+
+    if resp.get("ok"):
+        camera_client = client
+        state.camera_video_filename.set(resp.get("video_filename", ""))
+        state.add_log_message(f"Camera pre-roll started: {resp.get('video_filename')}")
+        # The Pi also reclaims disk space at session start (a crashed run
+        # never reaches the post-stop cleanup), so surface that here too.
+        _report_pi_disk_cleanup(resp)
+    else:
+        state.add_log_message(f"WARNING: Camera start failed: {resp.get('error')}")
 
 
 def start_recording():
@@ -57,6 +118,9 @@ def start_recording():
     state.recording_all.set(True)
     state.session_error.set("")  # Clear error on successful start
 
+    # Fresh file -> restart every sensor's recording cycle at 0.
+    _reset_sensor_lifecycle()
+
     # Create recorder instance
     from components.hardware_status import mpr121_manager
     if mpr121_manager is None:
@@ -80,7 +144,35 @@ def start_recording():
 
     recording_task = asyncio.create_task(run_recording())
 
+    # Optionally start concurrent Pi video pre-roll.
+    if state.camera_enabled.value:
+        video_base = os.path.splitext(os.path.basename(full_path))[0]
+        _start_camera(video_base)
+
     state.add_log_message(f"Recording session started - saving to: {full_path}")
+
+
+def _report_pi_disk_cleanup(resp):
+    """Surface the Pi's post-session disk cleanup (from STOP_SESSION reply).
+
+    The Pi deletes its oldest videos (never the one just recorded) until 5 GB
+    is free for the next run. low_disk means even that wasn't enough, so the
+    user must free space on the Pi manually — shown as a persistent GUI
+    warning, cleared at the next camera start.
+    """
+    deleted = resp.get("deleted", [])
+    if deleted:
+        state.add_log_message(
+            f"Pi deleted {len(deleted)} old video(s) to free disk space: "
+            + ", ".join(deleted))
+    if resp.get("low_disk"):
+        free_gb = resp.get("free_bytes", 0) / 1024 ** 3
+        message = (
+            f"Pi disk space low: only {free_gb:.1f} GB free even after "
+            "deleting old videos. Free up space on the Pi manually before "
+            "the next session, or the video may not fit.")
+        state.camera_disk_warning.set(message)
+        state.add_log_message(f"WARNING: {message}")
 
 
 def stop_recording():
@@ -138,6 +230,32 @@ def stop_recording():
     # Cancel the async task
     if recording_task and not recording_task.done():
         recording_task.cancel()
+
+    # Stop the camera and copy its files back in a background thread so GUI
+    # doesn't block during multi-MB file transfer.
+    global camera_client
+    if state.camera_enabled.value and camera_client is not None:
+        _client = camera_client
+        _out_dir = state.output_directory.value
+
+        def _camera_stop_and_fetch(client, out_dir):
+            try:
+                resp = client.stop_session()
+                if resp.get("ok"):
+                    names = [f["name"] for f in resp.get("files", [])]
+                    fetched = client.fetch_files(names, out_dir)
+                    state.add_log_message(
+                        f"Camera stopped; copied {len(fetched)} file(s)")
+                    _report_pi_disk_cleanup(resp)
+                else:
+                    state.add_log_message(
+                        f"WARNING: Camera stop failed: {resp.get('error')}")
+            except Exception as exc:
+                state.add_log_message(f"WARNING: Camera stop error: {exc}")
+
+        threading.Thread(target=_camera_stop_and_fetch, args=(_client, _out_dir),
+                         daemon=True).start()
+    camera_client = None
 
     # Update state
     state.recording_all.set(False)

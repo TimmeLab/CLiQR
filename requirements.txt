@@ -12,3 +12,6 @@ ipympl==0.10.0
 panel==1.8.10
 solara==1.57.3
 starlette==0.36.3
+pytest==8.3.4
+imageio==2.36.1
+imageio-ffmpeg==0.5.1

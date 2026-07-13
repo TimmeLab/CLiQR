@@ -1,192 +1,171 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Project Overview
 
-CLiQR (Capacitive Lickometry System) is a Python-based system for recording and analyzing rodent licking behavior using MPR121 capacitive touch sensors connected via FT232H USB-to-I2C boards. The system is designed for the Timme Lab at University of Cincinnati and runs primarily on Windows for ease of use by lab personnel.
+CLiQR (Capacitive Lick Quantification in Rodents) records rodent licking behavior using MPR121 capacitive touch sensors connected via FT232H USB-to-I2C boards. Built for the Timme Lab at University of Cincinnati. Runs on Windows (lab PCs) and macOS (development).
 
-## Development Goals
+Four subsystems:
+1. **Recording GUI** — complete, in production
+2. **Data analysis pipeline** — functional, actively maintained for manuscript
+3. **False positive analysis** — implemented, validating detection accuracy against CVAT video annotations
+4. **Concurrent video capture** — Pi 5 + Camera 3 over TCP; bookmarks video frame at sipper insertion. See `docs/VIDEO_CAPTURE.md`.
 
-**Primary Goal: Solara-based Standalone GUI**
+## Current Development Focus
 
-The current development focus is converting `DataRecording.ipynb` into a standalone GUI application using Solara. Key requirements:
-
-- **No functional changes**: The conversion should preserve all existing functionality of the data recording system
-- **Improved usability**: Create a user-friendly interface for non-technical lab personnel
-- **Standalone deployment**: The GUI should run as a standalone application, not requiring users to interact with JupyterLab
-- **DataAnalysis.ipynb remains unchanged**: Analysis workflows will continue using the existing Jupyter notebook
-
-This migration aims to lower the barrier to entry for lab members unfamiliar with Jupyter notebooks while maintaining the same robust data collection capabilities.
+Recording GUI is done. Active work is the false positive analysis pipeline (validating CLiQR lick detection accuracy against hand-annotated video). See `CURRENT_STATE.md` for current results.
 
 ## Environment Setup
 
-### Installation Options
-
-**Option 1 - Miniforge (recommended for Windows):**
+**Option 1 — Miniforge (Windows, recommended for lab use):**
 ```bash
 conda env create --file environment.yml
 conda activate cliqr
-solara run recording_gui.py  # For data recording
-# OR
-jupyter-lab  # For data analysis
 ```
 
-**Option 2 - pyenv-virtualenv (Unix-based systems):**
+**Option 2 — pyenv-virtualenv (macOS/Linux, development):**
 ```bash
 pyenv virtualenv 3.13 cliqr
 pyenv activate cliqr
 pip install -r requirements.txt
 ```
 
-### Hardware Setup
-
-Before first use, FT232H boards must be assigned serial numbers (one board at a time):
+**Hardware setup (one-time):** Assign serial numbers to FT232H boards one at a time:
 ```bash
-python set_ft232h_serial.py FT232H0
+python set_ft232h_serial.py FT232H0   # repeat FT232H1, FT232H2, FT232H3
 ```
 
-The system expects serial numbers FT232H0 through FT232H3, mapped to sensors 1-24 in the `SERIAL_NUMBER_SENSOR_MAP` constant in `utils/state.py`.
-
-**Windows-specific requirement:** FT232H drivers must be installed using Zadig before use. See README.md for details.
-
-## Architecture
-
-### Data Recording Pipeline
-
-The system provides two interfaces for data collection:
-
-1. **recording_gui.py** - Standalone Solara GUI (Recommended)
-   - Web-based interface running at http://localhost:8765
-   - Hardware initialization via "Initialize Hardware" button
-   - Session controls for starting/stopping recordings
-   - 24 individual sensor cards (arranged in 4 rows × 6 columns matching physical rack)
-   - Each sensor card includes:
-     - Start/Stop button with status indicator
-     - Timer display (updates every 60 seconds)
-     - Test button for viewing recent data
-     - Volume inputs (start/stop) and weight input
-   - Activity log for real-time feedback
-   - Comments area (auto-saved to HDF5)
-   - Async recording from multiple MPR121 sensors via ThreadPoolExecutor
-   - Records capacitance values (~50Hz) to HDF5 files (`raw_data_*.h5`)
-   - HDF5 structure: `/board_{serial_number}/sensor_{sensor_id}/[cap_data, time_data, start_time, stop_time, start_vol, stop_vol, weight]`
-
-2. **DataRecording.ipynb** - Legacy Jupyter notebook interface (Deprecated)
-   - Original interface, kept for reference
-   - Same functionality as Solara GUI but requires JupyterLab
-   - Not recommended for new recordings
-
-3. **DataAnalysis.ipynb** - Batch analysis and visualization
-   - Processes multiple `raw_data_*.h5` files across multiple cohorts
-   - Uses `data_analysis.py:filter_data()` to detect licks via thresholding or Hilbert envelope
-   - Generates `filtered_*.h5` files (intermediate), then combines into `results_combined_*.h5` by animal ID
-   - Includes correlation analysis (licks vs volume consumed) with outlier detection via MAD
-
-4. **data_analysis.py** - Core lick detection algorithms
-   - `basic_algorithm()`: Threshold-based peak detection with depth requirements
-   - `hilbert_algorithm()`: Hilbert envelope + high-pass filtering (8-12 Hz)
-   - Both handle start/stop time corrections and can use time fix files (`*_time_fix.xlsx`)
-
-### Solara GUI Architecture
-
-The recording GUI is built with Solara (reactive web framework) and organized into modules:
-
-**Core Modules:**
-- `recording_gui.py` - Main app entry point, assembles all components
-- `utils/state.py` - Reactive state management using `solara.reactive()`
-- `hardware/ft232h.py` - FT232H board detection and I2C initialization
-- `hardware/mpr121.py` - MPR121 sensor configuration and data reading
-- `hardware/mock_hardware.py` - Simulated hardware for testing without physical devices
-- `recording/recorder.py` - Async recording loop and HDF5 file operations
-- `components/hardware_status.py` - Hardware initialization UI
-- `components/session_controls.py` - Session start/stop controls
-- `components/sensor_card.py` - Per-sensor control cards (24 instances)
-
-**State Management:**
-- Global session state: `recording_all`, `filename`, `output_directory`, `i2c_controllers`
-- Per-sensor state: `SensorState` dataclass with recording status, volumes, weight, timer
-- Activity log: `log_messages` list with timestamped entries
-- Hardware state: `boards_connected` dict of FT232H boards
-
-**Key Design Patterns:**
-- **Reactive UI**: Solara components automatically re-render when state changes
-- **Asynchronous recording**: `SensorRecorder.record_sensors()` uses `asyncio` to avoid blocking the UI
-- **Deferred writes**: Capacitance data is buffered (`HISTORY_SIZE=100`) before writing to HDF5 to reduce I/O overhead
-- **Multi-cohort analysis**: DataAnalysis.ipynb can process data from multiple animal cohorts in parallel via the `base_dir` and `animal_id_prefixes` variables
-- **Time fix mechanism**: If start/stop times are incorrect, create `<raw_filename>_time_fix.xlsx` with columns `[Sensor, New Start Time, New End Time]` to override
-- **Component-based architecture**: Reusable Solara components for sensors, hardware status, etc.
-- **Mock hardware support**: `recording_gui_mock.py` uses simulated sensors for testing
-
-### Critical Hardware-Software Mapping
-
-Sensor numbers (1-24) map to FT232H boards based on physical rack layout:
-- Sensors 1,2,3,7,8,9 → FT232H0
-- Sensors 4,5,6,10,11,12 → FT232H1
-- Sensors 13,14,15,19,20,21 → FT232H2
-- Sensors 16,17,18,22,23,24 → FT232H3
-
-The system records from 6 channels per MPR121 (every other channel: 1, 3, 5, 7, 9, 11) to match one sensor per cage.
+**Windows only:** Install libusbK drivers for each FT232H board using Zadig before first use.
 
 ## Common Commands
 
-### Running the Recording GUI
-
 ```bash
-# Activate environment
-conda activate cliqr
+# Recording GUI (real hardware)
+solara run recording_gui.py        # opens at http://localhost:8765
 
-# Start the Solara GUI (recommended)
-solara run recording_gui.py
-# Opens at http://localhost:8765
-
-# For Windows users: double-click start_cliqr.bat
-
-# Test mode with mock hardware (no physical boards needed)
+# Recording GUI (mock hardware, no boards needed)
 solara run recording_gui_mock.py
+
+# Data analysis
+jupyter-lab                        # then open DataAnalysis.ipynb
+
+# False positive analysis
+jupyter-lab                        # then open FalsePositive.ipynb
 ```
 
-### Running Data Analysis
+## Architecture
 
-```bash
-# Start JupyterLab and open DataAnalysis.ipynb
-jupyter-lab
+### Recording GUI (`recording_gui.py`)
+
+Solara web app at `localhost:8765`. Modular structure:
+
+| Module | Purpose |
+|---|---|
+| `utils/state.py` | Reactive state for 24 sensors, session, hardware |
+| `hardware/ft232h.py` | FT232H USB scan, I2C controller init, auto-detect MPR121 address |
+| `hardware/mpr121.py` | MPR121 soft reset, config, channel reads |
+| `hardware/mock_hardware.py` | Simulated hardware for testing |
+| `recording/recorder.py` | Async loop, ThreadPoolExecutor reads, buffered HDF5 writes |
+| `components/hardware_status.py` | Board init UI |
+| `components/session_controls.py` | Start/stop session, layout file upload (CSV or XLSX), output dir |
+| `components/sensor_card.py` | 24 per-sensor cards |
+| `components/plot_dialog.py` | Live test plot of recent sensor data |
+
+HDF5 output structure:
 ```
+raw_data_YYYY-MM-DD_HH-MM-SS.h5
+/comments
+/board_{serial_number}/sensor_{sensor_id}/
+    cap_data, time_data, start_time[N], stop_time[N], start_vol, stop_vol, weight
+```
+Multiple start/stop cycles per sensor use numbered suffixes: `start_time1`, `start_time2`, etc.
 
-### Data Analysis
+### Data Analysis (`data_analysis.py` + `DataAnalysis.ipynb`)
 
-Open `DataAnalysis.ipynb` and:
-1. Set `base_dir` and `animal_id_prefixes` for cohorts to analyze
-2. Use the file selector widgets to choose raw data files
-3. Run the analysis cells to generate combined results
+`data_analysis.py` is the core library. `DataAnalysis.ipynb` is the batch analysis notebook (Panel widgets).
 
-### Modifying Hardware Configuration
+Key functions:
 
-If using different FT232H serial numbers or sensor numbering:
-1. Edit `SERIAL_NUMBER_SENSOR_MAP` in `utils/state.py`
-2. Edit board ID mappings in `data_analysis.py` lines 114-121
-3. (Legacy) Edit `serial_number_sensor_map` in DataRecording.ipynb (cell 10) if still using notebook
+| Function | Description |
+|---|---|
+| `filter_data()` | Top-level: loads raw HDF5, trims to start/stop, runs algorithm |
+| `basic_algorithm()` | Threshold-based peak detection. Scans all inter-value thresholds, picks one maximizing peak count. Requires 2-threshold depth. |
+| `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. |
+| `_run_optimal_threshold()` | Grid-search threshold fraction maximizing R² vs. volume. Runs as comparison baseline. |
+| `compute_bout_structure()` | ILIs, bout lick counts, bout durations. Default params: `ibi_threshold=0.25, min_licks=3`. Call sites in notebook use `ibi_threshold=1.0, min_licks=2`. |
+| `save_filtered_data()` | Writes per-animal HDF5 group. |
+
+Notebook pipeline:
+1. Set `base_dir`, `animal_id_prefixes`, `recording_length`
+2. Load per-cohort `layout.csv` files
+3. File selector GUI → pick raw HDF5 files per cohort
+4. Run `filter_data()` → `filtered_*.h5` per file
+5. Combine into `results_combined_*.h5` by animal ID
+6. Algorithm comparison (CLiQR vs. optimal threshold)
+7. Behavioral metrics: ILI distribution, licks/bout, bout duration
+8. Temporal dynamics: 5-min bins across 2-hour session
+9. Correlation: OLS + RLM (HC3-robust), MAD-based outlier detection
+10. CSV exports for Prism
+
+**Time fix mechanism:** If start/stop times in raw HDF5 are wrong, create `<raw_filename>_time_fix.xlsx` with columns `[Sensor, New Start Time, New End Time]`.
+
+### False Positive Analysis (`false_positive_analysis.py` + `FalsePositive.ipynb`)
+
+Validates CLiQR lick detection accuracy against CVAT-annotated video. Completely standalone — no imports from `data_analysis.py`.
+
+Pipeline functions:
+
+| Function | Description |
+|---|---|
+| `parse_job_annotations(xml_path)` | Parse per-job CVAT XML → `{frame_id: [labels]}` |
+| `parse_annotations(xml_path)` | Parse project-level CVAT XML with task metadata |
+| `load_frame_offsets(txt_path)` | Load picamera `.txt` frame timestamp file as numpy array |
+| `frames_to_relative_seconds()` | Convert frame IDs → seconds since video start |
+| `build_ground_truth()` | Pair bout starts/ends, inconclusive regions, sipper events → intervals |
+| `load_sensor_data()` | Load raw HDF5 cap_data/time_data for a sensor |
+| `detect_sipper_step()` | Detect sipper insertion/removal as a step change in cap_data |
+| `establish_alignment()` | Anchor video clock to HDF5 clock via sipper insertion. Optional drift correction via sipper removal. |
+| `video_relative_to_abs()` | Convert video-relative timestamps to Unix seconds |
+| `intervals_to_abs()` | Convert bout/inconclusive intervals to absolute time |
+| `load_lick_times_abs()` | Load CLiQR lick_times from filtered HDF5, convert to Unix seconds |
+| `classify_licks()` | Label each lick as TP, FP, or excluded (inconclusive window) |
+| `plot_session()` | Per-session figure: cap trace + bout regions + colored lick markers |
+| `build_results_dataframe()` | Aggregate per-session results into DataFrame |
+
+**Time alignment:** Pi clock unreliable; only relative frame offsets in `.txt` files are trustworthy. Sipper insertion (detected as a step-down in cap_data in the pre-start window) is the primary anchor. Sipper removal (step-up after stop_time) provides optional drift correction.
+
+**Notebook (`FalsePositive.ipynb`):** Manifest-driven. Edit `SESSION_DIR`. Reads `session_manifest.csv` with columns `task_id, xml_path, txt_path, raw_h5, filtered_h5, animal_id, sensor_num`. Produces per-session HTML/PNG figures and `false_positive_results.csv`.
+
+### Concurrent Video Capture (`pi/`, `video/`, `hardware/pi_camera.py`)
+
+Desktop ↔ Pi 5 over TCP. `video/protocol.py` (shared wire format), `pi/server_core.py` (dispatcher), `pi/pi_camera_server.py` (TCP + picamera2 entry), `pi/camera_backend.py` (picamera2), `hardware/pi_camera.py` (desktop client), `hardware/pi_camera_mock.py` (no-Pi mock), `components/camera_controls.py` (UI). Bookmarks stored in HDF5 as `video_frame_index`/`video_pts`/`video_filename`. Full guide: `docs/VIDEO_CAPTURE.md`.
+
+## Hardware: Sensor → Board Mapping
+
+Hardcoded in **two places** — `utils/state.py` (SERIAL_NUMBER_SENSOR_MAP) and `data_analysis.py:114–121`. Change both if layout changes.
+
+| Board | Sensors |
+|---|---|
+| FT232H0 | 1, 2, 3, 7, 8, 9 |
+| FT232H1 | 4, 5, 6, 10, 11, 12 |
+| FT232H2 | 13, 14, 15, 19, 20, 21 |
+| FT232H3 | 16, 17, 18, 22, 23, 24 |
+
+MPR121 reads every other channel: 1, 3, 5, 7, 9, 11 (6 sensors per board).
+
+## Known Issues / Technical Debt
+
+1. **Sensor-board mapping duplicated** — `utils/state.py` and `data_analysis.py:114–121` both hardcode the same mapping.
+2. **`hilbert_algorithm()` filter passes** — `data_analysis.py:276` TODO: currently applies bandpass 7× total, may over-smooth.
+3. **`compute_bout_structure()` param inconsistency** — function defaults are `ibi_threshold=0.25, min_licks=3`; notebook call sites use `ibi_threshold=1.0, min_licks=2`.
+4. **ML experiments not integrated** — `checkpoints/best.pt` and training data exist but no training or inference code is in the repo.
 
 ## Important Notes
 
-### Recording GUI
-- **Hardware initialization**: Click "Initialize Hardware" before starting any recording session
-- **Sensor controls**: Individual sensors can only be started after the main "START RECORDING" button is clicked
-- **Timer updates**: Sensor timers update every 60 seconds (not real-time)
-- **Volume/Weight inputs**: These are disabled once a sensor is recording - enter values before starting
-- **Activity log**: Check the activity log for real-time status updates and error messages
-- **Mock mode**: Use `recording_gui_mock.py` for testing without physical hardware
-- **Browser compatibility**: Tested with Chrome, Firefox, and Edge. Safari may have issues.
-
-### Data Analysis
-- **Recording length**: Analysis trims recordings to exactly `recording_length` (default 2 hours) after applying start/stop times. Adjust in DataAnalysis.ipynb cell 5.
-- **Layout files**: Each cohort directory should contain `layout.csv` mapping sensors to animal IDs (format: sensor number in index, animal ID in first column)
-- **Time synchronization**: All timestamps use `time.time()` (Unix epoch). The first timestamp in a recording is subtracted to normalize times to 0.
-- **Missing data handling**: If start/stop times or volumes aren't recorded, the analysis logs warnings and may skip animals. Check `logs/*.log` files.
-
-### Troubleshooting
-- **"No FT232H boards found"**: Check USB connections, verify Zadig drivers (Windows), try different USB ports
-- **Recording not starting**: Ensure hardware is initialized first, check output directory permissions
-- **Sensor timers not updating**: Wait at least 60 seconds, check browser console for errors
-- **HDF5 file not created**: Check file permissions, verify output directory exists
-- **For more help**: See `DEPLOYMENT.md` and `TEST_MOCK_MODE.md`
+- **Recording:** Initialize hardware before starting sessions. Volume/weight inputs disabled once sensor is recording.
+- **Layout files:** CSV or XLSX. Format: sensor number in index, animal ID in first column. Template at `layouts/default_layout.csv`.
+- **Timestamps:** `time.time()` (Unix epoch) throughout. `time_data` in raw HDF5 is absolute Unix seconds.
+- **False positive data:** CVAT annotations, picamera MP4/TXT files, and raw/filtered HDF5s all live under `Lickometry Data/ACG-26-3/`. Pipeline driven by `session_manifest.csv` in that directory.
+- **Mock mode:** `solara run recording_gui_mock.py` for UI testing without physical hardware.
+- **Browser:** Chrome/Firefox/Edge. Safari may have issues with Solara.
