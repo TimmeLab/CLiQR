@@ -10,6 +10,10 @@ Run with: solara run recording_gui_mock.py
 from hardware.mock_hardware import use_mock_hardware
 use_mock_hardware()
 
+# Use the in-memory mock camera client (no Pi needed)
+from utils import state
+state.camera_mock.set(True)
+
 # Now import the main app components
 from recording_gui import Page
 

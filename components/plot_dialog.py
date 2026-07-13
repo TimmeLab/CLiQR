@@ -27,6 +27,11 @@ def TestPlotDialog():
         state.show_test_dialog.set(False)
         state.test_plot_data.set(None)
 
+    def refresh_dialog():
+        # Re-fetch latest samples for this sensor
+        from components.sensor_card import test_sensor
+        test_sensor(sensor_id)
+
     with solara.Card(
         style={
             "position": "fixed",
@@ -73,8 +78,13 @@ def TestPlotDialog():
         solara.FigureMatplotlib(fig)
         plt.close(fig)  # Clean up
 
-        # Close button
-        with solara.Row(style={"justify-content": "center", "margin-top": "10px"}):
+        # Action buttons
+        with solara.Row(style={"justify-content": "center", "gap": "10px", "margin-top": "10px"}):
+            solara.Button(
+                label="Refresh",
+                on_click=refresh_dialog,
+                color="secondary"
+            )
             solara.Button(
                 label="Close",
                 on_click=close_dialog,
