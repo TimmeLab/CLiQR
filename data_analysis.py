@@ -13,6 +13,15 @@ import numpy as np
 import scipy.signal as scs
 
 
+# Control cages have sippers (so volume is recorded) but no animal, hence no
+# weight. IDs are "Control1", "Control2", ... (1-indexed) in the layout file.
+_CONTROL_RE = re.compile(r'^Control\d+$')
+
+def is_control(animal_id):
+    """True if animal_id is a control cage (no animal, no weight recorded)."""
+    return bool(_CONTROL_RE.match(str(animal_id)))
+
+
 def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold', recording_length=2*60*60):
     """This organizes the data by animal and handles some common issues relating to
     recording start/stop times, volumes, and weights. Current algorithm choices:
@@ -469,10 +478,15 @@ def save_filtered_data(data, animal, filtered_h5f, logfile):
     try:
         grp.create_dataset('weight', data=data['weight'])
     except KeyError as e:
-        with open(logfile, 'a') as lf:
-            lf.write(f"Caught KeyError {e}, weight not recorded for {animal}\n")
-        print(f'Caught KeyError {e}, weight was likely not recorded for {animal}')
-        missing_data = True
+        # Control cages have no animal, so no weight. Expected: don't flag missing.
+        if is_control(animal):
+            with open(logfile, 'a') as lf:
+                lf.write(f"No weight for control {animal} (expected), skipping weight check\n")
+        else:
+            with open(logfile, 'a') as lf:
+                lf.write(f"Caught KeyError {e}, weight not recorded for {animal}\n")
+            print(f'Caught KeyError {e}, weight was likely not recorded for {animal}')
+            missing_data = True
 
     return missing_data
 #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
