@@ -126,12 +126,14 @@ matching). Written to mp4 via the ffmpeg writer.
 3. **Sync mapper** — pure function `video_sec(τ)` as defined above.
 
 4. **Video frame source** — `FrameGrabber`
-   - Wraps `cv2.VideoCapture`. For output frame `i` at `τ_i = start + i/fps`,
-     returns the source frame nearest `video_sec(τ_i)`.
-   - Sequential decode: seek once to the clip's first `video_sec`, then read
-     forward, emitting the frame whose timestamp is nearest each `τ_i` (output
-     fps ≤ source fps, so this is decode-and-skip). Convert BGR→RGB for
-     matplotlib.
+   - Wraps `imageio.get_reader(video, 'ffmpeg', input_params=['-ss', <clip_start_sec>])`
+     (imageio + imageio-ffmpeg are already project deps; no cv2). For output
+     frame `i` at `τ_i = start + i/fps`, returns the source frame nearest
+     `video_sec(τ_i)`.
+   - Sequential decode: `-ss` fast-seeks to the clip's first `video_sec`, then
+     iterate forward, emitting the frame whose timestamp is nearest each `τ_i`
+     (output fps ≤ source fps, so this is decode-and-skip). imageio returns RGB
+     already.
 
 5. **Animator** — builds the figure (left `imshow` axis, right trace axis),
    defines `init` and `update(i)`:
@@ -188,5 +190,6 @@ pts.txt ─► video_base
 
 ## Dependencies
 
-`h5py`, `numpy`, `pandas`, `matplotlib` (ffmpeg writer), `opencv-python` (cv2),
+`h5py`, `numpy`, `pandas`, `matplotlib` (ffmpeg writer), `imageio` +
+`imageio-ffmpeg` (video frame reading — already project deps),
 `data_analysis.py` (import `filter_data`), system `ffmpeg` on PATH.
