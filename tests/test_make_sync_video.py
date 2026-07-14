@@ -130,3 +130,35 @@ def test_render_clip_smoke(tmp_path):
     assert os.path.exists(out) and os.path.getsize(out) > 0
     # duration ~ (end - start), within a couple frames
     assert _video_duration(out) == pytest.approx(end - start, abs=2.0 / fps)
+
+
+def test_validate_window_ok():
+    msv.validate_window(10.0, 20.0, 100.0)  # no raise
+
+
+@pytest.mark.parametrize("start,end,dur", [
+    (20.0, 10.0, 100.0),   # inverted
+    (-1.0, 10.0, 100.0),   # negative start
+    (10.0, 200.0, 100.0),  # past session end
+])
+def test_validate_window_rejects(start, end, dur):
+    with pytest.raises(ValueError):
+        msv.validate_window(start, end, dur)
+
+
+def test_build_arg_parser_parses_required():
+    p = msv.build_arg_parser()
+    args = p.parse_args([
+        "--h5", "r.h5", "--layout", "l.csv",
+        "--start", "5", "--end", "9", "--out", "o.mp4",
+    ])
+    assert args.h5 == "r.h5" and args.start == 5.0 and args.end == 9.0
+    assert args.fps == 30.0 and args.window == 2.5 and args.sync_offset == 0.0
+
+
+@needs_reference
+def test_resolve_paths_defaults_from_h5():
+    video, pts = msv.resolve_paths(H5, None, None)
+    assert video.endswith("raw_data_2026-07-13_11-59-47.mp4")
+    assert pts.endswith("raw_data_2026-07-13_11-59-47.txt")
+    assert os.path.dirname(video) == os.path.dirname(H5)

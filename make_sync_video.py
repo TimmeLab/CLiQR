@@ -4,8 +4,11 @@ Left panel: the mouse video. Right panel: the sensor's capacitance trace in a
 sliding window with a centered dot marking the current time and markers on
 detected licks. See docs/superpowers/specs/2026-07-14-sync-video-composite-design.md.
 """
+import argparse
 import os
 import re
+import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 
@@ -254,3 +257,68 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     finally:
         plt.close(fig)
         grabber.close()
+
+
+def resolve_paths(h5_path, video, pts_txt):
+    if video is None:
+        with h5py.File(h5_path, "r") as raw:
+            board_id, sensor_name, _ = find_video_sensor(raw)
+            fname = raw[board_id][sensor_name]["video_filename"][()]
+        fname = fname.decode() if isinstance(fname, bytes) else str(fname)
+        video = os.path.join(os.path.dirname(h5_path), fname)
+    if pts_txt is None:
+        pts_txt = os.path.splitext(video)[0] + ".txt"
+    return video, pts_txt
+
+
+def validate_window(start, end, session_duration):
+    if start < 0:
+        raise ValueError(f"--start must be >= 0 (got {start})")
+    if end <= start:
+        raise ValueError(f"--end ({end}) must be greater than --start ({start})")
+    if end > session_duration:
+        raise ValueError(
+            f"--end ({end}) exceeds session duration ({session_duration:.1f} s)")
+
+
+def build_arg_parser():
+    p = argparse.ArgumentParser(
+        description="Render a side-by-side mouse-video + capacitance-trace clip.")
+    p.add_argument("--h5", required=True, help="raw recording .h5")
+    p.add_argument("--layout", required=True, help="sensor->animal layout csv")
+    p.add_argument("--start", type=float, required=True,
+                   help="clip start, seconds since the Start bookmark")
+    p.add_argument("--end", type=float, required=True,
+                   help="clip end, seconds since the Start bookmark")
+    p.add_argument("--out", required=True, help="output .mp4 path")
+    p.add_argument("--video", default=None,
+                   help="mouse video (default: from h5 video_filename)")
+    p.add_argument("--pts-txt", dest="pts_txt", default=None,
+                   help="per-frame PTS sidecar (default: video path with .txt)")
+    p.add_argument("--fps", type=float, default=30.0, help="output fps (default 30)")
+    p.add_argument("--window", type=float, default=2.5,
+                   help="trace half-window seconds (default 2.5)")
+    p.add_argument("--sync-offset", dest="sync_offset", type=float, default=0.0,
+                   help="manual video/cap alignment nudge, seconds (default 0)")
+    return p
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    if shutil.which("ffmpeg") is None:
+        print("error: ffmpeg not found on PATH (needed to write the video)",
+              file=sys.stderr)
+        return 1
+    video, pts_txt = resolve_paths(args.h5, args.video, args.pts_txt)
+    rec = load_recording(args.h5, args.layout, pts_txt, video)
+    validate_window(args.start, args.end, rec.session_duration)
+    print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
+          f"[{args.start:.1f}, {args.end:.1f}] s -> {args.out}")
+    render_clip(rec, args.start, args.end, args.out,
+                fps=args.fps, window=args.window, sync_offset=args.sync_offset)
+    print("done")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
