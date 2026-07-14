@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import dataclass
 
 import h5py
+import imageio
 import numpy as np
 import pandas as pd
 
@@ -160,3 +161,33 @@ def nearest_index(times, tau):
         return times.size - 1
     # searchsorted lands on the right neighbor; pick the closer of i-1, i
     return i if abs(times[i] - tau) < abs(times[i - 1] - tau) else i - 1
+
+
+class FrameGrabber:
+    """Sequential RGB frame reader; fast-seeks to the clip start, then serves
+    the frame nearest each requested (monotonically increasing) video second."""
+
+    def __init__(self, video_path, clip_start_sec):
+        self.clip_start = max(0.0, clip_start_sec)
+        self._reader = imageio.get_reader(
+            video_path, "ffmpeg",
+            input_params=["-ss", f"{self.clip_start:.6f}"],
+        )
+        self.src_fps = float(self._reader.get_meta_data()["fps"])
+        self._k = -1
+        self._frame = None
+
+    def get(self, video_sec):
+        target_k = int(round((video_sec - self.clip_start) * self.src_fps))
+        if target_k < 0:
+            target_k = 0
+        while self._k < target_k:
+            try:
+                self._frame = self._reader.get_next_data()
+                self._k += 1
+            except (IndexError, StopIteration):
+                break
+        return self._frame
+
+    def close(self):
+        self._reader.close()

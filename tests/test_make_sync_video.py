@@ -85,3 +85,24 @@ def test_load_recording_reference():
     # sync fields populated; video_base ~ 32 s for this recording
     assert rec.video_base == pytest.approx(31.97, abs=0.1)
     assert rec.session_duration > 3600
+
+
+needs_video = pytest.mark.skipif(
+    not os.path.exists(VIDEO), reason="reference video not present"
+)
+
+
+@needs_video
+def test_frame_grabber_reads_rgb_and_advances():
+    start = 60.0
+    g = msv.FrameGrabber(VIDEO, clip_start_sec=start)
+    try:
+        assert g.src_fps > 1
+        f0 = g.get(start)
+        assert f0 is not None
+        assert f0.ndim == 3 and f0.shape[2] == 3
+        # advancing ~1s forward returns a frame of the same shape
+        f1 = g.get(start + 1.0)
+        assert f1.shape == f0.shape
+    finally:
+        g.close()
