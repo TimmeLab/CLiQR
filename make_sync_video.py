@@ -24,13 +24,6 @@ import pandas as pd
 
 from data_analysis import filter_data
 
-_BOARD_FOR_SENSOR = {
-    **{s: "board_FT232H0" for s in (1, 2, 3, 7, 8, 9)},
-    **{s: "board_FT232H1" for s in (4, 5, 6, 10, 11, 12)},
-    **{s: "board_FT232H2" for s in (13, 14, 15, 19, 20, 21)},
-    **{s: "board_FT232H3" for s in (16, 17, 18, 22, 23, 24)},
-}
-
 
 @dataclass
 class Recording:
@@ -41,8 +34,6 @@ class Recording:
     lick_times: np.ndarray
     lick_indices: np.ndarray
     lick_vals: np.ndarray
-    start_time: float
-    t0_raw: float
     video_base: float
     video_path: str
     session_duration: float
@@ -87,12 +78,20 @@ def _resolve_start_stop(group):
     return start_time, stop_time
 
 
+def read_session_duration(h5_path):
+    """Return the session duration (stop_time - start_time) without running
+    filter_data, so the CLI can validate --start/--end before the expensive load."""
+    with h5py.File(h5_path, "r") as raw:
+        board_id, sensor_name, _ = find_video_sensor(raw)
+        start_time, stop_time = _resolve_start_stop(raw[board_id][sensor_name])
+    return stop_time - start_time
+
+
 def load_recording(h5_path, layout_path, pts_txt_path, video_path):
     layout = pd.read_csv(layout_path, header=None, index_col=0)
     with h5py.File(h5_path, "r") as raw:
         board_id, sensor_name, sensor_number = find_video_sensor(raw)
         group = raw[board_id][sensor_name]
-        t0_raw = float(group["time_data"][0])
         start_time, stop_time = _resolve_start_stop(group)
         video_frame_index = int(group["video_frame_index"][()])
     session_duration = stop_time - start_time
@@ -128,7 +127,7 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path):
     return Recording(
         animal=animal, sensor=sensor_number, cap=cap, time=time,
         lick_times=np.asarray(lick_times), lick_indices=lick_indices,
-        lick_vals=lick_vals, start_time=start_time, t0_raw=t0_raw,
+        lick_vals=lick_vals,
         video_base=video_base, video_path=video_path,
         session_duration=session_duration,
     )
@@ -140,9 +139,9 @@ def compute_video_base(pts_ns, frame_index):
     return float(pts_ns[frame_index] - pts_ns[0]) / 1e9
 
 
-def video_sec(tau, video_base, start_time, t0_raw, sync_offset=0.0):
-    """Video-file second for session-relative time ``tau`` (0 = start_time)."""
-    return video_base + (start_time + tau - t0_raw) + sync_offset
+def video_sec(tau, video_base, sync_offset=0.0):
+    """Video-file second for session-relative time ``tau`` (0 = start_time bookmark)."""
+    return video_base + tau + sync_offset
 
 
 def n_output_frames(start, end, fps):
@@ -206,9 +205,7 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     if taus.size == 0:
         raise ValueError("empty clip: check --start/--end/--fps")
 
-    clip_start_video_sec = video_sec(
-        start, rec.video_base, rec.start_time, rec.t0_raw, sync_offset
-    )
+    clip_start_video_sec = video_sec(start, rec.video_base, sync_offset)
     grabber = FrameGrabber(rec.video_path, clip_start_video_sec)
 
     cap_min, cap_max = float(rec.cap.min()), float(rec.cap.max())
@@ -221,6 +218,7 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     im = axv.imshow(first_frame if first_frame is not None
                     else np.zeros((2, 2, 3), dtype=np.uint8))
     axv.axis("off")
+    im_sized = first_frame is not None
 
     (line,) = axt.plot([], [], lw=0.8, color="tab:blue")
     (dot,) = axt.plot([], [], "o", color="red", markersize=6, zorder=5)
@@ -231,11 +229,14 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     axt.set_ylabel("Capacitance")
 
     def update(i):
+        nonlocal im_sized
         tau = float(taus[i])
-        frame = grabber.get(video_sec(
-            tau, rec.video_base, rec.start_time, rec.t0_raw, sync_offset))
+        frame = grabber.get(video_sec(tau, rec.video_base, sync_offset))
         if frame is not None:
             im.set_data(frame)
+            if not im_sized:
+                im.set_extent((-0.5, frame.shape[1] - 0.5, frame.shape[0] - 0.5, -0.5))
+                im_sized = True
 
         lo, hi = tau - window, tau + window
         m = window_mask(rec.time, lo, hi)
@@ -309,14 +310,18 @@ def main(argv=None):
         print("error: ffmpeg not found on PATH (needed to write the video)",
               file=sys.stderr)
         return 1
-    video, pts_txt = resolve_paths(args.h5, args.video, args.pts_txt)
-    rec = load_recording(args.h5, args.layout, pts_txt, video)
-    validate_window(args.start, args.end, rec.session_duration)
-    print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
-          f"[{args.start:.1f}, {args.end:.1f}] s -> {args.out}")
-    render_clip(rec, args.start, args.end, args.out,
-                fps=args.fps, window=args.window, sync_offset=args.sync_offset)
-    print("done")
+    try:
+        video, pts_txt = resolve_paths(args.h5, args.video, args.pts_txt)
+        validate_window(args.start, args.end, read_session_duration(args.h5))
+        rec = load_recording(args.h5, args.layout, pts_txt, video)
+        print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
+              f"[{args.start:.1f}, {args.end:.1f}] s -> {args.out}")
+        render_clip(rec, args.start, args.end, args.out,
+                    fps=args.fps, window=args.window, sync_offset=args.sync_offset)
+        print("done")
+    except (ValueError, FileNotFoundError, KeyError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
