@@ -9,6 +9,11 @@ import re
 import tempfile
 from dataclasses import dataclass
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, FFMpegWriter
+
 import h5py
 import imageio
 import numpy as np
@@ -191,3 +196,61 @@ class FrameGrabber:
 
     def close(self):
         self._reader.close()
+
+
+def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0):
+    taus = frame_times(start, end, fps)
+    if taus.size == 0:
+        raise ValueError("empty clip: check --start/--end/--fps")
+
+    clip_start_video_sec = video_sec(
+        start, rec.video_base, rec.start_time, rec.t0_raw, sync_offset
+    )
+    grabber = FrameGrabber(rec.video_path, clip_start_video_sec)
+
+    cap_min, cap_max = float(rec.cap.min()), float(rec.cap.max())
+    pad = 0.05 * (cap_max - cap_min + 1.0)
+
+    fig, (axv, axt) = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig.subplots_adjust(left=0.02, right=0.97, wspace=0.08)
+
+    first_frame = grabber.get(clip_start_video_sec)
+    im = axv.imshow(first_frame if first_frame is not None
+                    else np.zeros((2, 2, 3), dtype=np.uint8))
+    axv.axis("off")
+
+    (line,) = axt.plot([], [], lw=0.8, color="tab:blue")
+    (dot,) = axt.plot([], [], "o", color="red", markersize=6, zorder=5)
+    markers = axt.scatter([], [], s=40, facecolors="none",
+                          edgecolors="tab:orange", linewidths=1.5, zorder=4)
+    axt.set_ylim(cap_min - pad, cap_max + pad)
+    axt.set_xlabel("Time (s, session)")
+    axt.set_ylabel("Capacitance")
+
+    def update(i):
+        tau = float(taus[i])
+        frame = grabber.get(video_sec(
+            tau, rec.video_base, rec.start_time, rec.t0_raw, sync_offset))
+        if frame is not None:
+            im.set_data(frame)
+
+        lo, hi = tau - window, tau + window
+        m = window_mask(rec.time, lo, hi)
+        line.set_data(rec.time[m], rec.cap[m])
+        axt.set_xlim(lo, hi)
+
+        ci = nearest_index(rec.time, tau)
+        dot.set_data([tau], [rec.cap[ci]])
+
+        if rec.lick_times.size:
+            lm = window_mask(rec.lick_times, lo, hi)
+            markers.set_offsets(np.c_[rec.lick_times[lm], rec.lick_vals[lm]]
+                                if np.any(lm) else np.empty((0, 2)))
+        return im, line, dot, markers
+
+    anim = FuncAnimation(fig, update, frames=len(taus), blit=False)
+    try:
+        anim.save(out_path, writer=FFMpegWriter(fps=fps))
+    finally:
+        plt.close(fig)
+        grabber.close()

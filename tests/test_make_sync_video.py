@@ -106,3 +106,27 @@ def test_frame_grabber_reads_rgb_and_advances():
         assert f1.shape == f0.shape
     finally:
         g.close()
+
+
+import subprocess
+
+
+def _video_duration(path):
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=duration", "-of",
+        "default=noprint_wrappers=1:nokey=1", path,
+    ])
+    return float(out.strip())
+
+
+@needs_reference
+@needs_video
+def test_render_clip_smoke(tmp_path):
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    out = str(tmp_path / "clip.mp4")
+    start, end, fps = 120.0, 124.0, 30.0
+    msv.render_clip(rec, start, end, out, fps=fps)
+    assert os.path.exists(out) and os.path.getsize(out) > 0
+    # duration ~ (end - start), within a couple frames
+    assert _video_duration(out) == pytest.approx(end - start, abs=2.0 / fps)
