@@ -24,3 +24,21 @@ def n_output_frames(start, end, fps):
 
 def frame_times(start, end, fps):
     return start + np.arange(n_output_frames(start, end, fps)) / fps
+
+
+def window_mask(times, lo, hi):
+    times = np.asarray(times)
+    return (times >= lo) & (times <= hi)
+
+
+def nearest_index(times, tau):
+    times = np.asarray(times)
+    if times.size == 0:
+        raise ValueError("times is empty")
+    i = int(np.searchsorted(times, tau))
+    if i <= 0:
+        return 0
+    if i >= times.size:
+        return times.size - 1
+    # searchsorted lands on the right neighbor; pick the closer of i-1, i
+    return i if abs(times[i] - tau) < abs(times[i - 1] - tau) else i - 1

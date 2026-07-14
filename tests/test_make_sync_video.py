@@ -38,3 +38,17 @@ def test_frame_times():
     assert len(ft) == 60
     assert ft[0] == pytest.approx(10.0)
     assert ft[1] == pytest.approx(10.0 + 1 / 30.0)
+
+
+def test_window_mask():
+    times = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+    mask = msv.window_mask(times, 1.0, 3.0)
+    assert list(mask) == [False, True, True, True, False]
+
+
+def test_nearest_index_interior_and_clamp():
+    times = np.array([0.0, 1.0, 2.0, 3.0])
+    assert msv.nearest_index(times, 1.4) == 1
+    assert msv.nearest_index(times, 1.6) == 2
+    assert msv.nearest_index(times, -5.0) == 0
+    assert msv.nearest_index(times, 99.0) == 3
