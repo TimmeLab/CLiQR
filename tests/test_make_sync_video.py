@@ -52,3 +52,36 @@ def test_nearest_index_interior_and_clamp():
     assert msv.nearest_index(times, 1.6) == 2
     assert msv.nearest_index(times, -5.0) == 0
     assert msv.nearest_index(times, 99.0) == 3
+
+
+import os
+
+REC_DIR = "Lickometry Data/ACG-26-3"
+H5 = os.path.join(REC_DIR, "raw_data_2026-07-13_11-59-47.h5")
+VIDEO = os.path.join(REC_DIR, "raw_data_2026-07-13_11-59-47.mp4")
+PTS = os.path.join(REC_DIR, "raw_data_2026-07-13_11-59-47.txt")
+LAYOUT = os.path.join(REC_DIR, "layout_w_controls.csv")
+
+needs_reference = pytest.mark.skipif(
+    not all(os.path.exists(p) for p in (H5, PTS, LAYOUT)),
+    reason="reference recording files not present",
+)
+
+
+@needs_reference
+def test_load_recording_reference():
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    assert rec.animal == "ACG-26-3-1"
+    assert rec.sensor == 1
+    assert rec.cap.shape == rec.time.shape
+    assert rec.cap.size > 1000
+    # session-relative time starts at ~0 and increases
+    assert rec.time[0] == pytest.approx(0.0, abs=1.0)
+    assert rec.time[-1] > rec.time[0]
+    # licks detected, indices valid, vals consistent
+    assert rec.lick_indices.size == rec.lick_times.size
+    assert rec.lick_indices.max() < rec.cap.size
+    assert np.allclose(rec.lick_vals, rec.cap[rec.lick_indices])
+    # sync fields populated; video_base ~ 32 s for this recording
+    assert rec.video_base == pytest.approx(31.97, abs=0.1)
+    assert rec.session_duration > 3600
