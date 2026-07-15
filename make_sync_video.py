@@ -150,7 +150,14 @@ class TrimmedFrameSource:
     frame nearest ``target`` session-seconds. Targets must be non-decreasing."""
 
     def __init__(self, path, frame_sess):
-        self._reader = imageio.get_reader(path, "ffmpeg")
+        # Decode PASSTHROUGH ("-vsync 0"): this footage is VFR (coded 240 fps,
+        # real ~120), and imageio's default reader forces CFR, duplicating frames
+        # so its decode count exceeds the ffprobe pts list. Since frames are timed
+        # by that pts list (frame_sess) but counted by this decode, any duplicate
+        # slips the frame<->session mapping (~1 s per ~300 s, worse the longer the
+        # clip). Passthrough yields exactly one decoded frame per pts entry.
+        self._reader = imageio.get_reader(path, "ffmpeg",
+                                          output_params=["-vsync", "0"])
         self._sess = np.asarray(frame_sess, dtype=float)
         self._j = -1
         self._frame = None

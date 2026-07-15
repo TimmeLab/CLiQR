@@ -177,6 +177,44 @@ def test_subclip_copy_lands_on_a_cropped_file(tmp_path):
     assert sess[0] <= 122.0 and sess[-1] >= 124.0
 
 
+@needs_reference
+@needs_video
+def test_trimmed_frame_source_decode_matches_pts(tmp_path):
+    # This footage is VFR (coded 240 fps, real ~120). imageio's default reader
+    # forces CFR and DUPLICATES frames, so its sequential decode count exceeds
+    # the ffprobe pts list; TrimmedFrameSource counts frames by decode but times
+    # them by pts, so the mismatch slips the frame<->session mapping ~1 s per
+    # ~300 s (different frame shown at the same session in clips of different
+    # length). The reader must decode passthrough: one decoded frame per pts.
+    import h5py
+    pts_ns = np.loadtxt(PTS, dtype=np.int64)
+    with h5py.File(H5, "r") as f:
+        board, sensor, _ = msv.find_video_sensor(f)
+        fi = int(f[board][sensor]["video_frame_index"][()])
+    video_base = msv.compute_video_base(pts_ns, fi)
+    # a long-ish window so any per-frame slip accumulates past rounding
+    sf, ef = msv.compute_trim_frames(pts_ns, video_base, 100.0, 160.0)
+    start_sec = float(pts_ns[sf] - pts_ns[0]) / 1e9
+    end_sec = float(pts_ns[ef] - pts_ns[0]) / 1e9 + 0.3
+    out = str(tmp_path / "long.mp4")
+    msv.trim_and_crop(VIDEO, start_sec, end_sec, out, 452, 180, 360)
+
+    frame_sess = msv.probe_frame_session_times(out, video_base)
+    src = msv.TrimmedFrameSource(out, frame_sess)
+    decoded = 0
+    try:
+        while True:
+            try:
+                src._reader.get_next_data()
+            except (IndexError, StopIteration):
+                break
+            decoded += 1
+    finally:
+        src.close()
+    # one decoded frame per pts entry -> mapping can't drift
+    assert decoded == frame_sess.size
+
+
 import subprocess
 
 
