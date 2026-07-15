@@ -1347,12 +1347,12 @@ git commit -m "feat: draggable crop selector GUI"
 ### Task 7: Point `make_sync_video.py` at the cropped file
 
 **Files:**
-- Modify: `make_sync_video.py` — `render_clip` (`:277-306` region), `build_arg_parser`, `main`
-- Modify: `tests/test_make_sync_video.py:210-218` (`test_build_arg_parser_parses_required`)
+- Modify: `make_sync_video.py` — `load_recording`, `render_clip` (`:277-306` region), `build_arg_parser`, `main`
+- Modify: `tests/test_make_sync_video.py:210-218` (`test_build_arg_parser_parses_required`), and every `load_recording` call site
 
 **Interfaces:**
 - Consumes: `subclip_copy`, `resolve_paths(prefer_cropped=True)`, `read_video_anchor` from Tasks 3-4.
-- Produces: no new API. `render_clip`'s `crop_w`/`crop_h` parameters are gone.
+- Produces: `load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor)` — new trailing `anchor` parameter. `render_clip`'s `crop_w`/`crop_h` parameters are gone.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1378,7 +1378,52 @@ def test_build_arg_parser_parses_required():
 Run: `python -m pytest tests/test_make_sync_video.py -q -k build_arg_parser`
 Expected: FAIL — `assert not hasattr(args, "crop_w")`
 
-- [ ] **Step 3: Update `render_clip`**
+- [ ] **Step 3: Make `load_recording` take the anchor instead of re-deriving it**
+
+`load_recording` currently opens the h5 and redoes exactly what `read_video_anchor` does. Take the anchor as a parameter instead. Change the signature:
+
+```python
+def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
+```
+
+Delete this block from its body (the first `with h5py.File(...)` and the two lines after it):
+
+```python
+    with h5py.File(h5_path, "r") as raw:
+        board_id, sensor_name, sensor_number = find_video_sensor(raw)
+        group = raw[board_id][sensor_name]
+        start_time, stop_time = _resolve_start_stop(group)
+        video_frame_index = int(group["video_frame_index"][()])
+        host_before = (float(group["video_bookmark_host_before"][()])
+                       if "video_bookmark_host_before" in group else None)
+        host_after = (float(group["video_bookmark_host_after"][()])
+                      if "video_bookmark_host_after" in group else None)
+    session_duration = stop_time - start_time
+    latency = bookmark_latency(host_before, host_after, start_time)
+
+    animal = str(layout.loc[sensor_number].iloc[0])
+```
+
+replacing it with:
+
+```python
+    session_duration = anchor.session_duration
+    latency = anchor.latency
+    video_frame_index = anchor.video_frame_index
+    animal = str(layout.loc[anchor.sensor_number].iloc[0])
+```
+
+and change the `Recording(...)` construction's `sensor=sensor_number` to `sensor=anchor.sensor_number`. The rest of the body (the `filter_data` call, the pts load, `compute_video_base`) is unchanged.
+
+`find_video_sensor`, `_resolve_start_stop`, and `bookmark_latency` are now unused in `make_sync_video.py` — drop them from the `from video.trimcrop import (...)` block. Importing the private `_resolve_start_stop` across modules goes away with them.
+
+Update the four `load_recording` call sites in `tests/test_make_sync_video.py` (in `test_load_recording_reference`, `test_trim_and_crop_and_frame_source`, `test_subclip_copy_lands_on_a_cropped_file`, `test_render_clip_smoke`) to pass an anchor:
+
+```python
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
+```
+
+- [ ] **Step 4: Update `render_clip`**
 
 Change the signature — drop `crop_w`/`crop_h`:
 
@@ -1422,7 +1467,7 @@ with:
 
 Everything after it is unchanged: `probe_frame_session_times(intermediate_path, video_base_eff)` reads the subclip's preserved PTS, and `TrimmedFrameSource` matches frames by session time.
 
-- [ ] **Step 4: Update `build_arg_parser` and `main`**
+- [ ] **Step 5: Update `build_arg_parser` and `main`**
 
 Delete the `--crop-w` and `--crop-h` arguments. Update `--video`'s help:
 
@@ -1443,7 +1488,13 @@ In `main`, replace the resolve + render calls:
 
 (`read_session_duration` is no longer needed in `main` — the anchor already carries the window. Keep the function; `tests/test_make_sync_video.py::test_read_session_duration_reference` covers it.)
 
-and:
+Pass the anchor through to `load_recording`:
+
+```python
+        rec = load_recording(args.h5, args.layout, pts_txt, video, anchor)
+```
+
+and drop the crop args from the render call:
 
 ```python
         render_clip(rec, args.start, args.end, args.out,
@@ -1451,12 +1502,12 @@ and:
                     intermediate_path=intermediate)
 ```
 
-- [ ] **Step 5: Run the full suite**
+- [ ] **Step 6: Run the full suite**
 
 Run: `python -m pytest tests/test_trimcrop.py tests/test_crop_video.py tests/test_make_sync_video.py -q`
 Expected: PASS, all tests including `test_render_clip_smoke` (excluded since Task 3, now unblocked).
 
-- [ ] **Step 6: End-to-end verification against the reference recording**
+- [ ] **Step 7: End-to-end verification against the reference recording**
 
 This is the spec's verification section. `/tmp/ref_cropped.mp4` from Task 6 is the crop; put it where the fallback logic looks for it:
 
@@ -1488,7 +1539,7 @@ Compare `/tmp/clip_cropped.mp4` and `/tmp/clip_uncropped.mp4` by eye: the trace 
 
 Clean up: `rm -f /tmp/stashed_cropped.mp4 /tmp/clip_*.mp4 /tmp/ref_cropped.mp4`
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add make_sync_video.py tests/test_make_sync_video.py
