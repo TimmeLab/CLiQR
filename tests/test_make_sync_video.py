@@ -285,10 +285,17 @@ def test_resolve_paths_defaults_from_h5():
     assert os.path.dirname(video) == os.path.dirname(H5)
 
 
-def _synthetic_rec(pts_ns, video_base, latency):
-    """A Recording carrying only what clip_trim_window reads."""
+def _synthetic_rec(pts_ns, video_base, latency, n=3):
+    """A Recording carrying only what clip_trim_window reads. ``n`` widens
+    cap/time (default 3, matching the original clip_trim_window-only callers)
+    for callers that need a renderable trace panel, e.g. render_clip."""
+    if n == 3:
+        cap, time = np.zeros(3), np.zeros(3)
+    else:
+        time = np.linspace(0.0, 5.0, n)
+        cap = np.sin(time)
     return msv.Recording(
-        animal="X", sensor=1, cap=np.zeros(3), time=np.zeros(3),
+        animal="X", sensor=1, cap=cap, time=time,
         lick_times=np.array([]), lick_indices=np.array([], dtype=int),
         lick_vals=np.array([]), video_base=video_base, video_path="v.mp4",
         session_duration=10.0, pts_ns=pts_ns, bookmark_latency=latency,
@@ -337,3 +344,50 @@ def test_clip_trim_window_matches_crop_window():
 
     assert (msv.clip_trim_window(rec, 0.0, anchor.session_duration)[:4]
             == cv.compute_crop_window(anchor, pts_ns))
+
+
+def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path, monkeypatch):
+    """Regression guard for the one anchor bug the reference recording (latency
+    0.0) can never catch: if render_clip's probe_frame_session_times call used
+    the raw rec.video_base instead of the latency-corrected video_base_eff, the
+    trim WINDOW would still be right (clip_trim_window handles that), but every
+    frame's session LABEL would be `latency` seconds early, so src.get(tau)
+    would return the frame captured at tau + latency — video running ahead of
+    the trace by exactly the bookmark latency. All 72 other tests stay green
+    under that regression; only this one, driven with a nonzero latency, sees
+    it.
+    """
+    pts_ns = (np.arange(0, 41) * 100_000_000).astype(np.int64)  # 0.0..4.0 s
+    vb = msv.compute_video_base(pts_ns, 2)  # 0.2
+    latency = 0.25
+    rec = _synthetic_rec(pts_ns, vb, latency, n=50)
+
+    recorded = {}
+
+    def fake_subclip_copy(video_path, start_sec, end_sec, out_path, *a, **kw):
+        return out_path
+
+    def fake_probe(path, video_base):
+        recorded["video_base"] = video_base
+        return np.linspace(0.0, 0.3, 5)
+
+    class FakeSource:
+        def __init__(self, path, frame_sess):
+            pass
+
+        def get(self, target_session):
+            return np.zeros((4, 4, 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(msv, "subclip_copy", fake_subclip_copy)
+    monkeypatch.setattr(msv, "probe_frame_session_times", fake_probe)
+    monkeypatch.setattr(msv, "TrimmedFrameSource", FakeSource)
+
+    out = str(tmp_path / "clip.mp4")
+    msv.render_clip(rec, 0.0, 0.2, out, fps=5.0)
+
+    assert "video_base" in recorded
+    assert recorded["video_base"] == pytest.approx(vb - latency)
+    assert recorded["video_base"] != pytest.approx(vb)
