@@ -307,10 +307,12 @@ def test_clip_trim_window_applies_bookmark_latency():
     vb = msv.compute_video_base(pts_ns, 2)  # 0.2
     plain = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.0), 0.0, 0.3)
     assert plain[0] == 2 and plain[2] == pytest.approx(0.2)
+    assert plain[4] == pytest.approx(vb)   # video_base_eff, latency 0.0
     shifted = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.25), 0.0, 0.3)
     assert shifted[0] == 0
     assert shifted[0] < plain[0]           # earlier start frame
     assert shifted[2] < plain[2]           # earlier start second
+    assert shifted[4] == pytest.approx(vb - 0.25)  # video_base_eff, latency 0.25
 
 
 def test_clip_trim_window_matches_crop_window():
@@ -333,5 +335,5 @@ def test_clip_trim_window_matches_crop_window():
     vb = msv.compute_video_base(pts_ns, anchor.video_frame_index)
     rec = _synthetic_rec(pts_ns, vb, anchor.latency)
 
-    assert (msv.clip_trim_window(rec, 0.0, anchor.session_duration)
+    assert (msv.clip_trim_window(rec, 0.0, anchor.session_duration)[:4]
             == cv.compute_crop_window(anchor, pts_ns))

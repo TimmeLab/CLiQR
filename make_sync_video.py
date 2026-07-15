@@ -7,7 +7,6 @@ detected licks. See docs/superpowers/specs/2026-07-14-sync-video-composite-desig
 import argparse
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -27,7 +26,6 @@ from video.trimcrop import (
     bookmark_latency,
     compute_trim_frames,
     compute_video_base,
-    cropped_path_for,
     find_video_sensor,
     frame_session_times,
     probe_frame_session_times,
@@ -171,8 +169,10 @@ class TrimmedFrameSource:
 
 
 def clip_trim_window(rec, start, end):
-    """Video-file window (start_frame, stop_frame, start_sec, end_sec) for the
-    clip's session window [start, end].
+    """Video-file window (start_frame, stop_frame, start_sec, end_sec,
+    video_base_eff) for the clip's session window [start, end]. video_base_eff is
+    the latency-corrected anchor the window was built from, returned so callers
+    don't need a second copy of the correction formula.
 
     Correct the bookmark-latency anchor error: the recorded bookmark frame was
     captured rec.bookmark_latency seconds AFTER start_time, so raw frame session
@@ -181,8 +181,10 @@ def clip_trim_window(rec, start, end):
     trim_window_seconds with crop_video's compute_crop_window so the two cannot
     drift apart.
     """
-    return trim_window_seconds(rec.pts_ns, rec.video_base - rec.bookmark_latency,
-                               start, end)
+    video_base_eff = rec.video_base - rec.bookmark_latency
+    sf, ef, start_sec, end_sec = trim_window_seconds(rec.pts_ns, video_base_eff,
+                                                      start, end)
+    return sf, ef, start_sec, end_sec, video_base_eff
 
 
 def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0,
@@ -206,8 +208,7 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     if taus.size == 0:
         raise ValueError("empty clip: check --start/--end/--fps")
 
-    video_base_eff = rec.video_base - rec.bookmark_latency
-    _, _, start_sec, end_sec = clip_trim_window(rec, start, end)
+    _, _, start_sec, end_sec, video_base_eff = clip_trim_window(rec, start, end)
 
     if intermediate_path is None:
         intermediate_path = os.path.splitext(out_path)[0] + "_trimcrop.mp4"
@@ -302,7 +303,7 @@ def build_arg_parser():
                    help="manual nudge, seconds; increase if video runs ahead of "
                         "the trace (default 0)")
     p.add_argument("--intermediate", default=None,
-                   help="path for the trimmed+cropped video (kept); "
+                   help="path for the trimmed subclip (kept); "
                         "default: <out>_trimcrop.mp4")
     return p
 
@@ -322,7 +323,7 @@ def main(argv=None):
         intermediate = args.intermediate or (os.path.splitext(args.out)[0] + "_trimcrop.mp4")
         print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
               f"[{args.start:.1f}, {args.end:.1f}] s")
-        print(f"  trimmed+cropped video -> {intermediate}")
+        print(f"  trimmed video -> {intermediate}")
         print(f"  composite -> {args.out}")
         render_clip(rec, args.start, args.end, args.out,
                     fps=args.fps, window=args.window, sync_offset=args.sync_offset,

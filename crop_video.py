@@ -18,7 +18,6 @@ from matplotlib.patches import Rectangle
 from matplotlib.widgets import Button
 
 from video.trimcrop import (
-    TAIL_MARGIN,
     clamp_origin,
     compute_video_base,
     cropped_path_for,
