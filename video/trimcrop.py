@@ -6,6 +6,7 @@ stream-copy subclip). See docs/superpowers/specs/2026-07-15-video-crop-tool-desi
 """
 import re
 import subprocess
+from dataclasses import dataclass
 
 import h5py
 import numpy as np
@@ -106,3 +107,57 @@ def probe_frame_session_times(path, video_base):
     if pts.size == 0:
         raise RuntimeError(f"ffprobe found no frames in {path}")
     return pts - video_base
+
+
+@dataclass
+class VideoAnchor:
+    """Everything needed to place the video against the trace, from one h5 open."""
+    sensor_number: int
+    video_filename: str
+    video_frame_index: int
+    start_time: float
+    stop_time: float
+    host_before: float | None
+    host_after: float | None
+
+    @property
+    def session_duration(self):
+        return self.stop_time - self.start_time
+
+    @property
+    def latency(self):
+        return bookmark_latency(self.host_before, self.host_after, self.start_time)
+
+
+def read_video_anchor(h5_path):
+    """Read the video sensor's sync metadata and session window in one open."""
+    with h5py.File(h5_path, "r") as raw:
+        board_id, sensor_name, sensor_number = find_video_sensor(raw)
+        group = raw[board_id][sensor_name]
+        start_time, stop_time = _resolve_start_stop(group)
+        fname = group["video_filename"][()]
+        fname = fname.decode() if isinstance(fname, bytes) else str(fname)
+        return VideoAnchor(
+            sensor_number=sensor_number,
+            video_filename=fname,
+            video_frame_index=int(group["video_frame_index"][()]),
+            start_time=start_time,
+            stop_time=stop_time,
+            host_before=(float(group["video_bookmark_host_before"][()])
+                         if "video_bookmark_host_before" in group else None),
+            host_after=(float(group["video_bookmark_host_after"][()])
+                        if "video_bookmark_host_after" in group else None),
+        )
+
+
+def clamp_origin(x, y, frame_w, frame_h, size):
+    """Clamp a proposed crop origin so the size x size box stays inside the frame,
+    rounding each coordinate down to an even number (yuv420p needs even offsets).
+    Rounding down only ever moves the box further inside. Raises ValueError if the
+    box cannot fit."""
+    if size > frame_w or size > frame_h:
+        raise ValueError(
+            f"crop size {size} exceeds frame {frame_w}x{frame_h}")
+    x = int(min(max(x, 0), frame_w - size))
+    y = int(min(max(y, 0), frame_h - size))
+    return x - (x % 2), y - (y % 2)

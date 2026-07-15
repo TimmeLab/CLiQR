@@ -109,3 +109,65 @@ def test_read_session_window(tmp_path):
         "start_time": 110.0, "stop_time": 175.0,
     }})
     assert tc.read_session_window(str(p)) == (110.0, 175.0)
+
+
+def test_clamp_origin_interior_unchanged():
+    assert tc.clamp_origin(452, 180, 1280, 720, 360) == (452, 180)
+
+
+def test_clamp_origin_rounds_down_to_even():
+    # yuv420p needs even offsets
+    assert tc.clamp_origin(451, 181, 1280, 720, 360) == (450, 180)
+
+
+def test_clamp_origin_clamps_each_edge():
+    assert tc.clamp_origin(-50, -50, 1280, 720, 360) == (0, 0)
+    # right/bottom clamp to frame - size, which stays inside
+    assert tc.clamp_origin(9999, 9999, 1280, 720, 360) == (920, 360)
+
+
+def test_clamp_origin_clamped_edge_stays_even():
+    # frame_h - size = 365 is odd -> must round down, not out of frame
+    assert tc.clamp_origin(9999, 9999, 1280, 725, 360) == (920, 364)
+
+
+def test_clamp_origin_size_exceeding_frame_raises():
+    with pytest.raises(ValueError):
+        tc.clamp_origin(0, 0, 320, 720, 360)
+    with pytest.raises(ValueError):
+        tc.clamp_origin(0, 0, 1280, 200, 360)
+
+
+def test_read_video_anchor(tmp_path):
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {
+        "sensor_0": {"time_data": np.array([1.0])},
+        "sensor_1": {
+            "time_data": np.array([100.0, 200.0]),
+            "video_filename": b"vid.mp4",
+            "video_frame_index": 42,
+            "start_time": 110.0,
+            "stop_time": 175.0,
+            "video_bookmark_host_before": 111.0,
+            "video_bookmark_host_after": 111.4,
+        },
+    })
+    a = tc.read_video_anchor(str(p))
+    assert a.sensor_number == 1
+    assert a.video_filename == "vid.mp4"   # decoded, not bytes
+    assert a.video_frame_index == 42
+    assert a.session_duration == pytest.approx(65.0)
+    assert a.latency == pytest.approx(1.2)  # (111.0 + 111.4)/2 - 110.0
+
+
+def test_read_video_anchor_without_host_bracket(tmp_path):
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {"sensor_1": {
+        "time_data": np.array([100.0, 200.0]),
+        "video_filename": b"vid.mp4",
+        "video_frame_index": 3,
+        "start_time": 110.0, "stop_time": 175.0,
+    }})
+    a = tc.read_video_anchor(str(p))
+    assert a.host_before is None and a.host_after is None
+    assert a.latency == 0.0
