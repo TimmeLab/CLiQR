@@ -83,8 +83,9 @@ lick times for the camera sensor.
 
 Two steps. Crop once per recording, then render as many clips as you like.
 
-1. **Crop** — trims the video to the capacitance-recording window and crops it
-   to a square you position by hand:
+1. **Crop** — trims the video to approximately the capacitance-recording window
+   (keeping a few seconds of lead-in; frames are timed by PTS downstream, not by
+   the trim) and crops it to a square you position by hand:
 
        python crop_video.py --h5 "Lickometry Data/<animal>/raw_data_<stamp>.h5"
 

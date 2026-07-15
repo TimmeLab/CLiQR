@@ -23,24 +23,6 @@ def test_bookmark_latency_missing_is_zero():
     assert msv.bookmark_latency(1000.0, None, 998.0) == 0.0
 
 
-def test_video_sec_at_bookmark_anchor():
-    # tau=0 (start_time bookmark) -> video_base, no spurious offset
-    got = msv.video_sec(0.0, video_base=32.0)
-    assert got == pytest.approx(32.0)
-
-
-def test_video_sec_linear_and_offset():
-    base = dict(video_base=32.0)
-    assert msv.video_sec(5.0, **base) - msv.video_sec(0.0, **base) == pytest.approx(5.0)
-    assert msv.video_sec(0.0, sync_offset=2.0, **base) - msv.video_sec(0.0, **base) == pytest.approx(2.0)
-
-
-def test_video_sec_vectorized():
-    taus = np.array([0.0, 1.0, 2.0])
-    got = msv.video_sec(taus, video_base=32.0)
-    assert np.allclose(got, np.array([32.0, 33.0, 34.0]))
-
-
 def test_n_output_frames():
     assert msv.n_output_frames(10.0, 20.0, 30.0) == 300
     assert msv.n_output_frames(0.0, 5.0, 30.0) == 150
@@ -231,8 +213,6 @@ def _video_duration(path):
 @needs_video
 def test_render_clip_smoke(tmp_path):
     rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
-    # sync anchor: tau=0 (start_time bookmark) maps to video_base seconds into the file
-    assert msv.video_sec(0.0, rec.video_base) == pytest.approx(rec.video_base)
     out = str(tmp_path / "clip.mp4")
     start, end, fps = 120.0, 124.0, 30.0
     msv.render_clip(rec, start, end, out, fps=fps)

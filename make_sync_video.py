@@ -105,11 +105,6 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
     )
 
 
-def video_sec(tau, video_base, sync_offset=0.0):
-    """Video-file second for session-relative time ``tau`` (0 = start_time bookmark)."""
-    return video_base + tau + sync_offset
-
-
 def n_output_frames(start, end, fps):
     return int(round((end - start) * fps))
 
@@ -295,7 +290,8 @@ def build_arg_parser():
                    help="mouse video (default: <base>_cropped.mp4 from "
                         "crop_video.py, else the uncropped recording)")
     p.add_argument("--pts-txt", dest="pts_txt", default=None,
-                   help="per-frame PTS sidecar (default: video path with .txt)")
+                   help="per-frame PTS sidecar (default: from the h5's "
+                        "video_filename, with .txt)")
     p.add_argument("--fps", type=float, default=30.0, help="output fps (default 30)")
     p.add_argument("--window", type=float, default=2.5,
                    help="trace half-window seconds (default 2.5)")

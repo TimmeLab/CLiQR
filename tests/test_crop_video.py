@@ -89,6 +89,30 @@ def test_resolve_out_path_existing_with_force(tmp_path):
     assert cv.resolve_out_path(v, None, True) == str(tmp_path / "v_cropped.mp4")
 
 
+def test_resolve_out_path_refuses_to_overwrite_source(tmp_path):
+    v = str(tmp_path / "v.mp4")
+    with pytest.raises(ValueError, match="refusing to overwrite the source"):
+        cv.resolve_out_path(v, v, False)
+
+
+def test_resolve_out_path_refuses_to_overwrite_source_even_with_force(tmp_path):
+    """--force must not override the same-file guard: this would destroy an
+    irreplaceable multi-GB recording via ffmpeg -y reading and writing it at
+    once."""
+    v = str(tmp_path / "v.mp4")
+    with pytest.raises(ValueError, match="refusing to overwrite the source"):
+        cv.resolve_out_path(v, v, True)
+
+
+def test_resolve_out_path_refuses_dotted_path_equivalent_to_source(tmp_path):
+    """Same file, different spelling — a plain string compare would miss this,
+    so resolve_out_path must compare abspaths."""
+    v = str(tmp_path / "v.mp4")
+    dotted = str(tmp_path / "." / "v.mp4")
+    with pytest.raises(ValueError, match="refusing to overwrite the source"):
+        cv.resolve_out_path(v, dotted, True)
+
+
 def test_reject_cropped_input():
     with pytest.raises(ValueError, match="already-cropped"):
         cv.reject_cropped_input("/d/v_cropped.mp4")

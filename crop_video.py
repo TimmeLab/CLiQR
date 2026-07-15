@@ -1,10 +1,12 @@
-"""Interactively crop a Pi video recording to a square region and trim it to the
-capacitance-recording window.
+"""Interactively crop a Pi video recording to a square region and trim it to
+approximately the capacitance-recording window.
 
 Shows the frame at the middle of the recording window, lets you drag a fixed-size
 square over the region of interest, then writes <video>_cropped.mp4 — trimmed to
-the session and cropped to the square. make_sync_video.py picks that file up
-automatically. See docs/superpowers/specs/2026-07-15-video-crop-tool-design.md.
+approximately the session (keeping a few seconds of lead-in; frames are timed by
+PTS downstream, not by the trim) and cropped to the square. make_sync_video.py
+picks that file up automatically. See
+docs/superpowers/specs/2026-07-15-video-crop-tool-design.md.
 """
 import argparse
 import os
@@ -47,6 +49,8 @@ def reject_cropped_input(video):
 def resolve_out_path(video, out, force):
     if out is None:
         out = cropped_path_for(video)
+    if os.path.abspath(out) == os.path.abspath(video):
+        raise ValueError(f"refusing to overwrite the source recording: {out}")
     if os.path.exists(out) and not force:
         raise ValueError(f"{out} exists; pass --force to overwrite")
     return out
@@ -134,7 +138,8 @@ def build_arg_parser():
     p.add_argument("--video", default=None,
                    help="source video (default: from h5 video_filename)")
     p.add_argument("--pts-txt", dest="pts_txt", default=None,
-                   help="per-frame PTS sidecar (default: video path with .txt)")
+                   help="per-frame PTS sidecar (default: from the h5's "
+                        "video_filename, with .txt)")
     p.add_argument("--size", type=int, default=360,
                    help="side length of the square crop (default 360)")
     p.add_argument("--out", default=None,
