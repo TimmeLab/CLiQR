@@ -24,7 +24,6 @@ import pandas as pd
 
 from data_analysis import filter_data
 from video.trimcrop import (
-    _resolve_start_stop,
     bookmark_latency,
     compute_trim_frames,
     compute_video_base,
@@ -64,21 +63,12 @@ def read_session_duration(h5_path):
     return stop_time - start_time
 
 
-def load_recording(h5_path, layout_path, pts_txt_path, video_path):
+def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
     layout = pd.read_csv(layout_path, header=None, index_col=0)
-    with h5py.File(h5_path, "r") as raw:
-        board_id, sensor_name, sensor_number = find_video_sensor(raw)
-        group = raw[board_id][sensor_name]
-        start_time, stop_time = _resolve_start_stop(group)
-        video_frame_index = int(group["video_frame_index"][()])
-        host_before = (float(group["video_bookmark_host_before"][()])
-                       if "video_bookmark_host_before" in group else None)
-        host_after = (float(group["video_bookmark_host_after"][()])
-                      if "video_bookmark_host_after" in group else None)
-    session_duration = stop_time - start_time
-    latency = bookmark_latency(host_before, host_after, start_time)
-
-    animal = str(layout.loc[sensor_number].iloc[0])
+    session_duration = anchor.session_duration
+    latency = anchor.latency
+    video_frame_index = anchor.video_frame_index
+    animal = str(layout.loc[anchor.sensor_number].iloc[0])
 
     with tempfile.TemporaryDirectory() as td:
         filt_path = os.path.join(td, "filtered.h5")
@@ -107,7 +97,7 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path):
     video_base = compute_video_base(pts_ns, video_frame_index)
 
     return Recording(
-        animal=animal, sensor=sensor_number, cap=cap, time=time,
+        animal=animal, sensor=anchor.sensor_number, cap=cap, time=time,
         lick_times=np.asarray(lick_times), lick_indices=lick_indices,
         lick_vals=lick_vals,
         video_base=video_base, video_path=video_path,
@@ -180,13 +170,18 @@ class TrimmedFrameSource:
 
 
 def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0,
-                crop_w=640, crop_h=360, intermediate_path=None):
-    """Render the side-by-side clip. First trims+crops the mouse video to the
-    window (intermediate file, kept), then composites from it: the left panel is
-    the trimmed frame, the right panel the sliding capacitance trace with a
-    centered dot and lick markers. Each video frame is placed by its true session
-    time (from the PTS sidecar) — no seeking into the full recording, no fps
-    assumption — so video and trace stay aligned.
+                intermediate_path=None):
+    """Render the side-by-side clip. First stream-copies the mouse video down to
+    the clip window (intermediate file, kept) so we don't decode the whole
+    recording, then composites from it: the left panel is the video frame, the
+    right panel the sliding capacitance trace with a centered dot and lick
+    markers. Each video frame is placed by its true session time (from its
+    preserved PTS) — no seeking assumptions, no fps assumption — so video and
+    trace stay aligned.
+
+    The video panel shows whatever region ``rec.video_path`` already carries:
+    crop it once with crop_video.py, or pass the uncropped recording for a
+    full-frame panel.
 
     ``sync_offset`` is a residual manual nudge in seconds: increase it if the
     video still runs ahead of the trace.
@@ -207,8 +202,7 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
 
     if intermediate_path is None:
         intermediate_path = os.path.splitext(out_path)[0] + "_trimcrop.mp4"
-    trim_and_crop(rec.video_path, start_sec, end_sec, intermediate_path,
-                  crop_w, crop_h)
+    subclip_copy(rec.video_path, start_sec, end_sec, intermediate_path)
 
     # Time each trimmed frame by its real (preserved) PTS, not by seek position.
     frame_sess = probe_frame_session_times(intermediate_path, video_base_eff)
@@ -288,7 +282,8 @@ def build_arg_parser():
                    help="clip end, seconds since the Start bookmark")
     p.add_argument("--out", required=True, help="output .mp4 path")
     p.add_argument("--video", default=None,
-                   help="mouse video (default: from h5 video_filename)")
+                   help="mouse video (default: <base>_cropped.mp4 from "
+                        "crop_video.py, else the uncropped recording)")
     p.add_argument("--pts-txt", dest="pts_txt", default=None,
                    help="per-frame PTS sidecar (default: video path with .txt)")
     p.add_argument("--fps", type=float, default=30.0, help="output fps (default 30)")
@@ -297,10 +292,6 @@ def build_arg_parser():
     p.add_argument("--sync-offset", dest="sync_offset", type=float, default=0.0,
                    help="manual nudge, seconds; increase if video runs ahead of "
                         "the trace (default 0)")
-    p.add_argument("--crop-w", dest="crop_w", type=int, default=640,
-                   help="center-crop width of the video panel (default 640)")
-    p.add_argument("--crop-h", dest="crop_h", type=int, default=360,
-                   help="center-crop height of the video panel (default 360)")
     p.add_argument("--intermediate", default=None,
                    help="path for the trimmed+cropped video (kept); "
                         "default: <out>_trimcrop.mp4")
@@ -314,9 +305,11 @@ def main(argv=None):
               file=sys.stderr)
         return 1
     try:
-        video, pts_txt = resolve_paths(args.h5, args.video, args.pts_txt)
-        validate_window(args.start, args.end, read_session_duration(args.h5))
-        rec = load_recording(args.h5, args.layout, pts_txt, video)
+        anchor = read_video_anchor(args.h5)
+        video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt,
+                                       prefer_cropped=True)
+        validate_window(args.start, args.end, anchor.session_duration)
+        rec = load_recording(args.h5, args.layout, pts_txt, video, anchor)
         intermediate = args.intermediate or (os.path.splitext(args.out)[0] + "_trimcrop.mp4")
         print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
               f"[{args.start:.1f}, {args.end:.1f}] s")
@@ -324,7 +317,6 @@ def main(argv=None):
         print(f"  composite -> {args.out}")
         render_clip(rec, args.start, args.end, args.out,
                     fps=args.fps, window=args.window, sync_offset=args.sync_offset,
-                    crop_w=args.crop_w, crop_h=args.crop_h,
                     intermediate_path=intermediate)
         print("done")
     except (ValueError, FileNotFoundError, KeyError, OSError, RuntimeError) as e:

@@ -101,7 +101,7 @@ needs_reference = pytest.mark.skipif(
 
 @needs_reference
 def test_load_recording_reference():
-    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
     assert rec.animal == "ACG-26-3-1"
     assert rec.sensor == 1
     assert rec.cap.shape == rec.time.shape
@@ -131,7 +131,7 @@ needs_video = pytest.mark.skipif(
 @needs_video
 def test_trim_and_crop_and_frame_source(tmp_path):
     import imageio
-    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
     sf, ef = msv.compute_trim_frames(rec.pts_ns, rec.video_base, 120.0, 123.0)
     start_sec = float(rec.pts_ns[sf] - rec.pts_ns[0]) / 1e9
     end_sec = float(rec.pts_ns[ef] - rec.pts_ns[0]) / 1e9 + 0.3
@@ -162,7 +162,7 @@ def test_trim_and_crop_and_frame_source(tmp_path):
 def test_subclip_copy_lands_on_a_cropped_file(tmp_path):
     """A cropped file's PTS start at the session start, not 0. Stream-copying a
     window out of it must still cover that window."""
-    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
     sf, ef = msv.compute_trim_frames(rec.pts_ns, rec.video_base, 120.0, 130.0)
     start_sec = float(rec.pts_ns[sf] - rec.pts_ns[0]) / 1e9
     end_sec = float(rec.pts_ns[ef] - rec.pts_ns[0]) / 1e9 + 0.3
@@ -230,7 +230,7 @@ def _video_duration(path):
 @needs_reference
 @needs_video
 def test_render_clip_smoke(tmp_path):
-    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
     # sync anchor: tau=0 (start_time bookmark) maps to video_base seconds into the file
     assert msv.video_sec(0.0, rec.video_base) == pytest.approx(rec.video_base)
     out = str(tmp_path / "clip.mp4")
@@ -270,7 +270,10 @@ def test_build_arg_parser_parses_required():
     ])
     assert args.h5 == "r.h5" and args.start == 5.0 and args.end == 9.0
     assert args.fps == 30.0 and args.window == 2.5 and args.sync_offset == 0.0
-    assert args.crop_w == 640 and args.crop_h == 360 and args.intermediate is None
+    assert args.intermediate is None
+    # cropping is crop_video.py's job now
+    assert not hasattr(args, "crop_w")
+    assert not hasattr(args, "crop_h")
 
 
 @needs_reference
