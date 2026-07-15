@@ -171,3 +171,87 @@ def test_read_video_anchor_without_host_bracket(tmp_path):
     a = tc.read_video_anchor(str(p))
     assert a.host_before is None and a.host_after is None
     assert a.latency == 0.0
+
+
+import types
+
+
+def _fake_run(calls, stdout="", returncode=0):
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr="boom")
+    return run
+
+
+def test_probe_start_pts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="30.000000\n"))
+    assert tc.probe_start_pts("in.mp4") == pytest.approx(30.0)
+    assert "start_time" in " ".join(calls[0])
+
+
+def test_probe_start_pts_missing_is_zero(monkeypatch):
+    # ffprobe prints "N/A" for containers without a start_time
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="N/A\n"))
+    assert tc.probe_start_pts("in.mp4") == 0.0
+
+
+def test_probe_start_pts_failure_raises(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, returncode=1))
+    with pytest.raises(RuntimeError):
+        tc.probe_start_pts("in.mp4")
+
+
+def test_trim_and_crop_builds_argv(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls))
+    tc.trim_and_crop("in.mp4", 100.0, 110.0, "out.mp4", 452, 180, 360)
+    cmd = calls[0]
+    assert "crop=360:360:452:180" in cmd
+    assert "-copyts" in cmd
+    # trim_and_crop reads the original video (start_time 0) -> plain margin seek
+    assert cmd[cmd.index("-ss") + 1] == "95.000000"
+    assert cmd[cmd.index("-to") + 1] == "110.000000"
+    assert "libx264" in cmd  # re-encode: a filter is applied
+
+
+def test_trim_and_crop_seek_floors_at_zero(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls))
+    tc.trim_and_crop("in.mp4", 2.0, 8.0, "out.mp4", 0, 0, 360)
+    assert calls[0][calls[0].index("-ss") + 1] == "0.000000"
+
+
+def test_trim_and_crop_failure_raises(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, returncode=1))
+    with pytest.raises(RuntimeError):
+        tc.trim_and_crop("in.mp4", 100.0, 110.0, "out.mp4", 0, 0, 360)
+
+
+def test_subclip_copy_builds_argv(monkeypatch):
+    calls = []
+    # first call is probe_start_pts, second is the ffmpeg subclip
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="0.000000\n"))
+    tc.subclip_copy("in.mp4", 100.0, 110.0, "out.mp4")
+    cmd = calls[-1]
+    assert cmd[cmd.index("-c") + 1] == "copy"   # stream copy, no re-encode
+    assert "-copyts" in cmd
+    assert "libx264" not in cmd
+    assert not any(str(a).startswith("crop=") for a in cmd)
+    assert cmd[cmd.index("-ss") + 1] == "95.000000"
+    assert cmd[cmd.index("-to") + 1] == "110.000000"
+
+
+def test_subclip_copy_seek_is_file_relative(monkeypatch):
+    """Input -ss is relative to the container start_time, but -to under -copyts is
+    absolute. On a cropped file whose PTS start at 30 s, seeking to original-timeline
+    second 100 means -ss 65 (=100-30-5), while -to stays at 110."""
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="30.000000\n"))
+    tc.subclip_copy("cropped.mp4", 100.0, 110.0, "out.mp4")
+    cmd = calls[-1]
+    assert cmd[cmd.index("-ss") + 1] == "65.000000"
+    assert cmd[cmd.index("-to") + 1] == "110.000000"

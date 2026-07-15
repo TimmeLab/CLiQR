@@ -31,7 +31,10 @@ from video.trimcrop import (
     find_video_sensor,
     frame_session_times,
     probe_frame_session_times,
+    probe_start_pts,
     read_session_window,
+    subclip_copy,
+    trim_and_crop,
 )
 
 
@@ -139,31 +142,6 @@ def nearest_index(times, tau):
         return times.size - 1
     # searchsorted lands on the right neighbor; pick the closer of i-1, i
     return i if abs(times[i] - tau) < abs(times[i - 1] - tau) else i - 1
-
-
-def trim_and_crop(video_path, start_sec, end_sec, out_path,
-                  crop_w=640, crop_h=360, seek_margin=5.0):
-    """Trim the video to video-seconds [start_sec, end_sec] and center-crop to
-    crop_w x crop_h, writing a new file (the original is left untouched).
-
-    Uses a coarse fast seek to ``start_sec - seek_margin`` and ``-copyts`` so the
-    output frames keep their ORIGINAL presentation timestamps. ffmpeg's input
-    ``-ss`` does not land frame-accurately on this footage, so we deliberately
-    seek a little early and rely on the preserved PTS (read back with
-    ``probe_frame_session_times``) to time each frame — never on where the seek
-    landed. Returns out_path. Raises RuntimeError if ffmpeg fails."""
-    coarse = max(0.0, start_sec - seek_margin)
-    vf = f"crop={crop_w}:{crop_h}:(iw-{crop_w})/2:(ih-{crop_h})/2"
-    cmd = [
-        "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
-        "-to", f"{end_sec:.6f}", "-vf", vf, "-an",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", out_path,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg trim/crop failed:\n{r.stderr[-800:]}")
-    return out_path
 
 
 class TrimmedFrameSource:

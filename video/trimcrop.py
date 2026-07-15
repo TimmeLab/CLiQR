@@ -161,3 +161,73 @@ def clamp_origin(x, y, frame_w, frame_h, size):
     x = int(min(max(x, 0), frame_w - size))
     y = int(min(max(y, 0), frame_h - size))
     return x - (x % 2), y - (y % 2)
+
+
+def probe_start_pts(path):
+    """The input's first presentation timestamp, in seconds. Containers without a
+    start_time report "N/A"; treat those as 0."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=start_time",
+         "-of", "csv=p=0", path],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}:\n{r.stderr[-800:]}")
+    tok = r.stdout.strip()
+    try:
+        return float(tok)
+    except ValueError:
+        return 0.0
+
+
+def trim_and_crop(video_path, start_sec, end_sec, out_path,
+                  crop_x, crop_y, size, seek_margin=5.0):
+    """Trim ``video_path`` to video-seconds [start_sec, end_sec] and crop a
+    size x size square whose top-left corner is (crop_x, crop_y), writing a new
+    file (the original is left untouched). Re-encodes, because a filter applies.
+
+    Uses a coarse fast seek to ``start_sec - seek_margin`` and ``-copyts`` so the
+    output frames keep their ORIGINAL presentation timestamps. ffmpeg's input
+    ``-ss`` does not land frame-accurately on this footage, so we deliberately
+    seek a little early and rely on the preserved PTS (read back with
+    ``probe_frame_session_times``) to time each frame — never on where the seek
+    landed. This reads the original recording, whose PTS start at 0, so the seek
+    needs no start-PTS correction. Returns out_path. Raises RuntimeError if
+    ffmpeg fails."""
+    coarse = max(0.0, start_sec - seek_margin)
+    vf = f"crop={size}:{size}:{crop_x}:{crop_y}"
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
+        "-to", f"{end_sec:.6f}", "-vf", vf, "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg trim/crop failed:\n{r.stderr[-800:]}")
+    return out_path
+
+
+def subclip_copy(video_path, start_sec, end_sec, out_path, seek_margin=5.0):
+    """Cut video-seconds [start_sec, end_sec] out of ``video_path`` by stream copy
+    — no filter, no re-encode, near-instant. Used to seek cheaply into a long file
+    without decoding everything before the window.
+
+    ``start_sec``/``end_sec`` are ORIGINAL-timeline seconds. Input ``-ss`` is
+    relative to the container's start_time, while ``-to`` under ``-copyts`` is
+    absolute, so the seek subtracts the input's start PTS and the end does not.
+    That subtraction is a no-op on the original recording (start_time 0) and is
+    what makes the seek land on a cropped file (start_time = session start).
+
+    Stream copy cuts at the keyframe at or before the seek target, so the output
+    may carry frames earlier than ``start_sec``. That is harmless: consumers time
+    frames by PTS and skip past them. Returns out_path."""
+    start_pts = probe_start_pts(video_path)
+    coarse = max(0.0, start_sec - start_pts - seek_margin)
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
+        "-to", f"{end_sec:.6f}", "-an", "-c", "copy", out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg subclip failed:\n{r.stderr[-800:]}")
+    return out_path

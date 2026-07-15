@@ -136,15 +136,13 @@ def test_trim_and_crop_and_frame_source(tmp_path):
     start_sec = float(rec.pts_ns[sf] - rec.pts_ns[0]) / 1e9
     end_sec = float(rec.pts_ns[ef] - rec.pts_ns[0]) / 1e9 + 0.3
     out = str(tmp_path / "trim.mp4")
-    msv.trim_and_crop(VIDEO, start_sec, end_sec, out, crop_w=640, crop_h=360)
+    msv.trim_and_crop(VIDEO, start_sec, end_sec, out, 452, 180, 360)
     assert os.path.exists(out) and os.path.getsize(out) > 0
     r = imageio.get_reader(out, "ffmpeg")
     size = r.get_meta_data()["size"]
     r.close()
-    assert size == (640, 360)  # (width, height)
+    assert size == (360, 360)  # (width, height)
 
-    # frames self-report their session time via preserved PTS; the window
-    # [120, 123] must be covered (coarse seek starts a little earlier)
     frame_sess = msv.probe_frame_session_times(out, rec.video_base)
     assert frame_sess[0] <= 120.0 and frame_sess[-1] >= 123.0
     assert np.all(np.diff(frame_sess) >= 0)  # monotonic
@@ -152,12 +150,31 @@ def test_trim_and_crop_and_frame_source(tmp_path):
     src = msv.TrimmedFrameSource(out, frame_sess)
     try:
         f0 = src.get(120.0)
-        assert f0 is not None and f0.shape[:2] == (360, 640)  # (h, w)
-        # advancing forward returns a same-shaped frame
+        assert f0 is not None and f0.shape[:2] == (360, 360)  # (h, w)
         f1 = src.get(122.0)
         assert f1.shape == f0.shape
     finally:
         src.close()
+
+
+@needs_reference
+@needs_video
+def test_subclip_copy_lands_on_a_cropped_file(tmp_path):
+    """A cropped file's PTS start at the session start, not 0. Stream-copying a
+    window out of it must still cover that window."""
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    sf, ef = msv.compute_trim_frames(rec.pts_ns, rec.video_base, 120.0, 130.0)
+    start_sec = float(rec.pts_ns[sf] - rec.pts_ns[0]) / 1e9
+    end_sec = float(rec.pts_ns[ef] - rec.pts_ns[0]) / 1e9 + 0.3
+    cropped = str(tmp_path / "cropped.mp4")
+    msv.trim_and_crop(VIDEO, start_sec, end_sec, cropped, 452, 180, 360)
+    assert msv.probe_start_pts(cropped) > 1.0  # not a zero-based timeline
+
+    sub = str(tmp_path / "sub.mp4")
+    msv.subclip_copy(cropped, start_sec + 2.0, start_sec + 5.0, sub)
+    sess = msv.probe_frame_session_times(sub, rec.video_base)
+    assert sess.size > 0
+    assert sess[0] <= 122.0 and sess[-1] >= 124.0
 
 
 import subprocess
