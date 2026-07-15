@@ -255,3 +255,69 @@ def test_subclip_copy_seek_is_file_relative(monkeypatch):
     cmd = calls[-1]
     assert cmd[cmd.index("-ss") + 1] == "65.000000"
     assert cmd[cmd.index("-to") + 1] == "110.000000"
+
+
+import os
+
+
+def _anchor(video_filename="v.mp4"):
+    return tc.VideoAnchor(
+        sensor_number=1, video_filename=video_filename, video_frame_index=3,
+        start_time=110.0, stop_time=175.0, host_before=None, host_after=None,
+    )
+
+
+def test_cropped_path_for():
+    assert tc.cropped_path_for("/d/v.mp4") == "/d/v_cropped.mp4"
+
+
+def test_resolve_paths_plain(tmp_path):
+    (tmp_path / "v.mp4").write_bytes(b"")
+    video, pts = tc.resolve_paths(str(tmp_path / "r.h5"), _anchor())
+    assert video == str(tmp_path / "v.mp4")
+    assert pts == str(tmp_path / "v.txt")
+
+
+def test_resolve_paths_prefers_cropped_when_present(tmp_path):
+    (tmp_path / "v.mp4").write_bytes(b"")
+    (tmp_path / "v_cropped.mp4").write_bytes(b"")
+    video, pts = tc.resolve_paths(
+        str(tmp_path / "r.h5"), _anchor(), prefer_cropped=True)
+    assert video == str(tmp_path / "v_cropped.mp4")
+    # THE TRAP: the sidecar belongs to the ORIGINAL video and must not follow
+    # the cropped name. The cropped file has no sidecar and needs none.
+    assert pts == str(tmp_path / "v.txt")
+
+
+def test_resolve_paths_falls_back_when_no_cropped(tmp_path):
+    (tmp_path / "v.mp4").write_bytes(b"")
+    video, pts = tc.resolve_paths(
+        str(tmp_path / "r.h5"), _anchor(), prefer_cropped=True)
+    assert video == str(tmp_path / "v.mp4")
+    assert pts == str(tmp_path / "v.txt")
+
+
+def test_resolve_paths_ignores_cropped_when_not_preferred(tmp_path):
+    (tmp_path / "v.mp4").write_bytes(b"")
+    (tmp_path / "v_cropped.mp4").write_bytes(b"")
+    video, _ = tc.resolve_paths(
+        str(tmp_path / "r.h5"), _anchor(), prefer_cropped=False)
+    assert video == str(tmp_path / "v.mp4")
+
+
+def test_resolve_paths_explicit_overrides(tmp_path):
+    (tmp_path / "v.mp4").write_bytes(b"")
+    (tmp_path / "v_cropped.mp4").write_bytes(b"")
+    video, pts = tc.resolve_paths(
+        str(tmp_path / "r.h5"), _anchor(), video="/elsewhere/x.mp4",
+        prefer_cropped=True)
+    assert video == "/elsewhere/x.mp4"
+    # sidecar still derives from the h5's video_filename, not from --video
+    assert pts == str(tmp_path / "v.txt")
+
+
+def test_resolve_paths_explicit_pts_overrides(tmp_path):
+    (tmp_path / "v.mp4").write_bytes(b"")
+    _, pts = tc.resolve_paths(
+        str(tmp_path / "r.h5"), _anchor(), pts_txt="/elsewhere/x.txt")
+    assert pts == "/elsewhere/x.txt"

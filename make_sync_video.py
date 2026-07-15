@@ -28,11 +28,14 @@ from video.trimcrop import (
     bookmark_latency,
     compute_trim_frames,
     compute_video_base,
+    cropped_path_for,
     find_video_sensor,
     frame_session_times,
     probe_frame_session_times,
     probe_start_pts,
     read_session_window,
+    read_video_anchor,
+    resolve_paths,
     subclip_copy,
     trim_and_crop,
 )
@@ -262,18 +265,6 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     finally:
         plt.close(fig)
         src.close()
-
-
-def resolve_paths(h5_path, video, pts_txt):
-    if video is None:
-        with h5py.File(h5_path, "r") as raw:
-            board_id, sensor_name, _ = find_video_sensor(raw)
-            fname = raw[board_id][sensor_name]["video_filename"][()]
-        fname = fname.decode() if isinstance(fname, bytes) else str(fname)
-        video = os.path.join(os.path.dirname(h5_path), fname)
-    if pts_txt is None:
-        pts_txt = os.path.splitext(video)[0] + ".txt"
-    return video, pts_txt
 
 
 def validate_window(start, end, session_duration):

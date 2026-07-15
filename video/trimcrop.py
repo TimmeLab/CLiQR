@@ -4,8 +4,10 @@ Anchor math, PTS/session-time conversion, and the ffmpeg wrappers used by both
 crop_video.py (one-time interactive trim+crop) and make_sync_video.py (per-clip
 stream-copy subclip). See docs/superpowers/specs/2026-07-15-video-crop-tool-design.md.
 """
+import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 
 import h5py
@@ -231,3 +233,36 @@ def subclip_copy(video_path, start_sec, end_sec, out_path, seek_margin=5.0):
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg subclip failed:\n{r.stderr[-800:]}")
     return out_path
+
+
+def cropped_path_for(video_path):
+    """The conventional cropped sibling of a recording: <base>_cropped.mp4."""
+    return os.path.splitext(video_path)[0] + "_cropped.mp4"
+
+
+def resolve_paths(h5_path, anchor, video=None, pts_txt=None, prefer_cropped=False):
+    """Resolve (video_path, pts_txt_path) for a recording.
+
+    The PTS sidecar is ALWAYS <original-video-base>.txt, derived from the h5's
+    video_filename — never from the resolved video path. A cropped file has no
+    sidecar of its own and needs none: it carries the original PTS via -copyts,
+    and probe_frame_session_times reads them back from the file itself.
+
+    ``prefer_cropped`` picks <base>_cropped.mp4 when it exists, printing a note to
+    stderr when it doesn't, so a forgotten crop degrades to a correct (just
+    uncropped) render instead of an error.
+    """
+    base = os.path.join(os.path.dirname(h5_path), anchor.video_filename)
+    if pts_txt is None:
+        pts_txt = os.path.splitext(base)[0] + ".txt"
+    if video is None:
+        video = base
+        if prefer_cropped:
+            cropped = cropped_path_for(base)
+            if os.path.exists(cropped):
+                video = cropped
+            else:
+                print(f"note: using uncropped video {base} "
+                      f"(no _cropped.mp4; run crop_video.py first)",
+                      file=sys.stderr)
+    return video, pts_txt

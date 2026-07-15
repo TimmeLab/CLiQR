@@ -275,7 +275,8 @@ def test_build_arg_parser_parses_required():
 
 @needs_reference
 def test_resolve_paths_defaults_from_h5():
-    video, pts = msv.resolve_paths(H5, None, None)
+    anchor = msv.read_video_anchor(H5)
+    video, pts = msv.resolve_paths(H5, anchor)
     assert video.endswith("raw_data_2026-07-13_11-59-47.mp4")
     assert pts.endswith("raw_data_2026-07-13_11-59-47.txt")
     assert os.path.dirname(video) == os.path.dirname(H5)
