@@ -10,6 +10,19 @@ def test_compute_video_base():
     assert msv.compute_video_base(pts_ns, 2) == pytest.approx(0.25)
 
 
+def test_bookmark_latency_from_bracket():
+    # frame's true host time ~ midpoint of the round-trip bracket; its offset
+    # from start_time is the latency the video would otherwise lead the trace by.
+    assert msv.bookmark_latency(1000.0, 1000.2, 998.0) == pytest.approx(2.1)
+    # symmetric bracket around start -> ~0
+    assert msv.bookmark_latency(999.9, 1000.1, 1000.0) == pytest.approx(0.0)
+
+
+def test_bookmark_latency_missing_is_zero():
+    assert msv.bookmark_latency(None, None, 1000.0) == 0.0
+    assert msv.bookmark_latency(1000.0, None, 998.0) == 0.0
+
+
 def test_video_sec_at_bookmark_anchor():
     # tau=0 (start_time bookmark) -> video_base, no spurious offset
     got = msv.video_sec(0.0, video_base=32.0)
@@ -54,6 +67,24 @@ def test_nearest_index_interior_and_clamp():
     assert msv.nearest_index(times, 99.0) == 3
 
 
+def test_frame_session_times_and_trim_frames():
+    # frames every 0.1 s; bookmark frame 2 -> session zero
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)  # 0.0 .. 1.0 s
+    vb = msv.compute_video_base(pts_ns, 2)  # 0.2 s
+    sess = msv.frame_session_times(pts_ns, vb)
+    assert sess[2] == pytest.approx(0.0)
+    assert sess[0] == pytest.approx(-0.2)
+    # session 0 at frame 2, session 0.5 at frame 7
+    sf, ef = msv.compute_trim_frames(pts_ns, vb, 0.0, 0.5)
+    assert sf == 2 and ef == 7
+
+
+def test_compute_trim_frames_empty_window_raises():
+    pts_ns = (np.arange(0, 5) * 100_000_000).astype(np.int64)
+    with pytest.raises(ValueError):
+        msv.compute_trim_frames(pts_ns, 0.0, 100.0, 200.0)
+
+
 import os
 
 REC_DIR = "Lickometry Data/ACG-26-3"
@@ -85,6 +116,10 @@ def test_load_recording_reference():
     # sync fields populated; video_base ~ 32 s for this recording
     assert rec.video_base == pytest.approx(31.97, abs=0.1)
     assert rec.session_duration > 3600
+    # PTS sidecar retained for trim/crop + per-frame timing
+    assert rec.pts_ns.size > 1000
+    # this recording predates bookmark-latency recording -> no correction
+    assert rec.bookmark_latency == 0.0
 
 
 needs_video = pytest.mark.skipif(
@@ -92,20 +127,37 @@ needs_video = pytest.mark.skipif(
 )
 
 
+@needs_reference
 @needs_video
-def test_frame_grabber_reads_rgb_and_advances():
-    start = 60.0
-    g = msv.FrameGrabber(VIDEO, clip_start_sec=start)
+def test_trim_and_crop_and_frame_source(tmp_path):
+    import imageio
+    rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO)
+    sf, ef = msv.compute_trim_frames(rec.pts_ns, rec.video_base, 120.0, 123.0)
+    start_sec = float(rec.pts_ns[sf] - rec.pts_ns[0]) / 1e9
+    end_sec = float(rec.pts_ns[ef] - rec.pts_ns[0]) / 1e9 + 0.3
+    out = str(tmp_path / "trim.mp4")
+    msv.trim_and_crop(VIDEO, start_sec, end_sec, out, crop_w=640, crop_h=360)
+    assert os.path.exists(out) and os.path.getsize(out) > 0
+    r = imageio.get_reader(out, "ffmpeg")
+    size = r.get_meta_data()["size"]
+    r.close()
+    assert size == (640, 360)  # (width, height)
+
+    # frames self-report their session time via preserved PTS; the window
+    # [120, 123] must be covered (coarse seek starts a little earlier)
+    frame_sess = msv.probe_frame_session_times(out, rec.video_base)
+    assert frame_sess[0] <= 120.0 and frame_sess[-1] >= 123.0
+    assert np.all(np.diff(frame_sess) >= 0)  # monotonic
+
+    src = msv.TrimmedFrameSource(out, frame_sess)
     try:
-        assert g.src_fps > 1
-        f0 = g.get(start)
-        assert f0 is not None
-        assert f0.ndim == 3 and f0.shape[2] == 3
-        # advancing ~1s forward returns a frame of the same shape
-        f1 = g.get(start + 1.0)
+        f0 = src.get(120.0)
+        assert f0 is not None and f0.shape[:2] == (360, 640)  # (h, w)
+        # advancing forward returns a same-shaped frame
+        f1 = src.get(122.0)
         assert f1.shape == f0.shape
     finally:
-        g.close()
+        src.close()
 
 
 import subprocess
@@ -163,6 +215,7 @@ def test_build_arg_parser_parses_required():
     ])
     assert args.h5 == "r.h5" and args.start == 5.0 and args.end == 9.0
     assert args.fps == 30.0 and args.window == 2.5 and args.sync_offset == 0.0
+    assert args.crop_w == 640 and args.crop_h == 360 and args.intermediate is None
 
 
 @needs_reference

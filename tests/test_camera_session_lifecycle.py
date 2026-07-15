@@ -111,7 +111,10 @@ def test_bookmark_index_and_pts_describe_same_frame(tmp_path):
 
     mark = backend.bookmark(sensor_id=5)
 
-    # 3 frames logged -> index 3, pts is the last logged frame's timestamp.
-    assert mark["frame_index"] == 3
+    # 3 frames logged (0-based indices 0,1,2). _on_frame writes the frame's ts
+    # then increments, so the just-logged frame's 0-based sidecar index is
+    # _frame_count - 1 = 2, and its ts is the reported pts. frame_index must
+    # point at THAT frame, not the not-yet-written next one.
+    assert mark["frame_index"] == 2
     assert mark["pts"] == 3_000_000 / 1e9
     backend.stop_session()

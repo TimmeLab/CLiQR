@@ -248,11 +248,21 @@ class SensorRecorder:
         return str(np.array(list(SERIAL_NUMBER_SENSOR_MAP.keys()))[sn_idx].item())
 
     def write_video_metadata(self, sensor_id: int, frame_index=None, pts=None,
-                             video_filename=None, cycle=0):
+                             video_filename=None, cycle=0,
+                             pi_monotonic=None, host_time_before=None,
+                             host_time_after=None):
         """Write video bookmark metadata for a sensor's recording cycle.
 
         Datasets mirror the start_time cycle-suffix convention:
         cycle 0 -> "video_frame_index", cycle 1 -> "video_frame_index1", etc.
+
+        ``pi_monotonic`` (Pi clock at bookmark) and ``host_time_before`` /
+        ``host_time_after`` (host wall-clock bracketing the bookmark round-trip)
+        record the bookmark latency so the video<->trace anchor can be corrected
+        post-hoc without a manual offset: the bookmarked frame's true host time
+        is ~midpoint(before, after), and its offset from ``start_time`` is the
+        latency the video panel would otherwise lead the trace by. Any of these
+        left None (older callers) is simply not written.
         """
         sn = self._serial_for_sensor(sensor_id)
         suffix = "" if cycle == 0 else str(cycle)
@@ -267,6 +277,9 @@ class SensorRecorder:
                 (f"video_frame_index{suffix}", frame_index),
                 (f"video_pts{suffix}", pts),
                 (f"video_filename{suffix}", video_filename),
+                (f"video_pi_monotonic{suffix}", pi_monotonic),
+                (f"video_bookmark_host_before{suffix}", host_time_before),
+                (f"video_bookmark_host_after{suffix}", host_time_after),
             ):
                 if value is None:
                     continue

@@ -8,6 +8,7 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ class Recording:
     video_base: float
     video_path: str
     session_duration: float
+    pts_ns: np.ndarray
+    bookmark_latency: float
 
 
 def find_video_sensor(raw_h5):
@@ -94,7 +97,12 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path):
         group = raw[board_id][sensor_name]
         start_time, stop_time = _resolve_start_stop(group)
         video_frame_index = int(group["video_frame_index"][()])
+        host_before = (float(group["video_bookmark_host_before"][()])
+                       if "video_bookmark_host_before" in group else None)
+        host_after = (float(group["video_bookmark_host_after"][()])
+                      if "video_bookmark_host_after" in group else None)
     session_duration = stop_time - start_time
+    latency = bookmark_latency(host_before, host_after, start_time)
 
     animal = str(layout.loc[sensor_number].iloc[0])
 
@@ -129,7 +137,8 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path):
         lick_times=np.asarray(lick_times), lick_indices=lick_indices,
         lick_vals=lick_vals,
         video_base=video_base, video_path=video_path,
-        session_duration=session_duration,
+        session_duration=session_duration, pts_ns=pts_ns,
+        bookmark_latency=latency,
     )
 
 
@@ -142,6 +151,16 @@ def compute_video_base(pts_ns, frame_index):
 def video_sec(tau, video_base, sync_offset=0.0):
     """Video-file second for session-relative time ``tau`` (0 = start_time bookmark)."""
     return video_base + tau + sync_offset
+
+
+def bookmark_latency(host_before, host_after, start_time):
+    """Seconds the bookmark round-trip lagged ``start_time``: the bookmarked frame
+    was captured mid-round-trip (~midpoint of the host bracket), so the video
+    leads the trace by this much and every frame's session time must be shifted
+    later by it. Returns 0.0 when the bracket wasn't recorded (older recordings)."""
+    if host_before is None or host_after is None:
+        return 0.0
+    return (float(host_before) + float(host_after)) / 2.0 - float(start_time)
 
 
 def n_output_frames(start, end, fps):
@@ -170,28 +189,83 @@ def nearest_index(times, tau):
     return i if abs(times[i] - tau) < abs(times[i - 1] - tau) else i - 1
 
 
-class FrameGrabber:
-    """Sequential RGB frame reader; fast-seeks to the clip start, then serves
-    the frame nearest each requested (monotonically increasing) video second."""
+def frame_session_times(pts_ns, video_base):
+    """Session-relative time (0 = start_time bookmark) of every video frame."""
+    pts_ns = np.asarray(pts_ns)
+    return (pts_ns - pts_ns[0]) / 1e9 - video_base
 
-    def __init__(self, video_path, clip_start_sec):
-        self.clip_start = max(0.0, clip_start_sec)
-        self._reader = imageio.get_reader(
-            video_path, "ffmpeg",
-            input_params=["-ss", f"{self.clip_start:.6f}"],
-        )
-        self.src_fps = float(self._reader.get_meta_data()["fps"])
-        self._k = -1
+
+def compute_trim_frames(pts_ns, video_base, start, end):
+    """Inclusive (start_frame, stop_frame) of the video frames whose session
+    time falls in [start, end]. Raises ValueError if the window has no frames."""
+    sess = frame_session_times(pts_ns, video_base)
+    idx = np.flatnonzero((sess >= start) & (sess <= end))
+    if idx.size == 0:
+        raise ValueError(
+            f"no video frames fall in the requested window [{start}, {end}] s")
+    return int(idx[0]), int(idx[-1])
+
+
+def trim_and_crop(video_path, start_sec, end_sec, out_path,
+                  crop_w=640, crop_h=360, seek_margin=5.0):
+    """Trim the video to video-seconds [start_sec, end_sec] and center-crop to
+    crop_w x crop_h, writing a new file (the original is left untouched).
+
+    Uses a coarse fast seek to ``start_sec - seek_margin`` and ``-copyts`` so the
+    output frames keep their ORIGINAL presentation timestamps. ffmpeg's input
+    ``-ss`` does not land frame-accurately on this footage, so we deliberately
+    seek a little early and rely on the preserved PTS (read back with
+    ``probe_frame_session_times``) to time each frame — never on where the seek
+    landed. Returns out_path. Raises RuntimeError if ffmpeg fails."""
+    coarse = max(0.0, start_sec - seek_margin)
+    vf = f"crop={crop_w}:{crop_h}:(iw-{crop_w})/2:(ih-{crop_h})/2"
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
+        "-to", f"{end_sec:.6f}", "-vf", vf, "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg trim/crop failed:\n{r.stderr[-800:]}")
+    return out_path
+
+
+def probe_frame_session_times(path, video_base):
+    """Session-relative time of every frame in ``path``, read from the file's
+    real presentation timestamps via ffprobe. Because the trimmed clip keeps its
+    original PTS (``-copyts``), each frame self-reports its true video-second, so
+    ``pts - video_base`` is its session time (0 = start_time bookmark)."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}:\n{r.stderr[-800:]}")
+    pts = np.array([float(tok.strip().rstrip(","))
+                    for tok in r.stdout.split() if tok.strip().rstrip(",")])
+    if pts.size == 0:
+        raise RuntimeError(f"ffprobe found no frames in {path}")
+    return pts - video_base
+
+
+class TrimmedFrameSource:
+    """Sequential RGB frame reader over a trimmed clip. Each source frame carries
+    its true session time (from the PTS sidecar); ``get(target)`` returns the
+    frame nearest ``target`` session-seconds. Targets must be non-decreasing."""
+
+    def __init__(self, path, frame_sess):
+        self._reader = imageio.get_reader(path, "ffmpeg")
+        self._sess = np.asarray(frame_sess, dtype=float)
+        self._j = -1
         self._frame = None
 
-    def get(self, video_sec):
-        target_k = int(round((video_sec - self.clip_start) * self.src_fps))
-        if target_k < 0:
-            target_k = 0
-        while self._k < target_k:
+    def get(self, target_session):
+        target_k = nearest_index(self._sess, target_session)
+        while self._j < target_k:
             try:
                 self._frame = self._reader.get_next_data()
-                self._k += 1
+                self._j += 1
             except (IndexError, StopIteration):
                 break
         return self._frame
@@ -200,13 +274,41 @@ class FrameGrabber:
         self._reader.close()
 
 
-def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0):
+def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0,
+                crop_w=640, crop_h=360, intermediate_path=None):
+    """Render the side-by-side clip. First trims+crops the mouse video to the
+    window (intermediate file, kept), then composites from it: the left panel is
+    the trimmed frame, the right panel the sliding capacitance trace with a
+    centered dot and lick markers. Each video frame is placed by its true session
+    time (from the PTS sidecar) — no seeking into the full recording, no fps
+    assumption — so video and trace stay aligned.
+
+    ``sync_offset`` is a residual manual nudge in seconds: increase it if the
+    video still runs ahead of the trace.
+    """
     taus = frame_times(start, end, fps)
     if taus.size == 0:
         raise ValueError("empty clip: check --start/--end/--fps")
 
-    clip_start_video_sec = video_sec(start, rec.video_base, sync_offset)
-    grabber = FrameGrabber(rec.video_path, clip_start_video_sec)
+    pts = rec.pts_ns
+    # Correct the bookmark-latency anchor error: the recorded bookmark frame was
+    # captured rec.bookmark_latency seconds AFTER start_time, so raw frame
+    # session times run that much early (video leads the trace). Shifting frame
+    # labels later by the latency == subtracting it from the anchor base.
+    video_base_eff = rec.video_base - rec.bookmark_latency
+    start_frame, stop_frame = compute_trim_frames(pts, video_base_eff, start, end)
+    start_sec = float(pts[start_frame] - pts[0]) / 1e9
+    end_sec = float(pts[stop_frame] - pts[0]) / 1e9 + 0.3
+
+    if intermediate_path is None:
+        intermediate_path = os.path.splitext(out_path)[0] + "_trimcrop.mp4"
+    trim_and_crop(rec.video_path, start_sec, end_sec, intermediate_path,
+                  crop_w, crop_h)
+
+    # Time each trimmed frame by its real (preserved) PTS, not by seek position.
+    frame_sess = probe_frame_session_times(intermediate_path, video_base_eff)
+
+    src = TrimmedFrameSource(intermediate_path, frame_sess)
 
     cap_min, cap_max = float(rec.cap.min()), float(rec.cap.max())
     pad = 0.05 * (cap_max - cap_min + 1.0)
@@ -214,7 +316,7 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     fig, (axv, axt) = plt.subplots(1, 2, figsize=(12, 4.5))
     fig.subplots_adjust(left=0.02, right=0.97, wspace=0.08)
 
-    first_frame = grabber.get(clip_start_video_sec)
+    first_frame = src.get(start - sync_offset)
     im = axv.imshow(first_frame if first_frame is not None
                     else np.zeros((2, 2, 3), dtype=np.uint8))
     axv.axis("off")
@@ -231,7 +333,7 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     def update(i):
         nonlocal im_sized
         tau = float(taus[i])
-        frame = grabber.get(video_sec(tau, rec.video_base, sync_offset))
+        frame = src.get(tau - sync_offset)
         if frame is not None:
             im.set_data(frame)
             if not im_sized:
@@ -257,7 +359,7 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
         anim.save(out_path, writer=FFMpegWriter(fps=fps))
     finally:
         plt.close(fig)
-        grabber.close()
+        src.close()
 
 
 def resolve_paths(h5_path, video, pts_txt):
@@ -300,7 +402,15 @@ def build_arg_parser():
     p.add_argument("--window", type=float, default=2.5,
                    help="trace half-window seconds (default 2.5)")
     p.add_argument("--sync-offset", dest="sync_offset", type=float, default=0.0,
-                   help="manual video/cap alignment nudge, seconds (default 0)")
+                   help="manual nudge, seconds; increase if video runs ahead of "
+                        "the trace (default 0)")
+    p.add_argument("--crop-w", dest="crop_w", type=int, default=640,
+                   help="center-crop width of the video panel (default 640)")
+    p.add_argument("--crop-h", dest="crop_h", type=int, default=360,
+                   help="center-crop height of the video panel (default 360)")
+    p.add_argument("--intermediate", default=None,
+                   help="path for the trimmed+cropped video (kept); "
+                        "default: <out>_trimcrop.mp4")
     return p
 
 
@@ -314,12 +424,17 @@ def main(argv=None):
         video, pts_txt = resolve_paths(args.h5, args.video, args.pts_txt)
         validate_window(args.start, args.end, read_session_duration(args.h5))
         rec = load_recording(args.h5, args.layout, pts_txt, video)
+        intermediate = args.intermediate or (os.path.splitext(args.out)[0] + "_trimcrop.mp4")
         print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
-              f"[{args.start:.1f}, {args.end:.1f}] s -> {args.out}")
+              f"[{args.start:.1f}, {args.end:.1f}] s")
+        print(f"  trimmed+cropped video -> {intermediate}")
+        print(f"  composite -> {args.out}")
         render_clip(rec, args.start, args.end, args.out,
-                    fps=args.fps, window=args.window, sync_offset=args.sync_offset)
+                    fps=args.fps, window=args.window, sync_offset=args.sync_offset,
+                    crop_w=args.crop_w, crop_h=args.crop_h,
+                    intermediate_path=intermediate)
         print("done")
-    except (ValueError, FileNotFoundError, KeyError, OSError) as e:
+    except (ValueError, FileNotFoundError, KeyError, OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0
