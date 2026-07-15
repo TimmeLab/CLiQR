@@ -79,6 +79,33 @@ still uses `detect_sipper_step` / `establish_alignment`.
 Call it from `DataAnalysis.ipynb` after lick detection, passing the absolute
 lick times for the camera sensor.
 
+## Cropping and rendering a sync video
+
+Two steps. Crop once per recording, then render as many clips as you like.
+
+1. **Crop** — trims the video to the capacitance-recording window and crops it
+   to a square you position by hand:
+
+       python crop_video.py --h5 "Lickometry Data/<animal>/raw_data_<stamp>.h5"
+
+   A window opens on a frame from the middle of the recording. Drag the green
+   box over the sipper and press **Crop**. Writes `raw_data_<stamp>_cropped.mp4`
+   next to the recording. `--size` changes the box (default 360x360); `--force`
+   overwrites an existing crop.
+
+2. **Render** — builds the side-by-side video + trace clip:
+
+       python make_sync_video.py --h5 "Lickometry Data/<animal>/raw_data_<stamp>.h5" \
+         --layout "Lickometry Data/<animal>/layout.csv" \
+         --start 120 --end 130 --out clip.mp4
+
+   It picks up `_cropped.mp4` automatically. If you skip step 1 it falls back to
+   the uncropped recording, prints a note, and renders a full-frame video panel.
+
+The cropped file keeps the original video's presentation timestamps, so the
+sync anchor is identical either way — cropping changes framing only, never
+alignment.
+
 ## Known limitations / pending work
 
 - **Frame-offset `.txt` format and `video_pts` base:** The current backend writes absolute `SensorTimestamp` nanoseconds (no header) and reports absolute `video_pts` seconds. These must be changed to relative values (relative nanoseconds and relative seconds, respectively) to establish consistency with `false_positive_analysis.load_frame_offsets()` and `alignment_from_bookmark()`. This change is deferred pending on-device testing and validation on the Pi.
