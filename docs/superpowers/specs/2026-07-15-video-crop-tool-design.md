@@ -80,12 +80,27 @@ Changed signature:
 
 New:
 
+- `probe_start_pts(path)` — new: the input's first presentation timestamp, via
+  `ffprobe -show_entries format=start_time`.
 - `subclip_copy(video_path, start_sec, end_sec, out_path, seek_margin=5.0)` —
   `ffmpeg -ss <coarse> -copyts -i <in> -to <end> -an -c copy <out>`. No filter,
   no re-encode, near-instant. Stream copy cuts at the keyframe at or before
   the seek target, so the clip may carry leading frames earlier than
   `start_sec`; that is harmless because consumers time frames by PTS and skip
   past them.
+
+  **Input `-ss` is file-relative; `-to` with `-copyts` is absolute.** Verified
+  experimentally on the reference recording: a cropped file whose PTS start at
+  30 s yields zero frames for `-ss 35`, and seeks correctly for `-ss 5`, while
+  `-to 40` cuts at absolute 40 s either way. So the seek must be
+
+      coarse = max(0.0, start_sec - probe_start_pts(video_path) - seek_margin)
+
+  `start_sec` is always an original-video-timeline second. The original video's
+  `start_time` is 0.0, so this reduces to today's behavior there; the cropped
+  file's `start_time` is the session start (~32 s), where the subtraction is
+  what makes the seek land. `trim_and_crop` reads the original video only and
+  keeps the plain `start_sec - seek_margin` seek.
 - `clamp_origin(x, y, frame_w, frame_h, size)` — clamps a proposed crop origin
   so the box stays inside the frame, and rounds each coordinate down to an even
   number (yuv420p chroma subsampling requires even offsets). Raises `ValueError`
