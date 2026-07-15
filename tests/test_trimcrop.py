@@ -321,3 +321,30 @@ def test_resolve_paths_explicit_pts_overrides(tmp_path):
     _, pts = tc.resolve_paths(
         str(tmp_path / "r.h5"), _anchor(), pts_txt="/elsewhere/x.txt")
     assert pts == "/elsewhere/x.txt"
+
+
+def test_trim_window_seconds():
+    # frames every 0.1 s; bookmark frame 2 -> session zero at 0.2 s
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
+    vb = tc.compute_video_base(pts_ns, 2)  # 0.2
+    sf, ef, start_sec, end_sec = tc.trim_window_seconds(pts_ns, vb, 0.0, 0.3)
+    assert (sf, ef) == (2, 5)
+    assert start_sec == pytest.approx(0.2)          # original-timeline seconds
+    assert end_sec == pytest.approx(0.5 + tc.TAIL_MARGIN)
+
+
+def test_trim_window_seconds_honors_the_anchor():
+    """A smaller video_base_eff labels every frame later, so the same session
+    window resolves to earlier frames and earlier video seconds."""
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
+    vb = tc.compute_video_base(pts_ns, 2)
+    plain = tc.trim_window_seconds(pts_ns, vb, 0.0, 0.3)
+    shifted = tc.trim_window_seconds(pts_ns, vb - 0.25, 0.0, 0.3)
+    assert shifted[0] < plain[0]
+    assert shifted[2] < plain[2]
+
+
+def test_trim_window_seconds_empty_raises():
+    pts_ns = (np.arange(0, 3) * 100_000_000).astype(np.int64)
+    with pytest.raises(ValueError):
+        tc.trim_window_seconds(pts_ns, 0.0, 0.0, -400.0)

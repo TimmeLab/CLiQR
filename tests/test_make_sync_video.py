@@ -283,3 +283,55 @@ def test_resolve_paths_defaults_from_h5():
     assert video.endswith("raw_data_2026-07-13_11-59-47.mp4")
     assert pts.endswith("raw_data_2026-07-13_11-59-47.txt")
     assert os.path.dirname(video) == os.path.dirname(H5)
+
+
+def _synthetic_rec(pts_ns, video_base, latency):
+    """A Recording carrying only what clip_trim_window reads."""
+    return msv.Recording(
+        animal="X", sensor=1, cap=np.zeros(3), time=np.zeros(3),
+        lick_times=np.array([]), lick_indices=np.array([], dtype=int),
+        lick_vals=np.array([]), video_base=video_base, video_path="v.mp4",
+        session_duration=10.0, pts_ns=pts_ns, bookmark_latency=latency,
+    )
+
+
+def test_clip_trim_window_applies_bookmark_latency():
+    """FAILS if render_clip's anchor drops the bookmark-latency correction.
+
+    The reference recording's latency is 0.0, so no reference-backed test can
+    catch that regression — this synthetic one is the guard. The bracket gives a
+    latency of exactly 0.25: values like 0.2 are not exactly representable and
+    would put the assertion on a floating-point knife-edge.
+    """
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
+    vb = msv.compute_video_base(pts_ns, 2)  # 0.2
+    plain = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.0), 0.0, 0.3)
+    assert plain[0] == 2 and plain[2] == pytest.approx(0.2)
+    shifted = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.25), 0.0, 0.3)
+    assert shifted[0] == 0
+    assert shifted[0] < plain[0]           # earlier start frame
+    assert shifted[2] < plain[2]           # earlier start second
+
+
+def test_clip_trim_window_matches_crop_window():
+    """The renderer and the crop tool MUST resolve the same session window to the
+    same video seconds. If they diverge, crop_video trims to one window while
+    render_clip places frames using another, and every cropped video silently
+    misaligns against its trace. Uses a NONZERO latency, which the reference
+    recording cannot exercise.
+    """
+    import crop_video as cv
+    from video.trimcrop import VideoAnchor
+
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
+    anchor = VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=2,
+        start_time=110.0, stop_time=110.3,
+        host_before=110.0, host_after=110.5,   # latency exactly 0.25
+    )
+    assert anchor.latency == pytest.approx(0.25)
+    vb = msv.compute_video_base(pts_ns, anchor.video_frame_index)
+    rec = _synthetic_rec(pts_ns, vb, anchor.latency)
+
+    assert (msv.clip_trim_window(rec, 0.0, anchor.session_duration)
+            == cv.compute_crop_window(anchor, pts_ns))

@@ -18,29 +18,25 @@ from matplotlib.patches import Rectangle
 from matplotlib.widgets import Button
 
 from video.trimcrop import (
+    TAIL_MARGIN,
     clamp_origin,
-    compute_trim_frames,
     compute_video_base,
     cropped_path_for,
     read_video_anchor,
     resolve_paths,
     trim_and_crop,
+    trim_window_seconds,
 )
-
-TAIL_MARGIN = 0.3  # seconds of slack past the last in-window frame
 
 
 def compute_crop_window(anchor, pts_ns):
     """Return (start_frame, stop_frame, start_sec, end_sec) covering the whole
     session. Frames are the indices into the original video; the seconds are on
     the original video's timeline. Uses the latency-corrected anchor, matching
-    make_sync_video's render_clip."""
+    make_sync_video's clip_trim_window."""
     pts_ns = np.asarray(pts_ns)
     video_base_eff = compute_video_base(pts_ns, anchor.video_frame_index) - anchor.latency
-    sf, ef = compute_trim_frames(pts_ns, video_base_eff, 0.0, anchor.session_duration)
-    start_sec = float(pts_ns[sf] - pts_ns[0]) / 1e9
-    end_sec = float(pts_ns[ef] - pts_ns[0]) / 1e9 + TAIL_MARGIN
-    return sf, ef, start_sec, end_sec
+    return trim_window_seconds(pts_ns, video_base_eff, 0.0, anchor.session_duration)
 
 
 def reject_cropped_input(video):

@@ -93,6 +93,28 @@ def compute_trim_frames(pts_ns, video_base, start, end):
     return int(idx[0]), int(idx[-1])
 
 
+TAIL_MARGIN = 0.3  # seconds of slack past the last in-window frame
+
+
+def trim_window_seconds(pts_ns, video_base_eff, start, end, tail_margin=TAIL_MARGIN):
+    """Resolve session window [start, end] to (start_frame, stop_frame, start_sec,
+    end_sec). The seconds are on the ORIGINAL video's timeline, which is what
+    trim_and_crop and subclip_copy expect.
+
+    ``video_base_eff`` must be the LATENCY-CORRECTED anchor
+    (compute_video_base(...) - bookmark_latency(...)). Both crop_video and
+    make_sync_video route through this function so their windows cannot drift
+    apart: if they did, the crop tool would trim to one window while the renderer
+    placed frames using another, and every cropped video would silently misalign
+    against its trace.
+    """
+    pts_ns = np.asarray(pts_ns)
+    sf, ef = compute_trim_frames(pts_ns, video_base_eff, start, end)
+    start_sec = float(pts_ns[sf] - pts_ns[0]) / 1e9
+    end_sec = float(pts_ns[ef] - pts_ns[0]) / 1e9 + tail_margin
+    return sf, ef, start_sec, end_sec
+
+
 def probe_frame_session_times(path, video_base):
     """Session-relative time of every frame in ``path``, read from the file's
     real presentation timestamps via ffprobe. Because trimmed clips keep their

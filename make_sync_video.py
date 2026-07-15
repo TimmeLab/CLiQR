@@ -37,6 +37,7 @@ from video.trimcrop import (
     resolve_paths,
     subclip_copy,
     trim_and_crop,
+    trim_window_seconds,
 )
 
 
@@ -169,6 +170,21 @@ class TrimmedFrameSource:
         self._reader.close()
 
 
+def clip_trim_window(rec, start, end):
+    """Video-file window (start_frame, stop_frame, start_sec, end_sec) for the
+    clip's session window [start, end].
+
+    Correct the bookmark-latency anchor error: the recorded bookmark frame was
+    captured rec.bookmark_latency seconds AFTER start_time, so raw frame session
+    times run that much early (video leads the trace). Shifting frame labels later
+    by the latency == subtracting it from the anchor base. Shares
+    trim_window_seconds with crop_video's compute_crop_window so the two cannot
+    drift apart.
+    """
+    return trim_window_seconds(rec.pts_ns, rec.video_base - rec.bookmark_latency,
+                               start, end)
+
+
 def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0,
                 intermediate_path=None):
     """Render the side-by-side clip. First stream-copies the mouse video down to
@@ -190,15 +206,8 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     if taus.size == 0:
         raise ValueError("empty clip: check --start/--end/--fps")
 
-    pts = rec.pts_ns
-    # Correct the bookmark-latency anchor error: the recorded bookmark frame was
-    # captured rec.bookmark_latency seconds AFTER start_time, so raw frame
-    # session times run that much early (video leads the trace). Shifting frame
-    # labels later by the latency == subtracting it from the anchor base.
     video_base_eff = rec.video_base - rec.bookmark_latency
-    start_frame, stop_frame = compute_trim_frames(pts, video_base_eff, start, end)
-    start_sec = float(pts[start_frame] - pts[0]) / 1e9
-    end_sec = float(pts[stop_frame] - pts[0]) / 1e9 + 0.3
+    _, _, start_sec, end_sec = clip_trim_window(rec, start, end)
 
     if intermediate_path is None:
         intermediate_path = os.path.splitext(out_path)[0] + "_trimcrop.mp4"
