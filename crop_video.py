@@ -11,9 +11,14 @@ import os
 import shutil
 import sys
 
+import imageio
+import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Rectangle
+from matplotlib.widgets import Button
 
 from video.trimcrop import (
+    clamp_origin,
     compute_trim_frames,
     compute_video_base,
     cropped_path_for,
@@ -52,6 +57,80 @@ def resolve_out_path(video, out, force):
     return out
 
 
+def load_preview_frame(video, frame_index):
+    """The frame at ``frame_index`` of the original video, as an RGB array."""
+    reader = imageio.get_reader(video, "ffmpeg")
+    try:
+        return reader.get_data(frame_index)
+    finally:
+        reader.close()
+
+
+class CropSelector:
+    """Drag a fixed-size square over a still frame. run() returns the chosen
+    (x, y) origin, or None if the window was closed without pressing Crop."""
+
+    def __init__(self, frame, size):
+        self.frame = frame
+        self.size = size
+        self.h, self.w = frame.shape[:2]
+        self.result = None
+        self._grab = None  # (dx, dy) offset from the box origin to the cursor
+
+        x0, y0 = clamp_origin((self.w - size) / 2, (self.h - size) / 2,
+                              self.w, self.h, size)
+        self.x, self.y = x0, y0
+
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.fig.subplots_adjust(bottom=0.12)
+        self.ax.imshow(frame)
+        self.ax.axis("off")
+        self.rect = Rectangle((self.x, self.y), size, size, fill=False,
+                              lw=2, edgecolor="lime")
+        self.ax.add_patch(self.rect)
+        self._update_title()
+
+        self.button = Button(self.fig.add_axes([0.82, 0.02, 0.13, 0.06]), "Crop")
+        self.button.on_clicked(self._on_crop)
+
+        self.fig.canvas.mpl_connect("button_press_event", self._on_press)
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
+
+    def _update_title(self):
+        self.ax.set_title(
+            f"drag the box over the sipper, then press Crop   "
+            f"[{self.size}x{self.size} @ ({self.x}, {self.y})]")
+
+    def _on_press(self, event):
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        if (self.x <= event.xdata <= self.x + self.size
+                and self.y <= event.ydata <= self.y + self.size):
+            self._grab = (event.xdata - self.x, event.ydata - self.y)
+
+    def _on_motion(self, event):
+        if self._grab is None or event.inaxes is not self.ax or event.xdata is None:
+            return
+        dx, dy = self._grab
+        self.x, self.y = clamp_origin(event.xdata - dx, event.ydata - dy,
+                                      self.w, self.h, self.size)
+        self.rect.set_xy((self.x, self.y))
+        self._update_title()
+        self.fig.canvas.draw_idle()
+
+    def _on_release(self, event):
+        self._grab = None
+
+    def _on_crop(self, event):
+        self.result = (self.x, self.y)
+        plt.close(self.fig)
+
+    def run(self):
+        plt.show()
+        return self.result
+
+
 def build_arg_parser():
     p = argparse.ArgumentParser(
         description="Trim a recording to its capacitance window and crop it to a "
@@ -87,7 +166,16 @@ def main(argv=None):
         print(f"animal sensor {anchor.sensor_number}; session "
               f"{anchor.session_duration:.1f} s -> frames {sf}..{ef} "
               f"({start_sec:.2f}..{end_sec:.2f} s of video)")
-        raise NotImplementedError("GUI wired up in Task 6")
+        mid_frame = (sf + ef) // 2
+        frame = load_preview_frame(video, mid_frame)
+        origin = CropSelector(frame, args.size).run()
+        if origin is None:
+            print("cancelled")
+            return 0
+        x, y = origin
+        print(f"cropping {args.size}x{args.size} @ ({x}, {y}) -> {out}")
+        trim_and_crop(video, start_sec, end_sec, out, x, y, args.size)
+        print("done")
     except (ValueError, FileNotFoundError, KeyError, OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
