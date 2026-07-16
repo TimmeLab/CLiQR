@@ -116,26 +116,58 @@ show_test_dialog = solara.reactive(False)
 # Constants
 # ============================================================================
 
-# Sensor mapping (same as in DataRecording.ipynb)
-# SERIAL_NUMBER_SENSOR_MAP = {
-#     "FT232H0": [1, 2, 3, 7, 8, 9],
-#     "FT232H1": [4, 5, 6, 10, 11, 12],
-#     "FT232H2": [13, 14, 15, 19, 20, 21],
-#     "FT232H3": [16, 17, 18, 22, 23, 24],
-# }
-# For the new DID rack, we now have 8 FT232H boards so
-# that cables don't have to be run so far and things are a bit
-# more organized
-SERIAL_NUMBER_SENSOR_MAP = {
-    "FT232H0": [1, 2, 3],
-    "FT232H1": [7, 8, 9],
-    "FT232H2": [4, 5, 6],
-    "FT232H3": [10, 11, 12],
-    "FT232H4": [13, 14, 15],
-    "FT232H5": [19, 20, 21],
-    "FT232H6": [16, 17, 18],
-    "FT232H7": [22, 23, 24],
+# ---------------------------------------------------------------------------
+# Rack design toggle
+# ---------------------------------------------------------------------------
+# Two rack generations are in use. Each pairs a board->sensor map with the
+# MPR121 channels actually wired on that rack; the two must stay consistent
+# because read_sensor_data zips ACTIVE_CHANNELS (in order) against a board's
+# sensor list (in order).
+#
+#   "4board" - original DID rack: 4 FT232H boards, 6 sensors per MPR121 wired
+#              on channels [1, 3, 5, 7, 9, 11].
+#   "8board" - new DID rack: 8 FT232H boards (shorter cable runs, tidier),
+#              3 sensors per MPR121 wired on channels [1, 6, 11].
+#
+# Select with the RACK_DESIGN constant below, or override at launch with the
+# CLIQR_RACK environment variable (e.g. CLIQR_RACK=8board).
+import os
+
+RACK_DESIGN = os.environ.get("CLIQR_RACK", "4board").strip().lower()
+
+_RACK_CONFIGS = {
+    "4board": {
+        "map": {
+            "FT232H0": [1, 2, 3, 7, 8, 9],
+            "FT232H1": [4, 5, 6, 10, 11, 12],
+            "FT232H2": [13, 14, 15, 19, 20, 21],
+            "FT232H3": [16, 17, 18, 22, 23, 24],
+        },
+        "channels": [1, 3, 5, 7, 9, 11],
+    },
+    "8board": {
+        "map": {
+            "FT232H0": [1, 2, 3],
+            "FT232H1": [7, 8, 9],
+            "FT232H2": [4, 5, 6],
+            "FT232H3": [10, 11, 12],
+            "FT232H4": [13, 14, 15],
+            "FT232H5": [19, 20, 21],
+            "FT232H6": [16, 17, 18],
+            "FT232H7": [22, 23, 24],
+        },
+        "channels": [1, 6, 11],
+    },
 }
+
+if RACK_DESIGN not in _RACK_CONFIGS:
+    raise ValueError(
+        f"Unknown RACK_DESIGN {RACK_DESIGN!r}; expected one of "
+        f"{sorted(_RACK_CONFIGS)}"
+    )
+
+# Sensor mapping (same as in DataRecording.ipynb) selected by RACK_DESIGN.
+SERIAL_NUMBER_SENSOR_MAP = _RACK_CONFIGS[RACK_DESIGN]["map"]
 
 
 # MPR121 register addresses
@@ -145,10 +177,9 @@ DATA = 0x04
 
 # Recording parameters
 HISTORY_SIZE = 100  # Buffer size before HDF5 write
-# On the new 8-board rack each MPR121 has only 3 sensors wired, on
-# channels 1, 6 and 11. read_sensor_data reads these in this order and
-# maps them to the 3 sensor IDs for the board (see SERIAL_NUMBER_SENSOR_MAP).
-ACTIVE_CHANNELS = [1, 6, 11]  # MPR121 channels actually wired
+# The wired MPR121 channels for this rack. read_sensor_data reads these in
+# order and maps them to the board's sensor IDs (see SERIAL_NUMBER_SENSOR_MAP).
+ACTIVE_CHANNELS = _RACK_CONFIGS[RACK_DESIGN]["channels"]
 NUM_CHANNELS = len(ACTIVE_CHANNELS)  # Channels recorded per MPR121
 
 
