@@ -5,6 +5,12 @@ import h5py
 from video import trimcrop as tc
 
 
+def _clock(pts_start_sec, latency=0.0, slope=1.0):
+    """A SessionClock with an explicit anchor. video_base==pts_start_sec at
+    latency 0; a former ``video_base - L`` is now ``latency=L``."""
+    return tc.SessionClock(pts_start_sec=pts_start_sec, latency=latency, slope=slope)
+
+
 def test_compute_video_base():
     pts_ns = np.array([1_000_000_000, 1_100_000_000, 1_250_000_000], dtype=np.int64)
     assert tc.compute_video_base(pts_ns, 2) == pytest.approx(0.25)
@@ -22,25 +28,25 @@ def test_bookmark_latency_missing_is_zero():
 
 def test_frame_session_times_and_trim_frames():
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)  # 0.0 .. 1.0 s
-    vb = tc.compute_video_base(pts_ns, 2)  # 0.2 s
-    sess = tc.frame_session_times(pts_ns, vb)
+    clock = _clock(pts_start_sec=float(pts_ns[2]) / 1e9)  # bookmark frame 2
+    sess = tc.frame_session_times(clock, pts_ns)
     assert sess[2] == pytest.approx(0.0)
     assert sess[0] == pytest.approx(-0.2)
-    sf, ef = tc.compute_trim_frames(pts_ns, vb, 0.0, 0.5)
+    sf, ef = tc.compute_trim_frames(clock, pts_ns, 0.0, 0.5)
     assert sf == 2 and ef == 7
 
 
 def test_compute_trim_frames_window_edges_inclusive():
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
-    # video_base 0 -> session time == file time; [0.2, 0.5] covers frames 2..5
-    sf, ef = tc.compute_trim_frames(pts_ns, 0.0, 0.2, 0.5)
+    # pts_start 0 -> session time == file time; [0.2, 0.5] covers frames 2..5
+    sf, ef = tc.compute_trim_frames(_clock(0.0), pts_ns, 0.2, 0.5)
     assert sf == 2 and ef == 5
 
 
 def test_compute_trim_frames_empty_window_raises():
     pts_ns = (np.arange(0, 5) * 100_000_000).astype(np.int64)
     with pytest.raises(ValueError):
-        tc.compute_trim_frames(pts_ns, 0.0, 100.0, 200.0)
+        tc.compute_trim_frames(_clock(0.0), pts_ns, 100.0, 200.0)
 
 
 def _write_sensor(path, groups):
@@ -422,20 +428,20 @@ def test_resolve_paths_explicit_pts_overrides(tmp_path):
 def test_trim_window_seconds():
     # frames every 0.1 s; bookmark frame 2 -> session zero at 0.2 s
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
-    vb = tc.compute_video_base(pts_ns, 2)  # 0.2
-    sf, ef, start_sec, end_sec = tc.trim_window_seconds(pts_ns, vb, 0.0, 0.3)
+    clock = _clock(pts_start_sec=float(pts_ns[2]) / 1e9)  # 0.2
+    sf, ef, start_sec, end_sec = tc.trim_window_seconds(clock, pts_ns, 0.0, 0.3)
     assert (sf, ef) == (2, 5)
     assert start_sec == pytest.approx(0.2)          # original-timeline seconds
     assert end_sec == pytest.approx(0.5 + tc.TAIL_MARGIN)
 
 
 def test_trim_window_seconds_honors_the_anchor():
-    """A smaller video_base_eff labels every frame later, so the same session
-    window resolves to earlier frames and earlier video seconds."""
+    """A larger latency labels every frame later, so the same session window
+    resolves to earlier frames and earlier video seconds."""
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
-    vb = tc.compute_video_base(pts_ns, 2)
-    plain = tc.trim_window_seconds(pts_ns, vb, 0.0, 0.3)
-    shifted = tc.trim_window_seconds(pts_ns, vb - 0.25, 0.0, 0.3)
+    ps = float(pts_ns[2]) / 1e9
+    plain = tc.trim_window_seconds(_clock(ps, latency=0.0), pts_ns, 0.0, 0.3)
+    shifted = tc.trim_window_seconds(_clock(ps, latency=0.25), pts_ns, 0.0, 0.3)
     assert shifted[0] < plain[0]
     assert shifted[2] < plain[2]
 
@@ -443,4 +449,23 @@ def test_trim_window_seconds_honors_the_anchor():
 def test_trim_window_seconds_empty_raises():
     pts_ns = (np.arange(0, 3) * 100_000_000).astype(np.int64)
     with pytest.raises(ValueError):
-        tc.trim_window_seconds(pts_ns, 0.0, 0.0, -400.0)
+        tc.trim_window_seconds(_clock(0.0), pts_ns, 0.0, -400.0)
+
+
+def test_frame_session_times_scales_with_slope():
+    # A non-unit slope scales video-elapsed-since-bookmark; the bookmark frame
+    # itself stays at τ=latency.
+    pts_ns = (np.arange(0, 600) * 1_000_000).astype(np.int64)  # 0 .. 0.599 s
+    clock = tc.SessionClock(pts_start_sec=0.1, latency=0.05, slope=1.002)
+    sess = tc.frame_session_times(clock, pts_ns)
+    assert sess[100] == pytest.approx(0.05)  # frame at pts 0.1 == pts_start
+    assert sess[300] == pytest.approx(0.05 + 1.002 * (0.3 - 0.1))
+
+
+def test_probe_frame_session_times_applies_same_clock(monkeypatch):
+    # ffprobe path must use the identical transform as the sidecar path.
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="0.3\n"))
+    clock = tc.SessionClock(pts_start_sec=0.1, latency=0.05, slope=1.002)
+    got = tc.probe_frame_session_times("clip.mp4", clock)
+    assert got[0] == pytest.approx(0.05 + 1.002 * (0.3 - 0.1))

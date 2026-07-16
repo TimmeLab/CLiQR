@@ -89,10 +89,17 @@ def bookmark_latency(host_before, host_after, start_time):
 
 @dataclass
 class SessionClock:
-    """Maps a video-clock PTS (seconds) to session time τ (host-seconds since
-    start_time). τ(pts) = latency + slope·(pts − pts_start_sec).
+    """Maps a VIDEO-FILE second (0-based: elapsed since the recording's first
+    frame) to session time τ (host-seconds since start_time).
+    τ(pts) = latency + slope·(pts − pts_start_sec).
 
-    pts_start_sec : PTS of the Start-bookmark frame.
+    This 0-based domain is the one both consumers already live in: the mp4's own
+    ffprobe PTS start at 0, and the SensorTimestamp sidecar is normalised by its
+    first entry (frame_session_times) before it reaches here. (The absolute
+    SensorTimestamp epoch — ~1e5 s — must NOT be fed in raw.)
+
+    pts_start_sec : the Start-bookmark frame's elapsed seconds from the first
+                    frame (== compute_video_base).
     latency       : host seconds the Start bookmark lagged start_time (0 when the
                     host bracket wasn't recorded); the Start frame sits at τ=latency.
     slope         : host-seconds per video-second from the two bookmarks (1.0 when
@@ -109,24 +116,31 @@ class SessionClock:
 
 
 def session_clock(anchor, pts_ns):
-    """Build the SessionClock for a recording from its anchor and PTS sidecar."""
+    """Build the SessionClock for a recording from its anchor and PTS sidecar.
+
+    pts_start_sec is the bookmark frame's offset from the first frame
+    (compute_video_base), keeping the clock in the 0-based video-file domain."""
     pts_ns = np.asarray(pts_ns)
-    pts_start_sec = float(pts_ns[anchor.video_frame_index]) / 1e9
+    pts_start_sec = compute_video_base(pts_ns, anchor.video_frame_index)
     return SessionClock(pts_start_sec=pts_start_sec,
                         latency=anchor.latency,
                         slope=anchor.drift_slope(pts_ns))
 
 
-def frame_session_times(pts_ns, video_base):
-    """Session-relative time (0 = start_time bookmark) of every video frame."""
+def frame_session_times(clock, pts_ns):
+    """Session time τ (0 = start_time) of every sidecar frame, drift-corrected.
+
+    The sidecar holds ABSOLUTE SensorTimestamps; normalise by the first frame so
+    the clock sees the 0-based video-file domain it expects (matching the mp4's
+    own ffprobe PTS)."""
     pts_ns = np.asarray(pts_ns)
-    return (pts_ns - pts_ns[0]) / 1e9 - video_base
+    return clock.session_time((pts_ns - pts_ns[0]) / 1e9)
 
 
-def compute_trim_frames(pts_ns, video_base, start, end):
+def compute_trim_frames(clock, pts_ns, start, end):
     """Inclusive (start_frame, stop_frame) of the video frames whose session
     time falls in [start, end]. Raises ValueError if the window has no frames."""
-    sess = frame_session_times(pts_ns, video_base)
+    sess = frame_session_times(clock, pts_ns)
     idx = np.flatnonzero((sess >= start) & (sess <= end))
     if idx.size == 0:
         raise ValueError(
@@ -137,30 +151,30 @@ def compute_trim_frames(pts_ns, video_base, start, end):
 TAIL_MARGIN = 0.3  # seconds of slack past the last in-window frame
 
 
-def trim_window_seconds(pts_ns, video_base_eff, start, end, tail_margin=TAIL_MARGIN):
+def trim_window_seconds(clock, pts_ns, start, end, tail_margin=TAIL_MARGIN):
     """Resolve session window [start, end] to (start_frame, stop_frame, start_sec,
-    end_sec). The seconds are on the ORIGINAL video's timeline, which is what
-    trim_and_crop and subclip_copy expect.
+    end_sec). The seconds are REAL original-video-timeline seconds (raw PTS, NOT
+    drift-scaled) — that is what trim_and_crop and subclip_copy seek by; only the
+    frame *selection* is drift/latency-aware, via ``clock``.
 
-    ``video_base_eff`` must be the LATENCY-CORRECTED anchor
-    (compute_video_base(...) - bookmark_latency(...)). Both crop_video and
-    make_sync_video route through this function so their windows cannot drift
-    apart: if they did, the crop tool would trim to one window while the renderer
-    placed frames using another, and every cropped video would silently misalign
-    against its trace.
+    Both crop_video and make_sync_video route through this function with the SAME
+    SessionClock so their windows cannot drift apart: if they did, the crop tool
+    would trim to one window while the renderer placed frames using another, and
+    every cropped video would silently misalign against its trace.
     """
     pts_ns = np.asarray(pts_ns)
-    sf, ef = compute_trim_frames(pts_ns, video_base_eff, start, end)
+    sf, ef = compute_trim_frames(clock, pts_ns, start, end)
     start_sec = float(pts_ns[sf] - pts_ns[0]) / 1e9
     end_sec = float(pts_ns[ef] - pts_ns[0]) / 1e9 + tail_margin
     return sf, ef, start_sec, end_sec
 
 
-def probe_frame_session_times(path, video_base):
-    """Session-relative time of every frame in ``path``, read from the file's
-    real presentation timestamps via ffprobe. Because trimmed clips keep their
-    original PTS (``-copyts``), each frame self-reports its true video-second, so
-    ``pts - video_base`` is its session time (0 = start_time bookmark)."""
+def probe_frame_session_times(path, clock):
+    """Session time τ of every frame in ``path``, read from the file's real
+    presentation timestamps via ffprobe. Because trimmed clips keep their original
+    PTS (``-copyts``), each frame self-reports its true video-second, so
+    ``clock.session_time(pts)`` is its session time (0 = start_time). Uses the
+    SAME clock as the sidecar path, so drift and latency are applied identically."""
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
@@ -171,7 +185,7 @@ def probe_frame_session_times(path, video_base):
                     for tok in r.stdout.split() if tok.strip().rstrip(",")])
     if pts.size == 0:
         raise RuntimeError(f"ffprobe found no frames in {path}")
-    return pts - video_base
+    return clock.session_time(pts)
 
 
 @dataclass
