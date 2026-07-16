@@ -160,6 +160,28 @@ def test_read_video_anchor(tmp_path):
     assert a.latency == pytest.approx(1.2)  # (111.0 + 111.4)/2 - 110.0
 
 
+def test_read_video_anchor_multi_cycle_uses_matching_cycle(tmp_path):
+    # A 2-cycle recording: the window comes from cycle 1 (start_time1/stop_time1),
+    # so the frame index and host bracket must come from cycle 1 too, not the
+    # unsuffixed cycle-0 datasets.
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {"sensor_1": {
+        "time_data": np.array([100.0, 300.0]),
+        "video_filename": b"vid.mp4",
+        "video_frame_index": 42,
+        "start_time": 110.0, "stop_time": 175.0,
+        "video_bookmark_host_before": 111.0, "video_bookmark_host_after": 111.4,
+        "video_filename1": b"vid.mp4",
+        "video_frame_index1": 900,
+        "start_time1": 210.0, "stop_time1": 260.0,
+        "video_bookmark_host_before1": 210.5, "video_bookmark_host_after1": 210.9,
+    }})
+    a = tc.read_video_anchor(str(p))
+    assert a.video_frame_index == 900
+    assert a.session_duration == pytest.approx(50.0)  # 260 - 210
+    assert a.latency == pytest.approx(0.7)  # (210.5 + 210.9)/2 - 210.0
+
+
 def test_read_video_anchor_without_host_bracket(tmp_path):
     p = tmp_path / "r.h5"
     _write_sensor(p, {"sensor_1": {
@@ -171,6 +193,80 @@ def test_read_video_anchor_without_host_bracket(tmp_path):
     a = tc.read_video_anchor(str(p))
     assert a.host_before is None and a.host_after is None
     assert a.latency == 0.0
+
+
+def test_session_clock_slope1_is_offset_only():
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)  # 0.0 .. 1.0 s
+    clock = tc.SessionClock(pts_start_sec=float(pts_ns[2]) / 1e9,
+                            latency=0.0, slope=1.0)
+    sess = clock.session_time(pts_ns / 1e9)
+    assert sess[2] == pytest.approx(0.0)   # bookmark frame -> session 0
+    assert sess[0] == pytest.approx(-0.2)
+
+
+def test_drift_slope_recovers_known_skew():
+    # Video clock runs slightly slow vs host -> slope = host-s per video-s.
+    slope_true = 1.0 / 1.001
+    pts_ns = (np.arange(0, 1000) * 1_000_000).astype(np.int64)  # 0..0.999 s
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=0,
+        start_time=1000.0, stop_time=1001.0,
+        host_before=1000.0, host_after=1000.0,            # mid_start = 1000.0
+        stop_frame_index=999,
+        stop_host_before=1000.0 + 0.999 * slope_true,
+        stop_host_after=1000.0 + 0.999 * slope_true)      # mid_stop
+    assert anchor.drift_slope(pts_ns) == pytest.approx(slope_true, rel=1e-6)
+
+
+def test_drift_slope_defaults_to_one_without_stop():
+    pts_ns = (np.arange(0, 10) * 1_000_000).astype(np.int64)
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=0,
+        start_time=1000.0, stop_time=1001.0,
+        host_before=1000.0, host_after=1000.2)
+    assert anchor.drift_slope(pts_ns) == 1.0
+
+
+def test_session_clock_builder_reads_anchor():
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=2,
+        start_time=110.0, stop_time=175.0,
+        host_before=110.1, host_after=110.3)  # latency 0.2, no stop -> slope 1
+    clock = tc.session_clock(anchor, pts_ns)
+    assert clock.pts_start_sec == pytest.approx(0.2)
+    assert clock.latency == pytest.approx(0.2)
+    assert clock.slope == 1.0
+
+
+def test_read_video_anchor_reads_stop_bookmark(tmp_path):
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {"sensor_1": {
+        "time_data": np.array([100.0, 200.0]),
+        "video_filename": b"vid.mp4", "video_frame_index": 3,
+        "start_time": 110.0, "stop_time": 175.0,
+        "video_bookmark_host_before": 111.0, "video_bookmark_host_after": 111.4,
+        "video_stop_frame_index": 900,
+        "video_stop_bookmark_host_before": 176.0,
+        "video_stop_bookmark_host_after": 176.4,
+    }})
+    a = tc.read_video_anchor(str(p))
+    assert a.stop_frame_index == 900
+    assert a.stop_host_before == pytest.approx(176.0)
+    assert a.stop_host_after == pytest.approx(176.4)
+
+
+def test_read_video_anchor_stop_fields_none_when_absent(tmp_path):
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {"sensor_1": {
+        "time_data": np.array([100.0, 200.0]),
+        "video_filename": b"vid.mp4", "video_frame_index": 3,
+        "start_time": 110.0, "stop_time": 175.0,
+    }})
+    a = tc.read_video_anchor(str(p))
+    assert a.stop_frame_index is None
+    assert a.stop_host_before is None
+    assert a.stop_host_after is None
 
 
 import types

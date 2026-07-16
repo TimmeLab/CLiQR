@@ -29,9 +29,12 @@ def find_video_sensor(raw_h5):
     raise ValueError("no sensor group with 'video_filename' found in h5")
 
 
-def _resolve_start_stop(group):
-    """Mirror filter_data: pick the highest-numbered start_time{N}/stop_time{N}
-    pair (or the unnumbered pair), falling back to time_data ends."""
+def _resolve_cycle(group):
+    """Mirror filter_data: pick the highest-numbered start_time{N} (or the
+    unnumbered start_time) and return (start_key, cycle_suffix). The suffix is the
+    one the video-bookmark datasets use — "" for cycle 0 (unnumbered start_time),
+    str(N) for start_time{N} — so callers read a self-consistent cycle. Returns
+    (None, "") when the group has no start_time at all."""
     pattern = re.compile(r"^start_time(\d+)?$")
     matches = {}
     for k in group.keys():
@@ -39,11 +42,19 @@ def _resolve_start_stop(group):
         if m:
             num = int(m.group(1)) if m.group(1) else -1
             matches[num] = k
-    time_data = group["time_data"]
     if not matches:
-        return float(time_data[0]), float(time_data[-1])
+        return None, ""
     num = max(matches)
-    last_start = matches[num]
+    return matches[num], ("" if num < 0 else str(num))
+
+
+def _resolve_start_stop(group):
+    """Mirror filter_data: pick the highest-numbered start_time{N}/stop_time{N}
+    pair (or the unnumbered pair), falling back to time_data ends."""
+    last_start, _ = _resolve_cycle(group)
+    time_data = group["time_data"]
+    if last_start is None:
+        return float(time_data[0]), float(time_data[-1])
     start_time = float(group[last_start][()])
     stop_key = "stop" + last_start[5:]
     if stop_key in group:
@@ -74,6 +85,36 @@ def bookmark_latency(host_before, host_after, start_time):
     if host_before is None or host_after is None:
         return 0.0
     return (float(host_before) + float(host_after)) / 2.0 - float(start_time)
+
+
+@dataclass
+class SessionClock:
+    """Maps a video-clock PTS (seconds) to session time τ (host-seconds since
+    start_time). τ(pts) = latency + slope·(pts − pts_start_sec).
+
+    pts_start_sec : PTS of the Start-bookmark frame.
+    latency       : host seconds the Start bookmark lagged start_time (0 when the
+                    host bracket wasn't recorded); the Start frame sits at τ=latency.
+    slope         : host-seconds per video-second from the two bookmarks (1.0 when
+                    there's no Stop bookmark) — corrects video<->cap clock drift
+                    across the session.
+    """
+    pts_start_sec: float
+    latency: float
+    slope: float
+
+    def session_time(self, pts_sec):
+        pts_sec = np.asarray(pts_sec, dtype=float)
+        return self.latency + self.slope * (pts_sec - self.pts_start_sec)
+
+
+def session_clock(anchor, pts_ns):
+    """Build the SessionClock for a recording from its anchor and PTS sidecar."""
+    pts_ns = np.asarray(pts_ns)
+    pts_start_sec = float(pts_ns[anchor.video_frame_index]) / 1e9
+    return SessionClock(pts_start_sec=pts_start_sec,
+                        latency=anchor.latency,
+                        slope=anchor.drift_slope(pts_ns))
 
 
 def frame_session_times(pts_ns, video_base):
@@ -143,6 +184,9 @@ class VideoAnchor:
     stop_time: float
     host_before: float | None
     host_after: float | None
+    stop_frame_index: int | None = None
+    stop_host_before: float | None = None
+    stop_host_after: float | None = None
 
     @property
     def session_duration(self):
@@ -152,25 +196,59 @@ class VideoAnchor:
     def latency(self):
         return bookmark_latency(self.host_before, self.host_after, self.start_time)
 
+    def drift_slope(self, pts_ns) -> float:
+        """host-seconds per video-second from the two bookmarks; 1.0 when the Stop
+        bookmark (or the Start host bracket) is absent, or the fit is degenerate."""
+        if (self.stop_frame_index is None or self.stop_host_before is None
+                or self.stop_host_after is None or self.host_before is None
+                or self.host_after is None):
+            return 1.0
+        pts_ns = np.asarray(pts_ns)
+        pts_start = float(pts_ns[self.video_frame_index]) / 1e9
+        pts_stop = float(pts_ns[self.stop_frame_index]) / 1e9
+        if pts_stop == pts_start:
+            return 1.0
+        mid_start = (self.host_before + self.host_after) / 2.0
+        mid_stop = (self.stop_host_before + self.stop_host_after) / 2.0
+        return (mid_stop - mid_start) / (pts_stop - pts_start)
+
 
 def read_video_anchor(h5_path):
-    """Read the video sensor's sync metadata and session window in one open."""
+    """Read the video sensor's sync metadata and session window in one open.
+
+    Every field is read from the SAME cycle _resolve_start_stop chose: the video
+    bookmark (frame_index, host bracket, filename) is re-written each cycle with
+    the same suffix as start_time{N}, so pairing a cycle-N window with a cycle-0
+    frame index — as reading the unsuffixed keys would for a multi-cycle
+    recording — misaligns the video against the trace."""
     with h5py.File(h5_path, "r") as raw:
         board_id, sensor_name, sensor_number = find_video_sensor(raw)
         group = raw[board_id][sensor_name]
         start_time, stop_time = _resolve_start_stop(group)
-        fname = group["video_filename"][()]
+        _, suffix = _resolve_cycle(group)
+        fname = group[f"video_filename{suffix}"][()]
         fname = fname.decode() if isinstance(fname, bytes) else str(fname)
+        before_key = f"video_bookmark_host_before{suffix}"
+        after_key = f"video_bookmark_host_after{suffix}"
+        stop_idx_key = f"video_stop_frame_index{suffix}"
+        stop_before_key = f"video_stop_bookmark_host_before{suffix}"
+        stop_after_key = f"video_stop_bookmark_host_after{suffix}"
         return VideoAnchor(
             sensor_number=sensor_number,
             video_filename=fname,
-            video_frame_index=int(group["video_frame_index"][()]),
+            video_frame_index=int(group[f"video_frame_index{suffix}"][()]),
             start_time=start_time,
             stop_time=stop_time,
-            host_before=(float(group["video_bookmark_host_before"][()])
-                         if "video_bookmark_host_before" in group else None),
-            host_after=(float(group["video_bookmark_host_after"][()])
-                        if "video_bookmark_host_after" in group else None),
+            host_before=(float(group[before_key][()])
+                         if before_key in group else None),
+            host_after=(float(group[after_key][()])
+                        if after_key in group else None),
+            stop_frame_index=(int(group[stop_idx_key][()])
+                              if stop_idx_key in group else None),
+            stop_host_before=(float(group[stop_before_key][()])
+                              if stop_before_key in group else None),
+            stop_host_after=(float(group[stop_after_key][()])
+                             if stop_after_key in group else None),
         )
 
 
