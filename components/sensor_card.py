@@ -6,6 +6,7 @@ timer display, and status indicator.
 """
 import solara
 import asyncio
+import threading
 import time as time_module
 from dataclasses import replace
 from utils import state
@@ -55,32 +56,57 @@ def start_sensor(sensor_id: int):
     state.add_log_message(f"Sensor {sensor_id}: Recording started{cycle_text}")
 
     # Bookmark the concurrent video for the designated camera sensor.
+    #
+    # The bookmark is a blocking wireless round-trip. start_sensor runs on the
+    # Solara asyncio event loop, the SAME loop that drives record_sensors, so a
+    # synchronous bookmark here stalls all sensor acquisition for the whole
+    # round-trip (observed: a ~5 s hole in every sensor's data at session start).
+    # Run it on its own thread so acquisition keeps sampling; write_video_metadata
+    # is already h5-lock guarded. Return the thread so callers/tests can join it.
+    bookmark_thread = None
     if state.camera_enabled.value and sensor_id == state.camera_sensor_id.value:
         from components import session_controls
         client = session_controls.camera_client
         if client is not None:
-            try:
-                resp = client.bookmark(sensor_id)
-                if resp.get("ok"):
-                    current_recorder.write_video_metadata(
-                        sensor_id=sensor_id,
-                        frame_index=resp.get("frame_index"),
-                        pts=resp.get("pts"),
-                        video_filename=state.camera_video_filename.value,
-                        cycle=current_cycle,
-                    )
+            recorder = current_recorder
+            video_filename = state.camera_video_filename.value
+
+            def _bookmark_video():
+                try:
+                    # Bracket the round-trip with host wall-clock so the residual
+                    # bookmark latency (frame's host time - start_time) stays
+                    # recoverable; the frame the Pi returns was captured mid-
+                    # round-trip, not at the start_time stamped above.
+                    host_before = time_module.time()
+                    resp = client.bookmark(sensor_id)
+                    host_after = time_module.time()
+                    if resp.get("ok"):
+                        recorder.write_video_metadata(
+                            sensor_id=sensor_id,
+                            frame_index=resp.get("frame_index"),
+                            pts=resp.get("pts"),
+                            video_filename=video_filename,
+                            cycle=current_cycle,
+                            pi_monotonic=resp.get("pi_monotonic"),
+                            host_time_before=host_before,
+                            host_time_after=host_after,
+                        )
+                        state.add_log_message(
+                            f"Sensor {sensor_id}: video bookmark "
+                            f"frame={resp.get('frame_index')} pts={resp.get('pts'):.3f}")
+                    else:
+                        state.add_log_message(
+                            f"WARNING: Sensor {sensor_id}: bookmark failed: {resp.get('error')}")
+                except Exception as exc:
                     state.add_log_message(
-                        f"Sensor {sensor_id}: video bookmark "
-                        f"frame={resp.get('frame_index')} pts={resp.get('pts'):.3f}")
-                else:
-                    state.add_log_message(
-                        f"WARNING: Sensor {sensor_id}: bookmark failed: {resp.get('error')}")
-            except Exception as exc:
-                state.add_log_message(
-                    f"WARNING: Sensor {sensor_id}: bookmark error: {exc}")
+                        f"WARNING: Sensor {sensor_id}: bookmark error: {exc}")
+
+            bookmark_thread = threading.Thread(target=_bookmark_video, daemon=True)
+            bookmark_thread.start()
 
     # Start timer update task
     asyncio.create_task(update_sensor_timer(sensor_id))
+    return bookmark_thread
 
 
 def stop_sensor(sensor_id: int):

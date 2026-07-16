@@ -1,0 +1,290 @@
+"""Shared trim/crop primitives for the Pi video recordings.
+
+Anchor math, PTS/session-time conversion, and the ffmpeg wrappers used by both
+crop_video.py (one-time interactive trim+crop) and make_sync_video.py (per-clip
+stream-copy subclip). See docs/superpowers/specs/2026-07-15-video-crop-tool-design.md.
+"""
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+
+import h5py
+import numpy as np
+
+
+def find_video_sensor(raw_h5):
+    """Return (board_id, sensor_group_name, sensor_number) for the group that
+    carries video sync metadata. Raises ValueError if none do."""
+    for board_id, board in raw_h5.items():
+        if not isinstance(board, h5py.Group):
+            continue
+        for sensor_name, group in board.items():
+            if isinstance(group, h5py.Group) and "video_filename" in group:
+                m = re.match(r"sensor_(\d+)$", sensor_name)
+                if not m:
+                    continue
+                return board_id, sensor_name, int(m.group(1))
+    raise ValueError("no sensor group with 'video_filename' found in h5")
+
+
+def _resolve_start_stop(group):
+    """Mirror filter_data: pick the highest-numbered start_time{N}/stop_time{N}
+    pair (or the unnumbered pair), falling back to time_data ends."""
+    pattern = re.compile(r"^start_time(\d+)?$")
+    matches = {}
+    for k in group.keys():
+        m = pattern.match(k)
+        if m:
+            num = int(m.group(1)) if m.group(1) else -1
+            matches[num] = k
+    time_data = group["time_data"]
+    if not matches:
+        return float(time_data[0]), float(time_data[-1])
+    num = max(matches)
+    last_start = matches[num]
+    start_time = float(group[last_start][()])
+    stop_key = "stop" + last_start[5:]
+    if stop_key in group:
+        stop_time = float(group[stop_key][()])
+    else:
+        stop_time = float(time_data[-1])
+    return start_time, stop_time
+
+
+def read_session_window(h5_path):
+    """Return (start_time, stop_time) of the video sensor's last cycle."""
+    with h5py.File(h5_path, "r") as raw:
+        board_id, sensor_name, _ = find_video_sensor(raw)
+        return _resolve_start_stop(raw[board_id][sensor_name])
+
+
+def compute_video_base(pts_ns, frame_index):
+    """Seconds between the sync frame's PTS and the first frame's PTS."""
+    pts_ns = np.asarray(pts_ns)
+    return float(pts_ns[frame_index] - pts_ns[0]) / 1e9
+
+
+def bookmark_latency(host_before, host_after, start_time):
+    """Seconds the bookmark round-trip lagged ``start_time``: the bookmarked frame
+    was captured mid-round-trip (~midpoint of the host bracket), so the video
+    leads the trace by this much and every frame's session time must be shifted
+    later by it. Returns 0.0 when the bracket wasn't recorded (older recordings)."""
+    if host_before is None or host_after is None:
+        return 0.0
+    return (float(host_before) + float(host_after)) / 2.0 - float(start_time)
+
+
+def frame_session_times(pts_ns, video_base):
+    """Session-relative time (0 = start_time bookmark) of every video frame."""
+    pts_ns = np.asarray(pts_ns)
+    return (pts_ns - pts_ns[0]) / 1e9 - video_base
+
+
+def compute_trim_frames(pts_ns, video_base, start, end):
+    """Inclusive (start_frame, stop_frame) of the video frames whose session
+    time falls in [start, end]. Raises ValueError if the window has no frames."""
+    sess = frame_session_times(pts_ns, video_base)
+    idx = np.flatnonzero((sess >= start) & (sess <= end))
+    if idx.size == 0:
+        raise ValueError(
+            f"no video frames fall in the requested window [{start}, {end}] s")
+    return int(idx[0]), int(idx[-1])
+
+
+TAIL_MARGIN = 0.3  # seconds of slack past the last in-window frame
+
+
+def trim_window_seconds(pts_ns, video_base_eff, start, end, tail_margin=TAIL_MARGIN):
+    """Resolve session window [start, end] to (start_frame, stop_frame, start_sec,
+    end_sec). The seconds are on the ORIGINAL video's timeline, which is what
+    trim_and_crop and subclip_copy expect.
+
+    ``video_base_eff`` must be the LATENCY-CORRECTED anchor
+    (compute_video_base(...) - bookmark_latency(...)). Both crop_video and
+    make_sync_video route through this function so their windows cannot drift
+    apart: if they did, the crop tool would trim to one window while the renderer
+    placed frames using another, and every cropped video would silently misalign
+    against its trace.
+    """
+    pts_ns = np.asarray(pts_ns)
+    sf, ef = compute_trim_frames(pts_ns, video_base_eff, start, end)
+    start_sec = float(pts_ns[sf] - pts_ns[0]) / 1e9
+    end_sec = float(pts_ns[ef] - pts_ns[0]) / 1e9 + tail_margin
+    return sf, ef, start_sec, end_sec
+
+
+def probe_frame_session_times(path, video_base):
+    """Session-relative time of every frame in ``path``, read from the file's
+    real presentation timestamps via ffprobe. Because trimmed clips keep their
+    original PTS (``-copyts``), each frame self-reports its true video-second, so
+    ``pts - video_base`` is its session time (0 = start_time bookmark)."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}:\n{r.stderr[-800:]}")
+    pts = np.array([float(tok.strip().rstrip(","))
+                    for tok in r.stdout.split() if tok.strip().rstrip(",")])
+    if pts.size == 0:
+        raise RuntimeError(f"ffprobe found no frames in {path}")
+    return pts - video_base
+
+
+@dataclass
+class VideoAnchor:
+    """Everything needed to place the video against the trace, from one h5 open."""
+    sensor_number: int
+    video_filename: str
+    video_frame_index: int
+    start_time: float
+    stop_time: float
+    host_before: float | None
+    host_after: float | None
+
+    @property
+    def session_duration(self):
+        return self.stop_time - self.start_time
+
+    @property
+    def latency(self):
+        return bookmark_latency(self.host_before, self.host_after, self.start_time)
+
+
+def read_video_anchor(h5_path):
+    """Read the video sensor's sync metadata and session window in one open."""
+    with h5py.File(h5_path, "r") as raw:
+        board_id, sensor_name, sensor_number = find_video_sensor(raw)
+        group = raw[board_id][sensor_name]
+        start_time, stop_time = _resolve_start_stop(group)
+        fname = group["video_filename"][()]
+        fname = fname.decode() if isinstance(fname, bytes) else str(fname)
+        return VideoAnchor(
+            sensor_number=sensor_number,
+            video_filename=fname,
+            video_frame_index=int(group["video_frame_index"][()]),
+            start_time=start_time,
+            stop_time=stop_time,
+            host_before=(float(group["video_bookmark_host_before"][()])
+                         if "video_bookmark_host_before" in group else None),
+            host_after=(float(group["video_bookmark_host_after"][()])
+                        if "video_bookmark_host_after" in group else None),
+        )
+
+
+def clamp_origin(x, y, frame_w, frame_h, size):
+    """Clamp a proposed crop origin so the size x size box stays inside the frame,
+    rounding each coordinate down to an even number (yuv420p needs even offsets).
+    Rounding down only ever moves the box further inside. Raises ValueError if the
+    box cannot fit."""
+    if size > frame_w or size > frame_h:
+        raise ValueError(
+            f"crop size {size} exceeds frame {frame_w}x{frame_h}")
+    x = int(min(max(x, 0), frame_w - size))
+    y = int(min(max(y, 0), frame_h - size))
+    return x - (x % 2), y - (y % 2)
+
+
+def probe_start_pts(path):
+    """The input's first presentation timestamp, in seconds. Containers without a
+    start_time report "N/A"; treat those as 0."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=start_time",
+         "-of", "csv=p=0", path],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}:\n{r.stderr[-800:]}")
+    tok = r.stdout.strip()
+    try:
+        return float(tok)
+    except ValueError:
+        return 0.0
+
+
+def trim_and_crop(video_path, start_sec, end_sec, out_path,
+                  crop_x, crop_y, size, seek_margin=5.0):
+    """Trim ``video_path`` to video-seconds [start_sec, end_sec] and crop a
+    size x size square whose top-left corner is (crop_x, crop_y), writing a new
+    file (the original is left untouched). Re-encodes, because a filter applies.
+
+    Uses a coarse fast seek to ``start_sec - seek_margin`` and ``-copyts`` so the
+    output frames keep their ORIGINAL presentation timestamps. ffmpeg's input
+    ``-ss`` does not land frame-accurately on this footage, so we deliberately
+    seek a little early and rely on the preserved PTS (read back with
+    ``probe_frame_session_times``) to time each frame — never on where the seek
+    landed. This reads the original recording, whose PTS start at 0, so the seek
+    needs no start-PTS correction. Returns out_path. Raises RuntimeError if
+    ffmpeg fails."""
+    coarse = max(0.0, start_sec - seek_margin)
+    vf = f"crop={size}:{size}:{crop_x}:{crop_y}"
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
+        "-to", f"{end_sec:.6f}", "-vf", vf, "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg trim/crop failed:\n{r.stderr[-800:]}")
+    return out_path
+
+
+def subclip_copy(video_path, start_sec, end_sec, out_path, seek_margin=5.0):
+    """Cut video-seconds [start_sec, end_sec] out of ``video_path`` by stream copy
+    — no filter, no re-encode, near-instant. Used to seek cheaply into a long file
+    without decoding everything before the window.
+
+    ``start_sec``/``end_sec`` are ORIGINAL-timeline seconds. Input ``-ss`` is
+    relative to the container's start_time, while ``-to`` under ``-copyts`` is
+    absolute, so the seek subtracts the input's start PTS and the end does not.
+    That subtraction is a no-op on the original recording (start_time 0) and is
+    what makes the seek land on a cropped file (start_time = session start).
+
+    Stream copy cuts at the keyframe at or before the seek target, so the output
+    may carry frames earlier than ``start_sec``. That is harmless: consumers time
+    frames by PTS and skip past them. Returns out_path."""
+    start_pts = probe_start_pts(video_path)
+    coarse = max(0.0, start_sec - start_pts - seek_margin)
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
+        "-to", f"{end_sec:.6f}", "-an", "-c", "copy", out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg subclip failed:\n{r.stderr[-800:]}")
+    return out_path
+
+
+def cropped_path_for(video_path):
+    """The conventional cropped sibling of a recording: <base>_cropped.mp4."""
+    return os.path.splitext(video_path)[0] + "_cropped.mp4"
+
+
+def resolve_paths(h5_path, anchor, video=None, pts_txt=None, prefer_cropped=False):
+    """Resolve (video_path, pts_txt_path) for a recording.
+
+    The PTS sidecar is ALWAYS <original-video-base>.txt, derived from the h5's
+    video_filename — never from the resolved video path. A cropped file has no
+    sidecar of its own and needs none: it carries the original PTS via -copyts,
+    and probe_frame_session_times reads them back from the file itself.
+
+    ``prefer_cropped`` picks <base>_cropped.mp4 when it exists, printing a note to
+    stderr when it doesn't, so a forgotten crop degrades to a correct (just
+    uncropped) render instead of an error.
+    """
+    base = os.path.join(os.path.dirname(h5_path), anchor.video_filename)
+    if pts_txt is None:
+        pts_txt = os.path.splitext(base)[0] + ".txt"
+    if video is None:
+        video = base
+        if prefer_cropped:
+            cropped = cropped_path_for(base)
+            if os.path.exists(cropped):
+                video = cropped
+            else:
+                print(f"note: using uncropped video {base} "
+                      f"(no _cropped.mp4; run crop_video.py first)",
+                      file=sys.stderr)
+    return video, pts_txt

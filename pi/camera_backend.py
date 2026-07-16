@@ -168,11 +168,18 @@ class Picamera2Backend:
         # the pre_callback logged. capture_metadata() would instead fetch (and
         # block until) a newer frame, whose timestamp would not match
         # frame_index, biasing the video<->trace anchor.
+        #
+        # _on_frame writes the frame's timestamp to the sidecar (0-based line =
+        # frame index) and THEN increments _frame_count. So after logging frame
+        # k, _frame_count == k + 1 while _last_frame_ts_ns is frame k's stamp.
+        # frame_index must therefore be _frame_count - 1 to line up with pts;
+        # returning _frame_count points one frame PAST the reported pts and
+        # shifts every downstream video<->trace mapping by a frame.
         # TODO: Change to report pts as relative seconds (relative to session start /
         # first_frame_SensorTimestamp) for consistency with alignment_from_bookmark()
         # and the planned .txt format change. Pending validation on Pi.
         return {
-            "frame_index": self._frame_count,
+            "frame_index": self._frame_count - 1,
             "pts": self._last_frame_ts_ns / 1e9,
             "pi_monotonic": time.monotonic(),
         }
