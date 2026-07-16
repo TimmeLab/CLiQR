@@ -5,6 +5,12 @@ import h5py
 from video import trimcrop as tc
 
 
+def _clock(pts_start_sec, latency=0.0, slope=1.0):
+    """A SessionClock with an explicit anchor. video_base==pts_start_sec at
+    latency 0; a former ``video_base - L`` is now ``latency=L``."""
+    return tc.SessionClock(pts_start_sec=pts_start_sec, latency=latency, slope=slope)
+
+
 def test_compute_video_base():
     pts_ns = np.array([1_000_000_000, 1_100_000_000, 1_250_000_000], dtype=np.int64)
     assert tc.compute_video_base(pts_ns, 2) == pytest.approx(0.25)
@@ -22,25 +28,25 @@ def test_bookmark_latency_missing_is_zero():
 
 def test_frame_session_times_and_trim_frames():
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)  # 0.0 .. 1.0 s
-    vb = tc.compute_video_base(pts_ns, 2)  # 0.2 s
-    sess = tc.frame_session_times(pts_ns, vb)
+    clock = _clock(pts_start_sec=float(pts_ns[2]) / 1e9)  # bookmark frame 2
+    sess = tc.frame_session_times(clock, pts_ns)
     assert sess[2] == pytest.approx(0.0)
     assert sess[0] == pytest.approx(-0.2)
-    sf, ef = tc.compute_trim_frames(pts_ns, vb, 0.0, 0.5)
+    sf, ef = tc.compute_trim_frames(clock, pts_ns, 0.0, 0.5)
     assert sf == 2 and ef == 7
 
 
 def test_compute_trim_frames_window_edges_inclusive():
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
-    # video_base 0 -> session time == file time; [0.2, 0.5] covers frames 2..5
-    sf, ef = tc.compute_trim_frames(pts_ns, 0.0, 0.2, 0.5)
+    # pts_start 0 -> session time == file time; [0.2, 0.5] covers frames 2..5
+    sf, ef = tc.compute_trim_frames(_clock(0.0), pts_ns, 0.2, 0.5)
     assert sf == 2 and ef == 5
 
 
 def test_compute_trim_frames_empty_window_raises():
     pts_ns = (np.arange(0, 5) * 100_000_000).astype(np.int64)
     with pytest.raises(ValueError):
-        tc.compute_trim_frames(pts_ns, 0.0, 100.0, 200.0)
+        tc.compute_trim_frames(_clock(0.0), pts_ns, 100.0, 200.0)
 
 
 def _write_sensor(path, groups):
@@ -160,6 +166,28 @@ def test_read_video_anchor(tmp_path):
     assert a.latency == pytest.approx(1.2)  # (111.0 + 111.4)/2 - 110.0
 
 
+def test_read_video_anchor_multi_cycle_uses_matching_cycle(tmp_path):
+    # A 2-cycle recording: the window comes from cycle 1 (start_time1/stop_time1),
+    # so the frame index and host bracket must come from cycle 1 too, not the
+    # unsuffixed cycle-0 datasets.
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {"sensor_1": {
+        "time_data": np.array([100.0, 300.0]),
+        "video_filename": b"vid.mp4",
+        "video_frame_index": 42,
+        "start_time": 110.0, "stop_time": 175.0,
+        "video_bookmark_host_before": 111.0, "video_bookmark_host_after": 111.4,
+        "video_filename1": b"vid.mp4",
+        "video_frame_index1": 900,
+        "start_time1": 210.0, "stop_time1": 260.0,
+        "video_bookmark_host_before1": 210.5, "video_bookmark_host_after1": 210.9,
+    }})
+    a = tc.read_video_anchor(str(p))
+    assert a.video_frame_index == 900
+    assert a.session_duration == pytest.approx(50.0)  # 260 - 210
+    assert a.latency == pytest.approx(0.7)  # (210.5 + 210.9)/2 - 210.0
+
+
 def test_read_video_anchor_without_host_bracket(tmp_path):
     p = tmp_path / "r.h5"
     _write_sensor(p, {"sensor_1": {
@@ -171,6 +199,80 @@ def test_read_video_anchor_without_host_bracket(tmp_path):
     a = tc.read_video_anchor(str(p))
     assert a.host_before is None and a.host_after is None
     assert a.latency == 0.0
+
+
+def test_session_clock_slope1_is_offset_only():
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)  # 0.0 .. 1.0 s
+    clock = tc.SessionClock(pts_start_sec=float(pts_ns[2]) / 1e9,
+                            latency=0.0, slope=1.0)
+    sess = clock.session_time(pts_ns / 1e9)
+    assert sess[2] == pytest.approx(0.0)   # bookmark frame -> session 0
+    assert sess[0] == pytest.approx(-0.2)
+
+
+def test_drift_slope_recovers_known_skew():
+    # Video clock runs slightly slow vs host -> slope = host-s per video-s.
+    slope_true = 1.0 / 1.001
+    pts_ns = (np.arange(0, 1000) * 1_000_000).astype(np.int64)  # 0..0.999 s
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=0,
+        start_time=1000.0, stop_time=1001.0,
+        host_before=1000.0, host_after=1000.0,            # mid_start = 1000.0
+        stop_frame_index=999,
+        stop_host_before=1000.0 + 0.999 * slope_true,
+        stop_host_after=1000.0 + 0.999 * slope_true)      # mid_stop
+    assert anchor.drift_slope(pts_ns) == pytest.approx(slope_true, rel=1e-6)
+
+
+def test_drift_slope_defaults_to_one_without_stop():
+    pts_ns = (np.arange(0, 10) * 1_000_000).astype(np.int64)
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=0,
+        start_time=1000.0, stop_time=1001.0,
+        host_before=1000.0, host_after=1000.2)
+    assert anchor.drift_slope(pts_ns) == 1.0
+
+
+def test_session_clock_builder_reads_anchor():
+    pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=2,
+        start_time=110.0, stop_time=175.0,
+        host_before=110.1, host_after=110.3)  # latency 0.2, no stop -> slope 1
+    clock = tc.session_clock(anchor, pts_ns)
+    assert clock.pts_start_sec == pytest.approx(0.2)
+    assert clock.latency == pytest.approx(0.2)
+    assert clock.slope == 1.0
+
+
+def test_read_video_anchor_reads_stop_bookmark(tmp_path):
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {"sensor_1": {
+        "time_data": np.array([100.0, 200.0]),
+        "video_filename": b"vid.mp4", "video_frame_index": 3,
+        "start_time": 110.0, "stop_time": 175.0,
+        "video_bookmark_host_before": 111.0, "video_bookmark_host_after": 111.4,
+        "video_stop_frame_index": 900,
+        "video_stop_bookmark_host_before": 176.0,
+        "video_stop_bookmark_host_after": 176.4,
+    }})
+    a = tc.read_video_anchor(str(p))
+    assert a.stop_frame_index == 900
+    assert a.stop_host_before == pytest.approx(176.0)
+    assert a.stop_host_after == pytest.approx(176.4)
+
+
+def test_read_video_anchor_stop_fields_none_when_absent(tmp_path):
+    p = tmp_path / "r.h5"
+    _write_sensor(p, {"sensor_1": {
+        "time_data": np.array([100.0, 200.0]),
+        "video_filename": b"vid.mp4", "video_frame_index": 3,
+        "start_time": 110.0, "stop_time": 175.0,
+    }})
+    a = tc.read_video_anchor(str(p))
+    assert a.stop_frame_index is None
+    assert a.stop_host_before is None
+    assert a.stop_host_after is None
 
 
 import types
@@ -326,20 +428,20 @@ def test_resolve_paths_explicit_pts_overrides(tmp_path):
 def test_trim_window_seconds():
     # frames every 0.1 s; bookmark frame 2 -> session zero at 0.2 s
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
-    vb = tc.compute_video_base(pts_ns, 2)  # 0.2
-    sf, ef, start_sec, end_sec = tc.trim_window_seconds(pts_ns, vb, 0.0, 0.3)
+    clock = _clock(pts_start_sec=float(pts_ns[2]) / 1e9)  # 0.2
+    sf, ef, start_sec, end_sec = tc.trim_window_seconds(clock, pts_ns, 0.0, 0.3)
     assert (sf, ef) == (2, 5)
     assert start_sec == pytest.approx(0.2)          # original-timeline seconds
     assert end_sec == pytest.approx(0.5 + tc.TAIL_MARGIN)
 
 
 def test_trim_window_seconds_honors_the_anchor():
-    """A smaller video_base_eff labels every frame later, so the same session
-    window resolves to earlier frames and earlier video seconds."""
+    """A larger latency labels every frame later, so the same session window
+    resolves to earlier frames and earlier video seconds."""
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
-    vb = tc.compute_video_base(pts_ns, 2)
-    plain = tc.trim_window_seconds(pts_ns, vb, 0.0, 0.3)
-    shifted = tc.trim_window_seconds(pts_ns, vb - 0.25, 0.0, 0.3)
+    ps = float(pts_ns[2]) / 1e9
+    plain = tc.trim_window_seconds(_clock(ps, latency=0.0), pts_ns, 0.0, 0.3)
+    shifted = tc.trim_window_seconds(_clock(ps, latency=0.25), pts_ns, 0.0, 0.3)
     assert shifted[0] < plain[0]
     assert shifted[2] < plain[2]
 
@@ -347,4 +449,23 @@ def test_trim_window_seconds_honors_the_anchor():
 def test_trim_window_seconds_empty_raises():
     pts_ns = (np.arange(0, 3) * 100_000_000).astype(np.int64)
     with pytest.raises(ValueError):
-        tc.trim_window_seconds(pts_ns, 0.0, 0.0, -400.0)
+        tc.trim_window_seconds(_clock(0.0), pts_ns, 0.0, -400.0)
+
+
+def test_frame_session_times_scales_with_slope():
+    # A non-unit slope scales video-elapsed-since-bookmark; the bookmark frame
+    # itself stays at τ=latency.
+    pts_ns = (np.arange(0, 600) * 1_000_000).astype(np.int64)  # 0 .. 0.599 s
+    clock = tc.SessionClock(pts_start_sec=0.1, latency=0.05, slope=1.002)
+    sess = tc.frame_session_times(clock, pts_ns)
+    assert sess[100] == pytest.approx(0.05)  # frame at pts 0.1 == pts_start
+    assert sess[300] == pytest.approx(0.05 + 1.002 * (0.3 - 0.1))
+
+
+def test_probe_frame_session_times_applies_same_clock(monkeypatch):
+    # ffprobe path must use the identical transform as the sidecar path.
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="0.3\n"))
+    clock = tc.SessionClock(pts_start_sec=0.1, latency=0.05, slope=1.002)
+    got = tc.probe_frame_session_times("clip.mp4", clock)
+    assert got[0] == pytest.approx(0.05 + 1.002 * (0.3 - 0.1))

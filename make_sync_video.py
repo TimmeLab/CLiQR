@@ -22,7 +22,11 @@ import numpy as np
 import pandas as pd
 
 from data_analysis import filter_data
-from video.trimcrop import (
+# Several trimcrop primitives are imported here purely to re-export them on the
+# make_sync_video namespace (CLI + test convenience); this module is the public
+# surface the sync-video tests poke at.
+from video.trimcrop import (  # noqa: F401
+    SessionClock,
     bookmark_latency,
     compute_trim_frames,
     compute_video_base,
@@ -33,6 +37,7 @@ from video.trimcrop import (
     read_session_window,
     read_video_anchor,
     resolve_paths,
+    session_clock,
     subclip_copy,
     trim_and_crop,
     trim_window_seconds,
@@ -48,11 +53,10 @@ class Recording:
     lick_times: np.ndarray
     lick_indices: np.ndarray
     lick_vals: np.ndarray
-    video_base: float
+    clock: SessionClock
     video_path: str
     session_duration: float
     pts_ns: np.ndarray
-    bookmark_latency: float
 
 
 def read_session_duration(h5_path):
@@ -65,8 +69,6 @@ def read_session_duration(h5_path):
 def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
     layout = pd.read_csv(layout_path, header=None, index_col=0)
     session_duration = anchor.session_duration
-    latency = anchor.latency
-    video_frame_index = anchor.video_frame_index
     animal = str(layout.loc[anchor.sensor_number].iloc[0])
 
     with tempfile.TemporaryDirectory() as td:
@@ -93,15 +95,14 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
     lick_vals = cap[lick_indices] if lick_indices.size else np.array([])
 
     pts_ns = np.loadtxt(pts_txt_path, dtype=np.int64)
-    video_base = compute_video_base(pts_ns, video_frame_index)
+    clock = session_clock(anchor, pts_ns)
 
     return Recording(
         animal=animal, sensor=anchor.sensor_number, cap=cap, time=time,
         lick_times=np.asarray(lick_times), lick_indices=lick_indices,
         lick_vals=lick_vals,
-        video_base=video_base, video_path=video_path,
+        clock=clock, video_path=video_path,
         session_duration=session_duration, pts_ns=pts_ns,
-        bookmark_latency=latency,
     )
 
 
@@ -164,22 +165,15 @@ class TrimmedFrameSource:
 
 
 def clip_trim_window(rec, start, end):
-    """Video-file window (start_frame, stop_frame, start_sec, end_sec,
-    video_base_eff) for the clip's session window [start, end]. video_base_eff is
-    the latency-corrected anchor the window was built from, returned so callers
-    don't need a second copy of the correction formula.
+    """Video-file window (start_frame, stop_frame, start_sec, end_sec) for the
+    clip's session window [start, end].
 
-    Correct the bookmark-latency anchor error: the recorded bookmark frame was
-    captured rec.bookmark_latency seconds AFTER start_time, so raw frame session
-    times run that much early (video leads the trace). Shifting frame labels later
-    by the latency == subtracting it from the anchor base. Shares
-    trim_window_seconds with crop_video's compute_crop_window so the two cannot
-    drift apart.
+    Latency and clock drift both live in rec.clock (the bookmark frame sits at
+    τ=latency; frame times are scaled by the two-bookmark slope), shared with
+    crop_video's compute_crop_window through trim_window_seconds so the crop and
+    render windows cannot drift apart.
     """
-    video_base_eff = rec.video_base - rec.bookmark_latency
-    sf, ef, start_sec, end_sec = trim_window_seconds(rec.pts_ns, video_base_eff,
-                                                      start, end)
-    return sf, ef, start_sec, end_sec, video_base_eff
+    return trim_window_seconds(rec.clock, rec.pts_ns, start, end)
 
 
 def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0,
@@ -203,14 +197,14 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
     if taus.size == 0:
         raise ValueError("empty clip: check --start/--end/--fps")
 
-    _, _, start_sec, end_sec, video_base_eff = clip_trim_window(rec, start, end)
+    _, _, start_sec, end_sec = clip_trim_window(rec, start, end)
 
     if intermediate_path is None:
         intermediate_path = os.path.splitext(out_path)[0] + "_trimcrop.mp4"
     subclip_copy(rec.video_path, start_sec, end_sec, intermediate_path)
 
     # Time each trimmed frame by its real (preserved) PTS, not by seek position.
-    frame_sess = probe_frame_session_times(intermediate_path, video_base_eff)
+    frame_sess = probe_frame_session_times(intermediate_path, rec.clock)
 
     src = TrimmedFrameSource(intermediate_path, frame_sess)
 

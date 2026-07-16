@@ -21,6 +21,10 @@ recording_task = None
 # when the camera failed to start).
 camera_client = None
 
+# The daemon thread that stops the camera and fetches its files, exposed so tests
+# can join it (the GUI never waits on it).
+_last_camera_stop_thread = None
+
 # The Pi's START_SESSION does a full Picamera2 warmup (create + configure +
 # start_recording) before replying, which takes longer than a normal request;
 # use a generous timeout so a slow-but-successful start isn't misreported as a
@@ -186,6 +190,7 @@ def stop_recording():
     state.add_log_message("Stopping recording session...")
 
     # Stop all sensors that are still recording and write all volume/weight metadata
+    stop_bookmark_thread = None
     sensors = state.sensor_states.value.copy()
     for sensor_id, sensor in sensors.items():
         if sensor.is_recording:
@@ -196,6 +201,13 @@ def stop_recording():
                     stop_time=time.time(),
                     cycle=sensor.recording_cycle
                 )
+            # Stop bookmark (drift-fit anchor) for the camera sensor. Capture the
+            # thread so the camera stop below joins it BEFORE STOP_SESSION — once
+            # the Pi session ends there is no frame to bookmark.
+            from components.sensor_card import bookmark_stop
+            t = bookmark_stop(sensor_id, sensor.recording_cycle)
+            if t is not None:
+                stop_bookmark_thread = t
             # Update sensor state (create new object, increment cycle)
             sensors[sensor_id] = replace(
                 sensor,
@@ -233,13 +245,17 @@ def stop_recording():
 
     # Stop the camera and copy its files back in a background thread so GUI
     # doesn't block during multi-MB file transfer.
-    global camera_client
+    global camera_client, _last_camera_stop_thread
     if state.camera_enabled.value and camera_client is not None:
         _client = camera_client
         _out_dir = state.output_directory.value
 
-        def _camera_stop_and_fetch(client, out_dir):
+        def _camera_stop_and_fetch(client, out_dir, bookmark_thread):
             try:
+                # Bookmark the Pi BEFORE stopping it: STOP_SESSION ends the
+                # session, after which BOOKMARK has no frame to return.
+                if bookmark_thread is not None:
+                    bookmark_thread.join(5.0)
                 resp = client.stop_session()
                 if resp.get("ok"):
                     names = [f["name"] for f in resp.get("files", [])]
@@ -253,8 +269,10 @@ def stop_recording():
             except Exception as exc:
                 state.add_log_message(f"WARNING: Camera stop error: {exc}")
 
-        threading.Thread(target=_camera_stop_and_fetch, args=(_client, _out_dir),
-                         daemon=True).start()
+        _last_camera_stop_thread = threading.Thread(
+            target=_camera_stop_and_fetch,
+            args=(_client, _out_dir, stop_bookmark_thread), daemon=True)
+        _last_camera_stop_thread.start()
     camera_client = None
 
     # Update state

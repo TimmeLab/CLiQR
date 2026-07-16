@@ -78,7 +78,7 @@ class Picamera2Backend:
         self._pts_path = None
         self._video_path = None
         self._frame_count = 0
-        self._last_frame_ts_ns = 0
+        self._last_frame = None  # (frame_index, timestamp_ns) of the newest frame
 
     @property
     def is_active(self) -> bool:
@@ -145,6 +145,7 @@ class Picamera2Backend:
         self._pts_path = self.output_dir / f"{name}.txt"
         self._pts_fh = open(self._pts_path, "w")
         self._frame_count = 0
+        self._last_frame = None
         self._picam2.pre_callback = self._on_frame
 
         self._encoder = self._create_encoder()
@@ -160,8 +161,12 @@ class Picamera2Backend:
         # compatibility with false_positive_analysis.load_frame_offsets().
         # Pending validation on Pi.
         self._pts_fh.write(f"{timestamp}\n")
+        index = self._frame_count
         self._frame_count += 1
-        self._last_frame_ts_ns = timestamp
+        # Publish index and timestamp as ONE tuple. bookmark() runs on another
+        # thread; a tuple rebind is atomic under the GIL, so it can never observe
+        # a half-updated pair (frame_index of frame k with pts of frame k-1).
+        self._last_frame = (index, timestamp)
 
     def bookmark(self, sensor_id) -> dict:
         # frame_index and pts must describe the SAME frame: the most recent one
@@ -169,18 +174,21 @@ class Picamera2Backend:
         # block until) a newer frame, whose timestamp would not match
         # frame_index, biasing the video<->trace anchor.
         #
-        # _on_frame writes the frame's timestamp to the sidecar (0-based line =
-        # frame index) and THEN increments _frame_count. So after logging frame
-        # k, _frame_count == k + 1 while _last_frame_ts_ns is frame k's stamp.
-        # frame_index must therefore be _frame_count - 1 to line up with pts;
-        # returning _frame_count points one frame PAST the reported pts and
-        # shifts every downstream video<->trace mapping by a frame.
+        # _on_frame publishes (frame_index, timestamp) as one tuple, where
+        # frame_index is the 0-based sidecar line the timestamp was written to, so
+        # the pair read here always lines up. No frame yet means no valid anchor:
+        # fail loudly rather than return frame_index -1 (which downstream reads as
+        # pts_ns[-1], the LAST frame, anchoring the whole video wrong).
         # TODO: Change to report pts as relative seconds (relative to session start /
         # first_frame_SensorTimestamp) for consistency with alignment_from_bookmark()
         # and the planned .txt format change. Pending validation on Pi.
+        last = self._last_frame
+        if last is None:
+            raise RuntimeError("no video frame captured yet; cannot bookmark")
+        frame_index, timestamp = last
         return {
-            "frame_index": self._frame_count - 1,
-            "pts": self._last_frame_ts_ns / 1e9,
+            "frame_index": frame_index,
+            "pts": timestamp / 1e9,
             "pi_monotonic": time.monotonic(),
         }
 

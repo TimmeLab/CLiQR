@@ -250,7 +250,9 @@ class SensorRecorder:
     def write_video_metadata(self, sensor_id: int, frame_index=None, pts=None,
                              video_filename=None, cycle=0,
                              pi_monotonic=None, host_time_before=None,
-                             host_time_after=None):
+                             host_time_after=None,
+                             stop_frame_index=None, stop_pts=None,
+                             stop_host_before=None, stop_host_after=None):
         """Write video bookmark metadata for a sensor's recording cycle.
 
         Datasets mirror the start_time cycle-suffix convention:
@@ -263,6 +265,11 @@ class SensorRecorder:
         is ~midpoint(before, after), and its offset from ``start_time`` is the
         latency the video panel would otherwise lead the trace by. Any of these
         left None (older callers) is simply not written.
+
+        The ``stop_*`` fields record the Stop bookmark — a second clock anchor at
+        the end of the cycle — so the video<->cap clock-rate drift can be fit as a
+        line across the session (see docs/superpowers/specs/
+        2026-07-16-clock-drift-stop-bookmark-design.md). Same omit-when-None rule.
         """
         sn = self._serial_for_sensor(sensor_id)
         suffix = "" if cycle == 0 else str(cycle)
@@ -280,6 +287,10 @@ class SensorRecorder:
                 (f"video_pi_monotonic{suffix}", pi_monotonic),
                 (f"video_bookmark_host_before{suffix}", host_time_before),
                 (f"video_bookmark_host_after{suffix}", host_time_after),
+                (f"video_stop_frame_index{suffix}", stop_frame_index),
+                (f"video_stop_pts{suffix}", stop_pts),
+                (f"video_stop_bookmark_host_before{suffix}", stop_host_before),
+                (f"video_stop_bookmark_host_after{suffix}", stop_host_after),
             ):
                 if value is None:
                     continue

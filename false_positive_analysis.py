@@ -132,10 +132,9 @@ def load_frame_offsets(txt_path):
 
     Format written by pi/camera_backend.py:_on_frame — one integer per line,
     no header, each the frame's absolute SensorTimestamp in nanoseconds (a
-    monotonic sensor clock, NOT Unix), 0-indexed by capture order. video/
-    sync_video.py reads the same file the same way. The absolute epoch cancels
-    downstream: alignment_from_bookmark() subtracts the bookmark's video_pts,
-    which is the same clock, so only elapsed time survives.
+    monotonic sensor clock, NOT Unix), 0-indexed by capture order. The absolute
+    epoch cancels downstream: alignment_from_bookmark() subtracts the bookmark's
+    video_pts, which is the same clock, so only elapsed time survives.
 
     Returns numpy int64 array of per-frame absolute-ns timestamps.
     """
@@ -357,28 +356,36 @@ def detect_sipper_step(cap_data, time_data, t_min, t_max, direction='down',
     return dip_time, dip_depth
 
 
-def alignment_from_bookmark(start_time_abs, video_pts):
-    """Build an alignment from a CLiQR video bookmark (frame PTS at sipper-in).
+def alignment_from_bookmark(start_time_abs, video_pts,
+                            host_before=None, host_after=None):
+    """Build an alignment from a CLiQR video bookmark (frame PTS at the Start click).
 
-    The recording GUI records, at sipper insertion, the Unix start_time and the
-    concurrent video frame PTS. Their difference gives the video_start_unix_s
-    (the Unix timestamp when the video began): video_start = start_time_abs - video_pts.
+    The recording GUI records, at the sensor Start click, the Unix start_time and
+    the concurrent video frame's PTS. The video's Unix start (its PTS=0 instant)
+    is that frame's true host time minus its PTS.
 
-    Returns a dict compatible with video_relative_to_abs(), with the same structure
-    as establish_alignment(). The bookmark was taken at the sensor start (Unix
-    start_time_abs), so:
-        video_start_unix_s = start_time_abs - video_pts
+    Bookmark-latency correction: the bookmarked frame was NOT captured at
+    start_time. Start_time is stamped on the host, then the bookmark is a wireless
+    round-trip to the Pi, which returns whatever frame it had captured by the time
+    it handled the request — ~L seconds after start_time (L = one-way latency).
+    Its true host time is ~midpoint(host_before, host_after), so:
+        video_start_unix_s = (start_time_abs + L) - video_pts
+    with L from the shared trimcrop.bookmark_latency formula (0.0 when the host
+    bracket wasn't recorded — older recordings). Without this correction the video
+    panel leads the trace by L (~2.5 s on the reference wireless link); see
+    docs/video-sync-alignment-bugs.md.
 
     NOTE: video_pts is stored in the SensorTimestamp clock (seconds), the SAME
     clock as load_frame_offsets(). Do NOT "fix" this to a relative-seconds pts —
     the large absolute epoch is intentional and cancels when video_relative_to_abs()
     adds the frame's absolute offset back (abs = start_time_abs + (offset/1e9 -
-    video_pts)). Producer and both consumers (this and video/sync_video.py) must
-    keep using the same clock on both sides.
+    video_pts)).
 
     Drift correction is unavailable (only one anchor), so drift_corrected=False.
     """
-    video_start = float(start_time_abs) - float(video_pts)
+    from video.trimcrop import bookmark_latency
+    latency = bookmark_latency(host_before, host_after, start_time_abs)
+    video_start = (float(start_time_abs) + latency) - float(video_pts)
     return {
         'video_start_unix_s':    video_start,
         'sipper_in_hdf5_abs_s':  float(start_time_abs),
@@ -387,6 +394,7 @@ def alignment_from_bookmark(start_time_abs, video_pts):
         'drift_corrected':       False,
         'step_magnitude':        None,
         'removal_magnitude':     None,
+        'bookmark_latency_s':    latency,
         'method':                'bookmark',
     }
 

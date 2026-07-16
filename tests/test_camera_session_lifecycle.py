@@ -118,3 +118,13 @@ def test_bookmark_index_and_pts_describe_same_frame(tmp_path):
     assert mark["frame_index"] == 2
     assert mark["pts"] == 3_000_000 / 1e9
     backend.stop_session()
+
+
+def test_bookmark_before_any_frame_raises(tmp_path):
+    # No frame yet -> no valid anchor. Must fail loudly, not return frame_index -1
+    # (which downstream reads as pts_ns[-1], anchoring the whole video wrong).
+    backend = _FakeBackend(output_dir=str(tmp_path))
+    backend.start_session("clip")
+    with pytest.raises(RuntimeError):
+        backend.bookmark(sensor_id=5)
+    backend.stop_session()

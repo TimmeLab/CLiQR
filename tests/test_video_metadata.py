@@ -60,3 +60,32 @@ def test_write_video_metadata_omits_latency_when_absent(tmp_path):
         assert "video_pi_monotonic" not in grp
         assert "video_bookmark_host_before" not in grp
         assert "video_bookmark_host_after" not in grp
+
+
+def test_write_video_metadata_writes_stop_bookmark_datasets(tmp_path):
+    # The Stop bookmark is the second clock anchor: its frame/pts + host bracket
+    # let the video<->cap clock-rate drift be fit across the session.
+    rec, serial, sensor_id = _make_recorder(tmp_path)
+    rec.write_video_metadata(
+        sensor_id=sensor_id, frame_index=10, pts=1.0, video_filename="v.mp4",
+        cycle=0,
+        stop_frame_index=200, stop_pts=5.0,
+        stop_host_before=1000.0, stop_host_after=1000.4)
+    with h5py.File(rec.filename, "r") as h5f:
+        grp = h5f[f"board_{serial}/sensor_{sensor_id}"]
+        assert int(grp["video_stop_frame_index"][()]) == 200
+        assert abs(grp["video_stop_pts"][()] - 5.0) < 1e-9
+        assert abs(grp["video_stop_bookmark_host_before"][()] - 1000.0) < 1e-9
+        assert abs(grp["video_stop_bookmark_host_after"][()] - 1000.4) < 1e-9
+
+
+def test_write_video_metadata_omits_stop_datasets_when_none(tmp_path):
+    rec, serial, sensor_id = _make_recorder(tmp_path)
+    rec.write_video_metadata(sensor_id=sensor_id, frame_index=10, pts=1.0,
+                             video_filename="v.mp4", cycle=0)
+    with h5py.File(rec.filename, "r") as h5f:
+        grp = h5f[f"board_{serial}/sensor_{sensor_id}"]
+        assert "video_stop_frame_index" not in grp
+        assert "video_stop_pts" not in grp
+        assert "video_stop_bookmark_host_before" not in grp
+        assert "video_stop_bookmark_host_after" not in grp

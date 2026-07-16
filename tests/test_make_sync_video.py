@@ -52,19 +52,21 @@ def test_nearest_index_interior_and_clamp():
 def test_frame_session_times_and_trim_frames():
     # frames every 0.1 s; bookmark frame 2 -> session zero
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)  # 0.0 .. 1.0 s
-    vb = msv.compute_video_base(pts_ns, 2)  # 0.2 s
-    sess = msv.frame_session_times(pts_ns, vb)
+    clock = msv.SessionClock(pts_start_sec=float(pts_ns[2]) / 1e9,
+                             latency=0.0, slope=1.0)
+    sess = msv.frame_session_times(clock, pts_ns)
     assert sess[2] == pytest.approx(0.0)
     assert sess[0] == pytest.approx(-0.2)
     # session 0 at frame 2, session 0.5 at frame 7
-    sf, ef = msv.compute_trim_frames(pts_ns, vb, 0.0, 0.5)
+    sf, ef = msv.compute_trim_frames(clock, pts_ns, 0.0, 0.5)
     assert sf == 2 and ef == 7
 
 
 def test_compute_trim_frames_empty_window_raises():
     pts_ns = (np.arange(0, 5) * 100_000_000).astype(np.int64)
+    clock = msv.SessionClock(pts_start_sec=0.0, latency=0.0, slope=1.0)
     with pytest.raises(ValueError):
-        msv.compute_trim_frames(pts_ns, 0.0, 100.0, 200.0)
+        msv.compute_trim_frames(clock, pts_ns, 100.0, 200.0)
 
 
 import os
@@ -95,13 +97,15 @@ def test_load_recording_reference():
     assert rec.lick_indices.size == rec.lick_times.size
     assert rec.lick_indices.max() < rec.cap.size
     assert np.allclose(rec.lick_vals, rec.cap[rec.lick_indices])
-    # sync fields populated; video_base ~ 32 s for this recording
-    assert rec.video_base == pytest.approx(31.97, abs=0.1)
+    # sync fields populated; bookmark frame PTS ~ 32 s for this recording
+    assert rec.clock.pts_start_sec == pytest.approx(31.97, abs=0.1)
     assert rec.session_duration > 3600
     # PTS sidecar retained for trim/crop + per-frame timing
     assert rec.pts_ns.size > 1000
-    # this recording predates bookmark-latency recording -> no correction
-    assert rec.bookmark_latency == 0.0
+    # this recording predates the latency bracket AND the stop bookmark ->
+    # no latency correction and no drift correction
+    assert rec.clock.latency == 0.0
+    assert rec.clock.slope == 1.0
 
 
 needs_video = pytest.mark.skipif(
@@ -114,7 +118,7 @@ needs_video = pytest.mark.skipif(
 def test_trim_and_crop_and_frame_source(tmp_path):
     import imageio
     rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
-    sf, ef = msv.compute_trim_frames(rec.pts_ns, rec.video_base, 120.0, 123.0)
+    sf, ef = msv.compute_trim_frames(rec.clock, rec.pts_ns, 120.0, 123.0)
     start_sec = float(rec.pts_ns[sf] - rec.pts_ns[0]) / 1e9
     end_sec = float(rec.pts_ns[ef] - rec.pts_ns[0]) / 1e9 + 0.3
     out = str(tmp_path / "trim.mp4")
@@ -125,7 +129,7 @@ def test_trim_and_crop_and_frame_source(tmp_path):
     r.close()
     assert size == (360, 360)  # (width, height)
 
-    frame_sess = msv.probe_frame_session_times(out, rec.video_base)
+    frame_sess = msv.probe_frame_session_times(out, rec.clock)
     assert frame_sess[0] <= 120.0 and frame_sess[-1] >= 123.0
     assert np.all(np.diff(frame_sess) >= 0)  # monotonic
 
@@ -145,7 +149,7 @@ def test_subclip_copy_lands_on_a_cropped_file(tmp_path):
     """A cropped file's PTS start at the session start, not 0. Stream-copying a
     window out of it must still cover that window."""
     rec = msv.load_recording(H5, LAYOUT, PTS, VIDEO, msv.read_video_anchor(H5))
-    sf, ef = msv.compute_trim_frames(rec.pts_ns, rec.video_base, 120.0, 130.0)
+    sf, ef = msv.compute_trim_frames(rec.clock, rec.pts_ns, 120.0, 130.0)
     start_sec = float(rec.pts_ns[sf] - rec.pts_ns[0]) / 1e9
     end_sec = float(rec.pts_ns[ef] - rec.pts_ns[0]) / 1e9 + 0.3
     cropped = str(tmp_path / "cropped.mp4")
@@ -154,7 +158,7 @@ def test_subclip_copy_lands_on_a_cropped_file(tmp_path):
 
     sub = str(tmp_path / "sub.mp4")
     msv.subclip_copy(cropped, start_sec + 2.0, start_sec + 5.0, sub)
-    sess = msv.probe_frame_session_times(sub, rec.video_base)
+    sess = msv.probe_frame_session_times(sub, rec.clock)
     assert sess.size > 0
     assert sess[0] <= 122.0 and sess[-1] >= 124.0
 
@@ -173,15 +177,16 @@ def test_trimmed_frame_source_decode_matches_pts(tmp_path):
     with h5py.File(H5, "r") as f:
         board, sensor, _ = msv.find_video_sensor(f)
         fi = int(f[board][sensor]["video_frame_index"][()])
-    video_base = msv.compute_video_base(pts_ns, fi)
+    clock = msv.SessionClock(pts_start_sec=msv.compute_video_base(pts_ns, fi),
+                             latency=0.0, slope=1.0)
     # a long-ish window so any per-frame slip accumulates past rounding
-    sf, ef = msv.compute_trim_frames(pts_ns, video_base, 100.0, 160.0)
+    sf, ef = msv.compute_trim_frames(clock, pts_ns, 100.0, 160.0)
     start_sec = float(pts_ns[sf] - pts_ns[0]) / 1e9
     end_sec = float(pts_ns[ef] - pts_ns[0]) / 1e9 + 0.3
     out = str(tmp_path / "long.mp4")
     msv.trim_and_crop(VIDEO, start_sec, end_sec, out, 452, 180, 360)
 
-    frame_sess = msv.probe_frame_session_times(out, video_base)
+    frame_sess = msv.probe_frame_session_times(out, clock)
     src = msv.TrimmedFrameSource(out, frame_sess)
     decoded = 0
     try:
@@ -265,20 +270,24 @@ def test_resolve_paths_defaults_from_h5():
     assert os.path.dirname(video) == os.path.dirname(H5)
 
 
-def _synthetic_rec(pts_ns, video_base, latency, n=3):
+def _synthetic_rec(pts_ns, video_base, latency, n=3, slope=1.0):
     """A Recording carrying only what clip_trim_window reads. ``n`` widens
     cap/time (default 3, matching the original clip_trim_window-only callers)
-    for callers that need a renderable trace panel, e.g. render_clip."""
+    for callers that need a renderable trace panel, e.g. render_clip.
+
+    ``video_base`` is the bookmark frame's PTS in seconds (== pts_start_sec here,
+    since these synthetic pts_ns start at 0)."""
     if n == 3:
         cap, time = np.zeros(3), np.zeros(3)
     else:
         time = np.linspace(0.0, 5.0, n)
         cap = np.sin(time)
+    clock = msv.SessionClock(pts_start_sec=video_base, latency=latency, slope=slope)
     return msv.Recording(
         animal="X", sensor=1, cap=cap, time=time,
         lick_times=np.array([]), lick_indices=np.array([], dtype=int),
-        lick_vals=np.array([]), video_base=video_base, video_path="v.mp4",
-        session_duration=10.0, pts_ns=pts_ns, bookmark_latency=latency,
+        lick_vals=np.array([]), clock=clock, video_path="v.mp4",
+        session_duration=10.0, pts_ns=pts_ns,
     )
 
 
@@ -294,12 +303,10 @@ def test_clip_trim_window_applies_bookmark_latency():
     vb = msv.compute_video_base(pts_ns, 2)  # 0.2
     plain = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.0), 0.0, 0.3)
     assert plain[0] == 2 and plain[2] == pytest.approx(0.2)
-    assert plain[4] == pytest.approx(vb)   # video_base_eff, latency 0.0
     shifted = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.25), 0.0, 0.3)
     assert shifted[0] == 0
     assert shifted[0] < plain[0]           # earlier start frame
     assert shifted[2] < plain[2]           # earlier start second
-    assert shifted[4] == pytest.approx(vb - 0.25)  # video_base_eff, latency 0.25
 
 
 def test_clip_trim_window_matches_crop_window():
@@ -328,14 +335,12 @@ def test_clip_trim_window_matches_crop_window():
 
 def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path, monkeypatch):
     """Regression guard for the one anchor bug the reference recording (latency
-    0.0) can never catch: if render_clip's probe_frame_session_times call used
-    the raw rec.video_base instead of the latency-corrected video_base_eff, the
-    trim WINDOW would still be right (clip_trim_window handles that), but every
-    frame's session LABEL would be `latency` seconds early, so src.get(tau)
-    would return the frame captured at tau + latency — video running ahead of
-    the trace by exactly the bookmark latency. All 72 other tests stay green
-    under that regression; only this one, driven with a nonzero latency, sees
-    it.
+    0.0) can never catch: if render_clip's probe_frame_session_times call used a
+    clock without the latency, the trim WINDOW would still be right
+    (clip_trim_window handles that), but every frame's session LABEL would be
+    `latency` seconds early, so src.get(tau) would return the frame captured at
+    tau + latency — video running ahead of the trace by exactly the bookmark
+    latency. render_clip must hand probe the SAME rec.clock (latency inside it).
     """
     pts_ns = (np.arange(0, 41) * 100_000_000).astype(np.int64)  # 0.0..4.0 s
     vb = msv.compute_video_base(pts_ns, 2)  # 0.2
@@ -347,8 +352,8 @@ def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path
     def fake_subclip_copy(video_path, start_sec, end_sec, out_path, *a, **kw):
         return out_path
 
-    def fake_probe(path, video_base):
-        recorded["video_base"] = video_base
+    def fake_probe(path, clock):
+        recorded["clock"] = clock
         return np.linspace(0.0, 0.3, 5)
 
     class FakeSource:
@@ -368,6 +373,8 @@ def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path
     out = str(tmp_path / "clip.mp4")
     msv.render_clip(rec, 0.0, 0.2, out, fps=5.0)
 
-    assert "video_base" in recorded
-    assert recorded["video_base"] == pytest.approx(vb - latency)
-    assert recorded["video_base"] != pytest.approx(vb)
+    assert "clock" in recorded
+    # the clock carries the latency (bookmark frame at τ=latency), so the probe
+    # labels frames correctly; a latency-less clock would be the regression.
+    assert recorded["clock"].latency == pytest.approx(latency)
+    assert recorded["clock"].pts_start_sec == pytest.approx(vb)
