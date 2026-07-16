@@ -16,14 +16,25 @@ def test_compute_video_base():
     assert tc.compute_video_base(pts_ns, 2) == pytest.approx(0.25)
 
 
-def test_bookmark_latency_from_bracket():
-    assert tc.bookmark_latency(1000.0, 1000.2, 998.0) == pytest.approx(2.1)
-    assert tc.bookmark_latency(999.9, 1000.1, 1000.0) == pytest.approx(0.0)
+def test_bookmark_latency_is_end_of_bracket_not_midpoint():
+    # The frame is grabbed when bookmark() RUNS on the Pi -- at the end of the
+    # host round-trip (~host_after), not its midpoint: the round-trip delay is
+    # Pi-side (the call blocks while the camera keeps capturing). So the lag is
+    # host_after - start_time, independent of host_before.
+    assert tc.bookmark_latency(1000.2, 998.0) == pytest.approx(2.2)
+
+
+def test_bookmark_latency_subtracts_pi_capture_gap():
+    # pi_monotonic (bookmark exec) and pts (grabbed frame) share the Pi clock;
+    # their difference is how long before exec the frame was captured, and is
+    # backed off host_after: latency = (host_after - start) - (pi_monotonic - pts).
+    assert tc.bookmark_latency(1000.2, 998.0, pi_monotonic=500.05, pts=500.0) \
+        == pytest.approx(2.15)
 
 
 def test_bookmark_latency_missing_is_zero():
-    assert tc.bookmark_latency(None, None, 1000.0) == 0.0
-    assert tc.bookmark_latency(1000.0, None, 998.0) == 0.0
+    assert tc.bookmark_latency(None, 1000.0) == 0.0
+    assert tc.bookmark_latency(None, 998.0, pi_monotonic=1.0, pts=0.9) == 0.0
 
 
 def test_frame_session_times_and_trim_frames():
@@ -163,7 +174,7 @@ def test_read_video_anchor(tmp_path):
     assert a.video_filename == "vid.mp4"   # decoded, not bytes
     assert a.video_frame_index == 42
     assert a.session_duration == pytest.approx(65.0)
-    assert a.latency == pytest.approx(1.2)  # (111.0 + 111.4)/2 - 110.0
+    assert a.latency == pytest.approx(1.4)  # host_after - start = 111.4 - 110.0
 
 
 def test_read_video_anchor_multi_cycle_uses_matching_cycle(tmp_path):
@@ -185,7 +196,7 @@ def test_read_video_anchor_multi_cycle_uses_matching_cycle(tmp_path):
     a = tc.read_video_anchor(str(p))
     assert a.video_frame_index == 900
     assert a.session_duration == pytest.approx(50.0)  # 260 - 210
-    assert a.latency == pytest.approx(0.7)  # (210.5 + 210.9)/2 - 210.0
+    assert a.latency == pytest.approx(0.9)  # host_after - start = 210.9 - 210.0
 
 
 def test_read_video_anchor_without_host_bracket(tmp_path):
@@ -211,16 +222,36 @@ def test_session_clock_slope1_is_offset_only():
 
 
 def test_drift_slope_recovers_known_skew():
-    # Video clock runs slightly slow vs host -> slope = host-s per video-s.
+    # Video clock runs slightly slow vs host -> slope = host-s per video-s. The
+    # slope uses each bookmark's END-of-bracket host time (host_after), not the
+    # midpoint, mirroring bookmark_latency.
     slope_true = 1.0 / 1.001
     pts_ns = (np.arange(0, 1000) * 1_000_000).astype(np.int64)  # 0..0.999 s
     anchor = tc.VideoAnchor(
         sensor_number=1, video_filename="v.mp4", video_frame_index=0,
         start_time=1000.0, stop_time=1001.0,
-        host_before=1000.0, host_after=1000.0,            # mid_start = 1000.0
+        host_before=999.9, host_after=1000.0,             # start frame host = 1000.0
         stop_frame_index=999,
-        stop_host_before=1000.0 + 0.999 * slope_true,
-        stop_host_after=1000.0 + 0.999 * slope_true)      # mid_stop
+        stop_host_before=1000.0 + 0.999 * slope_true - 0.1,
+        stop_host_after=1000.0 + 0.999 * slope_true)      # stop frame host
+    assert anchor.drift_slope(pts_ns) == pytest.approx(slope_true, rel=1e-6)
+
+
+def test_drift_slope_subtracts_pi_capture_gap_per_anchor():
+    # Each anchor's true frame-host time is host_after - (pi_monotonic - pts).
+    # Equal gaps at both ends cancel in the slope; a difference tilts it.
+    slope_true = 1.0 / 1.001
+    pts_ns = (np.arange(0, 1000) * 1_000_000).astype(np.int64)
+    host_start = 1000.0
+    host_stop = 1000.0 + 0.999 * slope_true
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=0,
+        start_time=1000.0, stop_time=1001.0,
+        host_before=999.0, host_after=host_start + 0.02,
+        pi_monotonic=500.02, video_pts=500.0,             # gap 0.02 -> frame host = host_start
+        stop_frame_index=999,
+        stop_host_before=host_stop, stop_host_after=host_stop + 0.02,
+        stop_pi_monotonic=600.02, stop_pts=600.0)         # gap 0.02 -> frame host = host_stop
     assert anchor.drift_slope(pts_ns) == pytest.approx(slope_true, rel=1e-6)
 
 
@@ -238,10 +269,10 @@ def test_session_clock_builder_reads_anchor():
     anchor = tc.VideoAnchor(
         sensor_number=1, video_filename="v.mp4", video_frame_index=2,
         start_time=110.0, stop_time=175.0,
-        host_before=110.1, host_after=110.3)  # latency 0.2, no stop -> slope 1
+        host_before=110.1, host_after=110.3)  # latency = after-start = 0.3, no stop -> slope 1
     clock = tc.session_clock(anchor, pts_ns)
     assert clock.pts_start_sec == pytest.approx(0.2)
-    assert clock.latency == pytest.approx(0.2)
+    assert clock.latency == pytest.approx(0.3)
     assert clock.slope == 1.0
 
 

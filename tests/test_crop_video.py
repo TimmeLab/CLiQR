@@ -27,25 +27,23 @@ def test_compute_crop_window_spans_the_session():
 
 
 def test_compute_crop_window_applies_bookmark_latency():
-    """The bookmarked frame was captured mid-round-trip, so raw frame session
-    times run early (the video leads the trace). Correcting for it shifts every
-    frame's session label LATER, so the same session window resolves to EARLIER
-    frames in the file.
+    """The bookmarked frame was captured at the END of the round-trip (~host_after),
+    so raw frame session times run early (the video leads the trace). Correcting
+    for it shifts every frame's session label LATER, so the same session window
+    resolves to EARLIER frames in the file.
 
-    The bracket is chosen so the latency is exactly representable in binary
-    (0.25). Values like 0.2 are not: (110.1+110.3)/2 - 110.0 evaluates to
-    0.19999999999998863, which leaves video_base_eff a hair ABOVE zero, and the
-    `sess >= start` test in compute_trim_frames then drops frame 0 on an
-    epsilon. That knife-edge would make this test assert floating-point noise
-    rather than the behavior it is here to pin down.
+    host_after is chosen so the latency is exactly representable in binary (0.25)
+    AND lands frame 0 inside the 0.3 s window: latency = host_after - start_time
+    must sit in [0.2, 0.5] for this pts grid, and 0.2 itself is not exactly
+    representable, so 0.25 keeps the `sess >= start` edge off a float knife-edge.
     """
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
     plain = cv.compute_crop_window(_anchor(frame_index=2, start=110.0, stop=110.3), pts_ns)
     assert plain[0] == 2 and plain[2] == pytest.approx(0.2)
-    # bracket midpoint 0.25 s after start_time -> latency 0.25 (exact)
+    # host_after 0.25 s after start_time -> latency 0.25 (exact)
     shifted = cv.compute_crop_window(
         _anchor(frame_index=2, start=110.0, stop=110.3,
-                host_before=110.0, host_after=110.5), pts_ns)
+                host_before=110.0, host_after=110.25), pts_ns)
     assert shifted[0] == 0
     assert shifted[0] < plain[0]           # earlier start frame
     assert shifted[2] < plain[2]           # earlier start second

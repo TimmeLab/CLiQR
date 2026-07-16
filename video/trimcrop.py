@@ -77,14 +77,31 @@ def compute_video_base(pts_ns, frame_index):
     return float(pts_ns[frame_index] - pts_ns[0]) / 1e9
 
 
-def bookmark_latency(host_before, host_after, start_time):
-    """Seconds the bookmark round-trip lagged ``start_time``: the bookmarked frame
-    was captured mid-round-trip (~midpoint of the host bracket), so the video
-    leads the trace by this much and every frame's session time must be shifted
-    later by it. Returns 0.0 when the bracket wasn't recorded (older recordings)."""
-    if host_before is None or host_after is None:
+def _frame_host_time(host_after, pi_monotonic=None, pts=None):
+    """Host wall-clock time the bookmarked frame was captured.
+
+    ``bookmark()`` reads the most-recent frame when it RUNS on the Pi, which is at
+    the END of the host round-trip (~``host_after``), not its midpoint: the
+    round-trip delay is Pi-side (the call sits blocked/queued while the camera
+    keeps capturing), so a midpoint assumption undercounts the lag by ~half the
+    round-trip. ``pi_monotonic`` (Pi clock at bookmark exec) and ``pts`` (the
+    grabbed frame's SensorTimestamp) share the Pi clock, so their difference is
+    how long before exec the frame was captured; back that off ``host_after``.
+    The only unmodelled term is the Pi->host response one-way latency (~ms).
+    When the Pi clocks aren't recorded the gap is dropped (frame == host_after)."""
+    gap = 0.0 if (pi_monotonic is None or pts is None) \
+        else float(pi_monotonic) - float(pts)
+    return float(host_after) - gap
+
+
+def bookmark_latency(host_after, start_time, pi_monotonic=None, pts=None):
+    """Seconds the bookmarked frame lagged ``start_time`` -- the amount the video
+    leads the trace, which every frame's session time must be shifted later by.
+    The frame's host time is ``_frame_host_time`` (end of the round-trip, not its
+    midpoint). Returns 0.0 when ``host_after`` wasn't recorded (older recordings)."""
+    if host_after is None:
         return 0.0
-    return (float(host_before) + float(host_after)) / 2.0 - float(start_time)
+    return _frame_host_time(host_after, pi_monotonic, pts) - float(start_time)
 
 
 @dataclass
@@ -198,9 +215,13 @@ class VideoAnchor:
     stop_time: float
     host_before: float | None
     host_after: float | None
+    pi_monotonic: float | None = None
+    video_pts: float | None = None
     stop_frame_index: int | None = None
     stop_host_before: float | None = None
     stop_host_after: float | None = None
+    stop_pi_monotonic: float | None = None
+    stop_pts: float | None = None
 
     @property
     def session_duration(self):
@@ -208,13 +229,16 @@ class VideoAnchor:
 
     @property
     def latency(self):
-        return bookmark_latency(self.host_before, self.host_after, self.start_time)
+        return bookmark_latency(self.host_after, self.start_time,
+                                self.pi_monotonic, self.video_pts)
 
     def drift_slope(self, pts_ns) -> float:
         """host-seconds per video-second from the two bookmarks; 1.0 when the Stop
-        bookmark (or the Start host bracket) is absent, or the fit is degenerate."""
-        if (self.stop_frame_index is None or self.stop_host_before is None
-                or self.stop_host_after is None or self.host_before is None
+        bookmark (or the Start host bracket) is absent, or the fit is degenerate.
+
+        Both endpoints use each bookmark's END-of-bracket host time (host_after,
+        backed off the Pi capture->exec gap), mirroring ``bookmark_latency``."""
+        if (self.stop_frame_index is None or self.stop_host_after is None
                 or self.host_after is None):
             return 1.0
         pts_ns = np.asarray(pts_ns)
@@ -222,9 +246,11 @@ class VideoAnchor:
         pts_stop = float(pts_ns[self.stop_frame_index]) / 1e9
         if pts_stop == pts_start:
             return 1.0
-        mid_start = (self.host_before + self.host_after) / 2.0
-        mid_stop = (self.stop_host_before + self.stop_host_after) / 2.0
-        return (mid_stop - mid_start) / (pts_stop - pts_start)
+        host_start = _frame_host_time(self.host_after, self.pi_monotonic,
+                                      self.video_pts)
+        host_stop = _frame_host_time(self.stop_host_after, self.stop_pi_monotonic,
+                                     self.stop_pts)
+        return (host_stop - host_start) / (pts_stop - pts_start)
 
 
 def read_video_anchor(h5_path):
@@ -244,25 +270,33 @@ def read_video_anchor(h5_path):
         fname = fname.decode() if isinstance(fname, bytes) else str(fname)
         before_key = f"video_bookmark_host_before{suffix}"
         after_key = f"video_bookmark_host_after{suffix}"
+        mono_key = f"video_pi_monotonic{suffix}"
+        pts_key = f"video_pts{suffix}"
         stop_idx_key = f"video_stop_frame_index{suffix}"
         stop_before_key = f"video_stop_bookmark_host_before{suffix}"
         stop_after_key = f"video_stop_bookmark_host_after{suffix}"
+        stop_mono_key = f"video_stop_pi_monotonic{suffix}"
+        stop_pts_key = f"video_stop_pts{suffix}"
+
+        def num(key):
+            return float(group[key][()]) if key in group else None
+
         return VideoAnchor(
             sensor_number=sensor_number,
             video_filename=fname,
             video_frame_index=int(group[f"video_frame_index{suffix}"][()]),
             start_time=start_time,
             stop_time=stop_time,
-            host_before=(float(group[before_key][()])
-                         if before_key in group else None),
-            host_after=(float(group[after_key][()])
-                        if after_key in group else None),
+            host_before=num(before_key),
+            host_after=num(after_key),
+            pi_monotonic=num(mono_key),
+            video_pts=num(pts_key),
             stop_frame_index=(int(group[stop_idx_key][()])
                               if stop_idx_key in group else None),
-            stop_host_before=(float(group[stop_before_key][()])
-                              if stop_before_key in group else None),
-            stop_host_after=(float(group[stop_after_key][()])
-                             if stop_after_key in group else None),
+            stop_host_before=num(stop_before_key),
+            stop_host_after=num(stop_after_key),
+            stop_pi_monotonic=num(stop_mono_key),
+            stop_pts=num(stop_pts_key),
         )
 
 

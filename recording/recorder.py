@@ -252,7 +252,8 @@ class SensorRecorder:
                              pi_monotonic=None, host_time_before=None,
                              host_time_after=None,
                              stop_frame_index=None, stop_pts=None,
-                             stop_host_before=None, stop_host_after=None):
+                             stop_host_before=None, stop_host_after=None,
+                             stop_pi_monotonic=None):
         """Write video bookmark metadata for a sensor's recording cycle.
 
         Datasets mirror the start_time cycle-suffix convention:
@@ -261,10 +262,11 @@ class SensorRecorder:
         ``pi_monotonic`` (Pi clock at bookmark) and ``host_time_before`` /
         ``host_time_after`` (host wall-clock bracketing the bookmark round-trip)
         record the bookmark latency so the video<->trace anchor can be corrected
-        post-hoc without a manual offset: the bookmarked frame's true host time
-        is ~midpoint(before, after), and its offset from ``start_time`` is the
-        latency the video panel would otherwise lead the trace by. Any of these
-        left None (older callers) is simply not written.
+        post-hoc without a manual offset: the bookmarked frame's true host time is
+        ~``host_after`` (bookmark() runs at the END of the Pi round-trip), backed
+        off the Pi capture->exec gap ``pi_monotonic - pts``; its offset from
+        ``start_time`` is the latency the video panel would otherwise lead the
+        trace by. Any of these left None (older callers) is simply not written.
 
         The ``stop_*`` fields record the Stop bookmark — a second clock anchor at
         the end of the cycle — so the video<->cap clock-rate drift can be fit as a
@@ -289,6 +291,7 @@ class SensorRecorder:
                 (f"video_bookmark_host_after{suffix}", host_time_after),
                 (f"video_stop_frame_index{suffix}", stop_frame_index),
                 (f"video_stop_pts{suffix}", stop_pts),
+                (f"video_stop_pi_monotonic{suffix}", stop_pi_monotonic),
                 (f"video_stop_bookmark_host_before{suffix}", stop_host_before),
                 (f"video_stop_bookmark_host_after{suffix}", stop_host_after),
             ):

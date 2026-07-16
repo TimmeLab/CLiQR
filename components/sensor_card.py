@@ -137,6 +137,7 @@ def bookmark_stop(sensor_id: int, cycle: int):
                     sensor_id=sensor_id, cycle=cycle,
                     stop_frame_index=resp.get("frame_index"),
                     stop_pts=resp.get("pts"),
+                    stop_pi_monotonic=resp.get("pi_monotonic"),
                     stop_host_before=host_before,
                     stop_host_after=host_after,
                 )

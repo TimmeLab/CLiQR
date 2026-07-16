@@ -10,17 +10,18 @@ def test_compute_video_base():
     assert msv.compute_video_base(pts_ns, 2) == pytest.approx(0.25)
 
 
-def test_bookmark_latency_from_bracket():
-    # frame's true host time ~ midpoint of the round-trip bracket; its offset
-    # from start_time is the latency the video would otherwise lead the trace by.
-    assert msv.bookmark_latency(1000.0, 1000.2, 998.0) == pytest.approx(2.1)
-    # symmetric bracket around start -> ~0
-    assert msv.bookmark_latency(999.9, 1000.1, 1000.0) == pytest.approx(0.0)
+def test_bookmark_latency_from_end_of_bracket():
+    # frame's true host time ~ host_after (bookmark runs at the END of the Pi
+    # round-trip); its offset from start_time is the latency the video would
+    # otherwise lead the trace by, backed off the Pi capture->exec gap.
+    assert msv.bookmark_latency(1000.2, 998.0) == pytest.approx(2.2)
+    assert msv.bookmark_latency(1000.2, 998.0, pi_monotonic=500.05, pts=500.0) \
+        == pytest.approx(2.15)
 
 
 def test_bookmark_latency_missing_is_zero():
-    assert msv.bookmark_latency(None, None, 1000.0) == 0.0
-    assert msv.bookmark_latency(1000.0, None, 998.0) == 0.0
+    assert msv.bookmark_latency(None, 1000.0) == 0.0
+    assert msv.bookmark_latency(None, 998.0, pi_monotonic=1.0, pts=0.9) == 0.0
 
 
 def test_n_output_frames():
@@ -323,7 +324,7 @@ def test_clip_trim_window_matches_crop_window():
     anchor = VideoAnchor(
         sensor_number=1, video_filename="v.mp4", video_frame_index=2,
         start_time=110.0, stop_time=110.3,
-        host_before=110.0, host_after=110.5,   # latency exactly 0.25
+        host_before=110.0, host_after=110.25,  # latency = after-start = 0.25 (exact)
     )
     assert anchor.latency == pytest.approx(0.25)
     vb = msv.compute_video_base(pts_ns, anchor.video_frame_index)

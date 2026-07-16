@@ -357,7 +357,8 @@ def detect_sipper_step(cap_data, time_data, t_min, t_max, direction='down',
 
 
 def alignment_from_bookmark(start_time_abs, video_pts,
-                            host_before=None, host_after=None):
+                            host_before=None, host_after=None,
+                            pi_monotonic=None):
     """Build an alignment from a CLiQR video bookmark (frame PTS at the Start click).
 
     The recording GUI records, at the sensor Start click, the Unix start_time and
@@ -367,12 +368,15 @@ def alignment_from_bookmark(start_time_abs, video_pts,
     Bookmark-latency correction: the bookmarked frame was NOT captured at
     start_time. Start_time is stamped on the host, then the bookmark is a wireless
     round-trip to the Pi, which returns whatever frame it had captured by the time
-    it handled the request — ~L seconds after start_time (L = one-way latency).
-    Its true host time is ~midpoint(host_before, host_after), so:
+    it RAN the request — at the END of the round-trip (~host_after), not its
+    midpoint, because the round-trip delay is Pi-side (the call blocks while the
+    camera keeps capturing). So:
         video_start_unix_s = (start_time_abs + L) - video_pts
-    with L from the shared trimcrop.bookmark_latency formula (0.0 when the host
-    bracket wasn't recorded — older recordings). Without this correction the video
-    panel leads the trace by L (~2.5 s on the reference wireless link); see
+    with L from the shared trimcrop.bookmark_latency formula (0.0 when host_after
+    wasn't recorded — older recordings). Passing ``pi_monotonic`` (the Pi clock at
+    bookmark exec) backs off the capture->exec gap ``pi_monotonic - video_pts``
+    (both on the SensorTimestamp clock). Without this correction the video panel
+    leads the trace by L (~2.5 s on the reference wireless link); see
     docs/video-sync-alignment-bugs.md.
 
     NOTE: video_pts is stored in the SensorTimestamp clock (seconds), the SAME
@@ -384,7 +388,8 @@ def alignment_from_bookmark(start_time_abs, video_pts,
     Drift correction is unavailable (only one anchor), so drift_corrected=False.
     """
     from video.trimcrop import bookmark_latency
-    latency = bookmark_latency(host_before, host_after, start_time_abs)
+    latency = bookmark_latency(host_after, start_time_abs,
+                               pi_monotonic=pi_monotonic, pts=video_pts)
     video_start = (float(start_time_abs) + latency) - float(video_pts)
     return {
         'video_start_unix_s':    video_start,
