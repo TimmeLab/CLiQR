@@ -58,6 +58,133 @@ def test_bookmark_written_on_sensor_start(tmp_path):
     sc.camera_client = None
 
 
+class _FakeBookmarkClient:
+    """Minimal camera client that answers BOOKMARK; records call order."""
+    def __init__(self, frame_index=900, pts=5.0, log=None):
+        self._fi = frame_index
+        self._pts = pts
+        self._log = log
+
+    def bookmark(self, sensor_id):
+        if self._log is not None:
+            self._log.append("bookmark")
+        return {"ok": True, "frame_index": self._fi, "pts": self._pts,
+                "pi_monotonic": 1.0}
+
+
+def test_bookmark_stop_writes_stop_datasets(tmp_path):
+    serial = next(iter(SERIAL_NUMBER_SENSOR_MAP))
+    sensor_id = SERIAL_NUMBER_SENSOR_MAP[serial][0]
+    rec = SensorRecorder(mpr121_manager=None,
+                         filename=str(tmp_path / "raw.h5"),
+                         controllers={serial: object()})
+    rec.initialize_hdf5_file()
+    sc.current_recorder = rec
+
+    state.camera_enabled.set(True)
+    state.camera_sensor_id.set(sensor_id)
+    sc.camera_client = _FakeBookmarkClient(frame_index=900, pts=5.0)
+
+    thread = scard.bookmark_stop(sensor_id, 0)
+    assert thread is not None
+    thread.join(5.0)
+
+    with h5py.File(rec.filename, "r") as h5f:
+        grp = h5f[f"board_{serial}/sensor_{sensor_id}"]
+        assert grp["video_stop_frame_index"][()] == 900
+        assert abs(grp["video_stop_pts"][()] - 5.0) < 1e-9
+        assert "video_stop_bookmark_host_before" in grp
+        assert "video_stop_bookmark_host_after" in grp
+
+    state.camera_enabled.set(False)
+    state.camera_sensor_id.set(None)
+    sc.current_recorder = None
+    sc.camera_client = None
+
+
+def test_bookmark_stop_none_for_non_camera_sensor():
+    serial = next(iter(SERIAL_NUMBER_SENSOR_MAP))
+    cam_sensor, other = SERIAL_NUMBER_SENSOR_MAP[serial][:2]
+    state.camera_enabled.set(True)
+    state.camera_sensor_id.set(cam_sensor)
+    sc.camera_client = _FakeBookmarkClient()
+    try:
+        assert scard.bookmark_stop(other, 0) is None
+    finally:
+        state.camera_enabled.set(False)
+        state.camera_sensor_id.set(None)
+        sc.camera_client = None
+
+
+class _OrderClient:
+    """Records bookmark/stop_session call order; bookmark is slow so a missing
+    join would let stop_session overtake it."""
+    def __init__(self, log):
+        self.log = log
+
+    def bookmark(self, sensor_id):
+        import time as _t
+        _t.sleep(0.05)
+        self.log.append("bookmark")
+        return {"ok": True, "frame_index": 900, "pts": 5.0, "pi_monotonic": 1.0}
+
+    def stop_session(self):
+        self.log.append("stop_session")
+        return {"ok": True, "files": []}
+
+    def fetch_files(self, names, out_dir):
+        return []
+
+
+def test_global_stop_bookmarks_before_stop_session(tmp_path):
+    """The Pi must be BOOKMARKED before it receives STOP_SESSION — afterwards
+    there is no active session to bookmark. stop_recording must join the stop-
+    bookmark thread before sending STOP_SESSION."""
+    from dataclasses import replace
+
+    serial = next(iter(SERIAL_NUMBER_SENSOR_MAP))
+    sensor_id = SERIAL_NUMBER_SENSOR_MAP[serial][0]
+    rec = SensorRecorder(mpr121_manager=None,
+                         filename=str(tmp_path / "raw.h5"),
+                         controllers={serial: object()})
+    rec.initialize_hdf5_file()
+    sc.current_recorder = rec
+    sc.recording_task = None
+
+    sensors = state.sensor_states.value.copy()
+    sensors[sensor_id] = replace(sensors[sensor_id], is_recording=True,
+                                 recording_cycle=0, start_time=1.0)
+    state.sensor_states.set(sensors)
+
+    state.camera_enabled.set(True)
+    state.camera_sensor_id.set(sensor_id)
+    state.camera_video_filename.set("clip.mp4")
+    state.recording_all.set(True)
+
+    log = []
+    sc.camera_client = _OrderClient(log)
+
+    sc.stop_recording()
+    thread = sc._last_camera_stop_thread
+    assert thread is not None
+    thread.join(5.0)
+
+    assert "bookmark" in log and "stop_session" in log
+    assert log.index("bookmark") < log.index("stop_session")
+
+    # Restore sensor lifecycle (stop_recording incremented recording_cycle) so
+    # later tests sharing this global state see a fresh cycle 0.
+    sensors = state.sensor_states.value.copy()
+    sensors[sensor_id] = replace(sensors[sensor_id], is_recording=False,
+                                 recording_cycle=0)
+    state.sensor_states.set(sensors)
+    state.camera_enabled.set(False)
+    state.camera_sensor_id.set(None)
+    state.recording_all.set(False)
+    sc.current_recorder = None
+    sc.camera_client = None
+
+
 def test_bookmark_does_not_block_the_caller(tmp_path):
     """The bookmark round-trip must run OFF the asyncio event loop: a synchronous
     bookmark here froze record_sensors for the whole round-trip, punching a

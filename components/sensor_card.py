@@ -109,6 +109,53 @@ def start_sensor(sensor_id: int):
     return bookmark_thread
 
 
+def bookmark_stop(sensor_id: int, cycle: int):
+    """Bookmark the video at the STOP of the camera sensor's cycle — the second
+    clock anchor for drift correction (see docs/superpowers/specs/
+    2026-07-16-clock-drift-stop-bookmark-design.md).
+
+    Mirrors start_sensor's bookmark: runs the wireless round-trip on a daemon
+    thread so stop never blocks, brackets it with host wall-clock, and writes the
+    stop datasets. Returns the thread (join-able), or None when this sensor isn't
+    the camera driver or no client/recorder is connected.
+    """
+    if not (state.camera_enabled.value and sensor_id == state.camera_sensor_id.value):
+        return None
+    from components import session_controls
+    client = session_controls.camera_client
+    recorder = session_controls.current_recorder
+    if client is None or recorder is None:
+        return None
+
+    def _bookmark():
+        try:
+            host_before = time_module.time()
+            resp = client.bookmark(sensor_id)
+            host_after = time_module.time()
+            if resp.get("ok"):
+                recorder.write_video_metadata(
+                    sensor_id=sensor_id, cycle=cycle,
+                    stop_frame_index=resp.get("frame_index"),
+                    stop_pts=resp.get("pts"),
+                    stop_host_before=host_before,
+                    stop_host_after=host_after,
+                )
+                state.add_log_message(
+                    f"Sensor {sensor_id}: video stop bookmark "
+                    f"frame={resp.get('frame_index')}")
+            else:
+                state.add_log_message(
+                    f"WARNING: Sensor {sensor_id}: stop bookmark failed: "
+                    f"{resp.get('error')}")
+        except Exception as exc:
+            state.add_log_message(
+                f"WARNING: Sensor {sensor_id}: stop bookmark error: {exc}")
+
+    thread = threading.Thread(target=_bookmark, daemon=True)
+    thread.start()
+    return thread
+
+
 def stop_sensor(sensor_id: int):
     """Stop recording for a specific sensor."""
     from components.session_controls import current_recorder
@@ -140,6 +187,10 @@ def stop_sensor(sensor_id: int):
             stop_time=time_module.time(),
             cycle=current_cycle
         )
+
+    # Stop bookmark for the camera sensor (drift-fit anchor). Camera is still
+    # active on an individual stop, so fire-and-forget like the start bookmark.
+    bookmark_stop(sensor_id, current_cycle)
 
     state.sensor_states.set(sensors)
 
