@@ -12,9 +12,12 @@ handler thread that dies after responding. We therefore funnel every backend
 call through a single long-lived worker thread so the camera lifecycle is
 owned by one persistent thread.
 """
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from video import protocol
+
+log = logging.getLogger(__name__)
 
 
 class CameraServer:
@@ -26,7 +29,16 @@ class CameraServer:
         self._camera = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera")
 
     def handle(self, request: dict) -> dict:
-        return self._camera.submit(self._handle, request).result()
+        # Every command is low-frequency (a handful per session), so logging
+        # all of them costs nothing and makes a failed session reconstructable.
+        # Without this a refused or failed START_SESSION left no trace at all.
+        cmd = request.get("cmd")
+        response = self._camera.submit(self._handle, request).result()
+        if response.get("ok"):
+            log.info("%s -> ok", cmd)
+        else:
+            log.warning("%s -> error: %s", cmd, response.get("error"))
+        return response
 
     def _handle(self, request: dict) -> dict:
         cmd = request.get("cmd")

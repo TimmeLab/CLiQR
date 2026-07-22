@@ -148,3 +148,14 @@ def test_fetch_large_file_coalesced_header_body(large_client, tmp_path):
 def test_ping_unreachable():
     # Nothing listening on this port -> graceful False, no exception.
     assert PiCameraClient("127.0.0.1", 1, timeout=0.2).ping() is False
+
+
+def test_connection_error_names_the_endpoint():
+    # 2026-07-22 logged only "[WinError 10061] ... actively refused it", which
+    # does not say which address was tried. The Pi has a wired link and a
+    # roaming wlan0 on a guest SSID; knowing the transport is most of the
+    # diagnosis.
+    resp = PiCameraClient("127.0.0.1", 1, timeout=0.2).bookmark(sensor_id=9)
+
+    assert resp["ok"] is False
+    assert "[127.0.0.1:1]" in resp["error"]

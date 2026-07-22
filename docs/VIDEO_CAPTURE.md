@@ -33,12 +33,43 @@ no camera-warmup slop.
 
 ## Running the Pi server
 
+Preferred — as a systemd service, so a dead server comes back by itself:
+
+```bash
+sudo cp pi/cliqr-camera.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cliqr-camera
+journalctl -u cliqr-camera -f
+```
+
+`Restart=always` matters: on 2026-07-22 the server accepted `START_SESSION` and
+was gone by the time `BOOKMARK` arrived (`[WinError 10061] ... actively refused
+it`), so the session ran with no video↔trace anchor at all. journald also
+captures output immediately, so it survives a hard death — a segfault or
+OOM-kill discards whatever is sitting in a block-buffered stdout, which is why
+the log came back empty.
+
+Manual alternative (same buffering fixes, no auto-restart):
+
 ```bash
 ./pi/run_server.sh --port 8770 --output-dir ~/cliqr_clips
 ```
 
 The wrapper redirects stdout/stderr to `~/cliqr_camera_server.log` (previous run
-kept as `.log.1`; override with `CLIQR_LOG`).
+kept as `.log.1`; override with `CLIQR_LOG`) and forces unbuffered output.
+
+**Unbuffered output is required, not cosmetic.** Python's stdout is block
+buffered (8 KB) when it points at a file rather than a tty —
+`sys.stdout.line_buffering` is `False` — so a plain `python -m … > log`
+writes *nothing* until the process exits or fills the buffer. The log looks
+empty precisely when you need it. The wrapper passes `-u`, exports
+`PYTHONUNBUFFERED=1`, and uses `stdbuf -oL -eL` when available (for
+picamera2's and libcamera's C/C++ writes to the same fds).
+
+The server logs one timestamped line per request (`START_SESSION -> ok`,
+`BOOKMARK -> error: …`), plus a `listening on …` line after the socket binds.
+**If `listening on …` is missing, the socket never came up** and every desktop
+attempt would have seen "connection refused".
 
 **Do not run `python -m pi.pi_camera_server` directly in an interactive
 terminal.** ffmpeg is a child process that inherits those handles. If the
@@ -104,6 +135,12 @@ A `.ffmpeg.log` is copied back to the desktop only if it is non-empty, so a
 healthy run still transfers exactly the two files it always did.
 
 ## Desktop usage
+
+The Start bookmark is the **only** thing tying frame numbers to session time, so
+the desktop retries it `BOOKMARK_ATTEMPTS` (3) times, 1 s apart, re-bracketing
+the host wall-clock on each attempt. If all attempts fail it logs an `ERROR`
+saying the video cannot be aligned — stop and restart the session rather than
+recording two hours of unusable video.
 
 1. In the Recording GUI, open the **Video Capture (Pi Camera)** card.
 2. Toggle **Enable concurrent video**.
@@ -178,9 +215,62 @@ alignment.
 - **Frame-offset `.txt` format and `video_pts` base:** The current backend writes absolute `SensorTimestamp` nanoseconds (no header) and reports absolute `video_pts` seconds. These must be changed to relative values (relative nanoseconds and relative seconds, respectively) to establish consistency with `false_positive_analysis.load_frame_offsets()` and `alignment_from_bookmark()`. This change is deferred pending on-device testing and validation on the Pi.
 - **picamera2 backend:** Not yet hardware-validated on production Pi systems. Initial testing on development hardware only.
 
+## Networking: the camera link must be wired
+
+Wifi on the Pi must stay off. The vivarium signal is weak, and on 2026-07-22
+wlan0 came back after a reboot, associated with the `UC_Guest` SSID, and roamed
+between two APs five times in fourteen minutes — tearing down DHCP on each roam
+(`dhcp4: restarting` → `state changed no lease`). A `BOOKMARK` was refused
+(`[WinError 10061]`) and the session lost its video↔trace anchor.
+
+An `rfkill` block or the raspi-config/desktop wifi toggle does **not** reliably
+survive a reboot. Disable the radio at the kernel level instead:
+
+```bash
+echo "dtoverlay=disable-wifi" | sudo tee -a /boot/firmware/config.txt
+sudo nmcli connection delete UC_Guest      # so nothing can re-associate
+sudo reboot
+```
+
+Verify — `wlan0` must be absent, not merely down:
+
+```bash
+ip link | grep -c wlan          # expect 0
+nmcli device status             # no wifi device
+dmesg | grep -i brcmf           # empty
+```
+
+The server logs its interfaces at startup and warns if any `wlan*`/`wlp*` is
+present, so a wifi regression shows up in the first lines of the log rather
+than after a lost run.
+
+With wifi gone the desktop must reach the Pi over the wired link. Check what it
+is bound to:
+
+```bash
+ip -brief addr show eth0
+ss -ltnp | grep 8770
+```
+
+If `eth0` has no DHCP server (direct cable to the recording PC), give both ends
+a static address rather than relying on link-local — the GUI's host field cannot
+carry an IPv6 zone index:
+
+```bash
+sudo nmcli connection modify "Wired connection 1" \
+     ipv4.method manual ipv4.addresses 192.168.50.2/24
+sudo nmcli connection up "Wired connection 1"
+```
+
+Then set the PC's adapter to `192.168.50.1/24` and enter `192.168.50.2` in the
+Video Capture card. `picamera0.local` works too if mDNS resolves reliably, but a
+static address has no resolution step to fail mid-session.
+
 ## Troubleshooting
 
-- **"✗ Not reachable":** verify the Pi server is running, host/IP is correct,
-  and the LAN allows the port. The session still records capacitively.
+- **"✗ Not reachable" or `[WinError 10061] ... actively refused it`:** the error
+  now names the endpoint it tried (`… [172.17.3.55:8770]`). If that is a wireless
+  address, see the networking section above. The session still records
+  capacitively either way.
 - **No video files copied:** they remain on the Pi under `--output-dir`; copy
   manually (`scp`).

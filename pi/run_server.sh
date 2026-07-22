@@ -26,4 +26,15 @@ fi
 
 cd "$REPO_DIR"
 echo "CLiQR camera server starting $(date -Is); logging to $LOG"
-exec python -m pi.pi_camera_server "$@" >>"$LOG" 2>&1
+
+# Unbuffered output is mandatory, not a nicety. Python's stdout is block
+# buffered (8 KB) when it is a file rather than a tty -- sys.stdout.line_buffering
+# is False -- so a server redirected to a log writes NOTHING until it exits or
+# fills the buffer. The log looks empty exactly when you need it. `-u` and
+# PYTHONUNBUFFERED cover Python; `stdbuf -oL -eL` covers picamera2's and
+# libcamera's C/C++ writes to the same fds.
+export PYTHONUNBUFFERED=1
+if command -v stdbuf >/dev/null 2>&1; then
+    exec stdbuf -oL -eL python -u -m pi.pi_camera_server "$@" >>"$LOG" 2>&1
+fi
+exec python -u -m pi.pi_camera_server "$@" >>"$LOG" 2>&1

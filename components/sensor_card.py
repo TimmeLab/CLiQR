@@ -19,6 +19,58 @@ from utils import state
 # ~250x the healthy gap and far below any real stall.
 VIDEO_STALL_WARN_S = 5.0
 
+# The video<->trace anchor is single-shot: the Start bookmark is the ONLY thing
+# tying frame numbers to session time, so one failed round-trip leaves the whole
+# session's video unalignable. On 2026-07-22 a single
+# "[WinError 10061] ... actively refused it" did exactly that. Retrying costs a
+# few seconds in the worst case and nothing in the normal one.
+BOOKMARK_ATTEMPTS = 3
+BOOKMARK_RETRY_DELAY_S = 1.0
+
+
+def _bookmark_with_retry(client, sensor_id: int, label: str):
+    """Bookmark the video, retrying failures. Returns (resp, before, after).
+
+    Host wall-clock brackets the attempt that SUCCEEDED, not the first one: the
+    latency correction works back from host_after to the bookmarked frame's true
+    host time, so carrying a stale bracket across a retry would bias the anchor
+    by the whole retry delay. client.bookmark() never raises — it returns an
+    error dict — so a failure here is always a value, never an exception.
+    """
+    resp, host_before, host_after = {}, 0.0, 0.0
+    for attempt in range(1, BOOKMARK_ATTEMPTS + 1):
+        host_before = time_module.time()
+        resp = client.bookmark(sensor_id)
+        host_after = time_module.time()
+        if resp.get("ok"):
+            if attempt > 1:
+                state.add_log_message(
+                    f"Sensor {sensor_id}: {label} bookmark succeeded on attempt "
+                    f"{attempt}")
+            return resp, host_before, host_after
+        if attempt < BOOKMARK_ATTEMPTS:
+            state.add_log_message(
+                f"Sensor {sensor_id}: {label} bookmark attempt {attempt} failed "
+                f"({resp.get('error')}); retrying")
+            time_module.sleep(BOOKMARK_RETRY_DELAY_S)
+    return resp, host_before, host_after
+
+
+def _report_bookmark_failure(sensor_id: int, resp: dict, label: str):
+    """Say plainly that the video is unalignable — this is not a minor warning.
+
+    The old message was one quiet WARNING line among many and was easy to scroll
+    past, which is how a session ran to completion with no usable anchor.
+    """
+    state.add_log_message(
+        f"ERROR: Sensor {sensor_id}: {label} bookmark FAILED after "
+        f"{BOOKMARK_ATTEMPTS} attempts: {resp.get('error')}")
+    if label == "start":
+        state.add_log_message(
+            "ERROR: Without a start bookmark the video CANNOT be aligned to the "
+            "capacitance trace. Check that the Pi camera server is running, "
+            "then stop and restart the session to get a usable anchor.")
+
 
 def _warn_if_video_frozen(sensor_id: int, resp: dict, label: str):
     """Log a warning when a bookmark reply describes a long-stale frame.
@@ -107,9 +159,8 @@ def start_sensor(sensor_id: int):
                     # bookmark latency (frame's host time - start_time) stays
                     # recoverable; the frame the Pi returns was captured mid-
                     # round-trip, not at the start_time stamped above.
-                    host_before = time_module.time()
-                    resp = client.bookmark(sensor_id)
-                    host_after = time_module.time()
+                    resp, host_before, host_after = _bookmark_with_retry(
+                        client, sensor_id, "start")
                     if resp.get("ok"):
                         recorder.write_video_metadata(
                             sensor_id=sensor_id,
@@ -126,8 +177,7 @@ def start_sensor(sensor_id: int):
                             f"frame={resp.get('frame_index')} pts={resp.get('pts'):.3f}")
                         _warn_if_video_frozen(sensor_id, resp, "start")
                     else:
-                        state.add_log_message(
-                            f"WARNING: Sensor {sensor_id}: bookmark failed: {resp.get('error')}")
+                        _report_bookmark_failure(sensor_id, resp, "start")
                 except Exception as exc:
                     state.add_log_message(
                         f"WARNING: Sensor {sensor_id}: bookmark error: {exc}")
@@ -160,9 +210,8 @@ def bookmark_stop(sensor_id: int, cycle: int):
 
     def _bookmark():
         try:
-            host_before = time_module.time()
-            resp = client.bookmark(sensor_id)
-            host_after = time_module.time()
+            resp, host_before, host_after = _bookmark_with_retry(
+                client, sensor_id, "stop")
             if resp.get("ok"):
                 recorder.write_video_metadata(
                     sensor_id=sensor_id, cycle=cycle,
@@ -177,9 +226,7 @@ def bookmark_stop(sensor_id: int, cycle: int):
                     f"frame={resp.get('frame_index')}")
                 _warn_if_video_frozen(sensor_id, resp, "stop")
             else:
-                state.add_log_message(
-                    f"WARNING: Sensor {sensor_id}: stop bookmark failed: "
-                    f"{resp.get('error')}")
+                _report_bookmark_failure(sensor_id, resp, "stop")
         except Exception as exc:
             state.add_log_message(
                 f"WARNING: Sensor {sensor_id}: stop bookmark error: {exc}")

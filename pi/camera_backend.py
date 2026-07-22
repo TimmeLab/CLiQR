@@ -7,12 +7,15 @@ sensor's Start click to a video frame.
 
 picamera2 is imported lazily so this module only loads on the Pi.
 """
+import logging
 import shutil
 import threading
 import time
 from pathlib import Path
 
 from pi import ffmpeg_output
+
+log = logging.getLogger(__name__)
 
 # imx708 fast readout mode: the sensor's 1536x864 mode runs at up to 120 fps.
 # Requesting a 1536x864 *raw* stream pins the sensor to that fast mode; locking
@@ -215,8 +218,24 @@ class Picamera2Backend:
         self._picam2.configure(config)
 
     def start_session(self, name: str) -> str:
-        # Defensive: free any camera a prior session left held (e.g. a stop that
-        # never ran) so acquire() can't fail with "camera already in use".
+        # Defensive: a prior session may still be live here. The desktop client
+        # gives up on a slow START_SESSION after 10 s and sets its client to
+        # None, which also skips the STOP_SESSION on the operator's next Stop
+        # -- so the very next Start arrives with the previous session still
+        # recording. Tear it down completely: stop the watchdog first (a
+        # surviving thread would keep polling state this session is about to
+        # overwrite, and _start_watchdog below would leave two running), then
+        # close the open segment so its ffmpeg is reaped and its mp4 finalized,
+        # then free the camera so acquire() can't fail with "camera in use".
+        if self._active or self._watchdog is not None:
+            log.warning("start_session while a session was still active; "
+                        "tearing down the previous one")
+            self._stop_watchdog()
+            self._active = False
+            try:
+                self._close_segment()
+            except Exception as exc:
+                log.error("could not close the previous segment: %s", exc)
         self._release_camera()
         self._session_name = name
         self._segment = 0
@@ -309,8 +328,7 @@ class Picamera2Backend:
             # deadlocked ffmpeg on 2026-07-21.
             self._frame_errors += 1
             if self._frame_errors <= 5 or self._frame_errors % 1000 == 0:
-                print(f"camera: frame callback error #{self._frame_errors}: {exc}",
-                      flush=True)
+                log.error("frame callback error #%d: %s", self._frame_errors, exc)
 
     # ---- stall watchdog -------------------------------------------------
 
@@ -343,7 +361,7 @@ class Picamera2Backend:
             except Exception as exc:
                 # A failed poll must not kill the watchdog thread; the next one
                 # retries. The session is degraded, not lost.
-                print(f"camera watchdog: poll failed: {exc}", flush=True)
+                log.error("watchdog poll failed: %s", exc)
 
     def _muxer_died(self) -> bool:
         """True if this segment's ffmpeg exited while the session is recording.
@@ -393,10 +411,10 @@ class Picamera2Backend:
         with open(log_path, "r+b") as fh:
             fh.truncate(0)
         self.ffmpeg_log_overflows += 1
-        print(f"camera watchdog: {log_path.name} exceeded "
-              f"{FFMPEG_LOG_MAX_BYTES} bytes and was truncated "
-              f"(overflow #{self.ffmpeg_log_overflows}); the muxer is erroring "
-              f"on nearly every packet", flush=True)
+        log.warning("%s exceeded %d bytes and was truncated (overflow #%d); "
+                    "the muxer is erroring on nearly every packet",
+                    log_path.name, FFMPEG_LOG_MAX_BYTES,
+                    self.ffmpeg_log_overflows)
 
     def _warn_if_disk_low(self):
         """Warn (rate-limited) when the Pi runs low on space mid-session."""
@@ -411,9 +429,9 @@ class Picamera2Backend:
             return
         self._last_disk_warn = now
         self.low_disk_during_run = True
-        print(f"camera watchdog: only {free / 1024 ** 3:.2f} GB free on the Pi "
-              f"while recording; the video will be truncated when it fills "
-              f"(~{1.38:.2f} GB/h at the current bitrate)", flush=True)
+        log.warning("only %.2f GB free while recording; the video will be "
+                    "truncated when it fills (~1.38 GB/h at the current bitrate)",
+                    free / 1024 ** 3)
 
     def _restart_stalled_segment(self, reason: str):
         """Tear down the stalled segment and record into a fresh one."""
@@ -436,16 +454,15 @@ class Picamera2Backend:
 
             if self._segment >= MAX_SEGMENTS:
                 self._segment_cap_reached = True
-                print(f"camera watchdog: {reason} in segment {self._segment}; "
-                      f"segment cap ({MAX_SEGMENTS}) reached, giving up on "
-                      f"video. The session continues and the capacitance data "
-                      f"is unaffected.", flush=True)
+                log.error("%s in segment %d; segment cap (%d) reached, giving "
+                          "up on video. The session continues and the "
+                          "capacitance data is unaffected.",
+                          reason, self._segment, MAX_SEGMENTS)
                 self._close_segment()
                 return
 
-            print(f"camera watchdog: {reason} after {self._frame_count} frames "
-                  f"in segment {self._segment}; restarting recording",
-                  flush=True)
+            log.warning("%s after %d frames in segment %d; restarting recording",
+                        reason, self._frame_count, self._segment)
 
             self._close_segment()
             # A stalled pipeline is not reusable: drop the camera entirely and

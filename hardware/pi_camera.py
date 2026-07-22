@@ -24,7 +24,11 @@ class PiCameraClient:
                 sock.sendall(protocol.encode_message(msg))
                 return protocol.decode_message(self._recv_line(sock))
         except Exception as exc:
-            return protocol.make_error(str(exc))
+            # Name the endpoint. A bare "[WinError 10061] ... actively refused
+            # it" (2026-07-22) does not say WHICH address failed, and the Pi has
+            # both a wired link and a roaming wlan0 on a guest SSID — knowing
+            # the transport is most of the diagnosis.
+            return protocol.make_error(f"{exc} [{self.host}:{self.port}]")
 
     @staticmethod
     def _recv_line(sock: socket.socket) -> bytes:
