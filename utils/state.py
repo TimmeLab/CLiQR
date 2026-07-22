@@ -177,14 +177,20 @@ CONFIG2 = 0x5D  # AFE Config 2: CDT (charge time) + SFI (second filter iter) + E
 CONFIG = 0x5E  # ECR (Electrode Configuration): calibration lock + electrode enable
 DATA = 0x04
 
-# AFE config values tuned for maximum sampling rate (~250 Hz, the MPR121 ceiling).
-# CONFIG1 = 0x10: FFI=00 (6 samples, fastest), CDC=16uA charge current.
-# CONFIG2 = 0x20: CDT=001 (0.5us charge time), SFI=00 (4 samples, fastest),
-#                 ESI=000 (1ms electrode sample interval, fastest).
-# Sample period = SFI * ESI = 4 * 1ms = 4ms -> 250 Hz. ESI/SFI already at their
-# hardware minimums; the chip cannot go faster than this.
-CONFIG1_VALUE = 0x10
-CONFIG2_VALUE = 0x20
+# AFE config values tuned for signal quality, not peak rate. We only poll ~113 Hz
+# over USB (latency-timer + flush-stall limited) yet the chip's old 4ms/250 Hz
+# output meant we discarded ~half its samples. Slowing the distinct-output period
+# to ~10 Hz-headroom and spending that budget on averaging (more filter
+# iterations) trades unused rate for lower noise (~sqrt(N) on the extra samples).
+#
+# CONFIG1 = 0x90: FFI=10 (18 first-filter samples, was 6), CDC=16uA charge current.
+# CONFIG2 = 0x30: CDT=001 (0.5us charge time), SFI=10 (10 second-filter samples,
+#                 was 4), ESI=000 (1ms electrode sample interval).
+# Distinct-output period = SFI * ESI = 10 * 1ms = 10ms -> 100 Hz, just under our
+# ~113 Hz poll so we catch ~every distinct sample (near 1:1, less duplication).
+# CDT still at minimum; a bump there (more charge amplitude) is a separate test.
+CONFIG1_VALUE = 0x90
+CONFIG2_VALUE = 0x30
 
 # Recording parameters
 HISTORY_SIZE = 100  # Buffer size before HDF5 write
