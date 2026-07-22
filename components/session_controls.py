@@ -63,6 +63,7 @@ def _start_camera(video_base):
     camera_client = None
     state.camera_video_filename.set("")
     state.camera_disk_warning.set("")
+    state.camera_stall_warning.set("")
 
     try:
         client = state.make_camera_client(timeout=CAMERA_START_TIMEOUT)
@@ -179,6 +180,43 @@ def _report_pi_disk_cleanup(resp):
         state.add_log_message(f"WARNING: {message}")
 
 
+def _report_camera_stalls(resp):
+    """Surface any watchdog-restarted segments from the STOP_SESSION reply.
+
+    A stall means the Pi camera stopped delivering frames mid-session and the
+    watchdog restarted recording into a `_partN` file. The run is intact -- the
+    capacitance trace is untouched and the segments cover everything but the
+    stall itself -- but the operator must know the video is split, and that the
+    camera misbehaved. Silence here is exactly what cost 90 min of video on
+    2026-07-21.
+    """
+    if resp.get("low_disk_during_run"):
+        state.add_log_message(
+            "WARNING: The Pi dropped below 1 GB free while recording. Video is "
+            "written at ~1.4 GB/h, so a long run can fill the disk mid-session "
+            "and truncate the video. Free space on the Pi before the next run.")
+    if resp.get("ffmpeg_log_overflows"):
+        state.add_log_message(
+            f"WARNING: The Pi's video muxer logged errors on nearly every frame "
+            f"({resp['ffmpeg_log_overflows']} log truncation(s)). The .ffmpeg.log "
+            f"file was copied back — check it.")
+
+    stalls = resp.get("stalls") or []
+    if not stalls:
+        return
+    for stall in stalls:
+        state.add_log_message(
+            f"WARNING: Camera stalled after {stall.get('frames')} frames in "
+            f"segment {stall.get('segment')} "
+            f"({stall.get('reason', 'no frames')}); recording was restarted "
+            f"into a new segment.")
+    state.camera_stall_warning.set(
+        f"Camera stalled {len(stalls)} time(s) this session; the video is split "
+        f"across multiple files (_part2, _part3, ...). Each has its own .txt "
+        f"sidecar of absolute frame timestamps, so all segments still align to "
+        f"the capacitance trace. Check the Pi server log.")
+
+
 def stop_recording():
     """Stop the current recording session."""
     global current_recorder, recording_task
@@ -262,6 +300,7 @@ def stop_recording():
                     fetched = client.fetch_files(names, out_dir)
                     state.add_log_message(
                         f"Camera stopped; copied {len(fetched)} file(s)")
+                    _report_camera_stalls(resp)
                     _report_pi_disk_cleanup(resp)
                 else:
                     state.add_log_message(

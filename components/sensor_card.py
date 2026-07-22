@@ -11,6 +11,36 @@ import time as time_module
 from dataclasses import replace
 from utils import state
 
+# A bookmark reply's `pi_monotonic - pts` is the Pi-side gap between the
+# bookmarked frame's capture and the bookmark executing. Healthy runs measure
+# ~0.02 s (2026-07-21 Start bookmark: 0.017 s). The same run's Stop bookmark
+# measured 5414 s: the camera had frozen 90 min earlier and every layer -- the
+# Pi server, the TCP client, the HDF5 writer -- reported success anyway. 5 s is
+# ~250x the healthy gap and far below any real stall.
+VIDEO_STALL_WARN_S = 5.0
+
+
+def _warn_if_video_frozen(sensor_id: int, resp: dict, label: str):
+    """Log a warning when a bookmark reply describes a long-stale frame.
+
+    The Pi reports `frames_stale_s` directly; `pi_monotonic - pts` is the
+    fallback for a server predating that field. Either way this is the check
+    that turns a silent 90-minute video loss into a message during the session.
+    """
+    stale = resp.get("frames_stale_s")
+    if stale is None:
+        pi_monotonic, pts = resp.get("pi_monotonic"), resp.get("pts")
+        if pi_monotonic is None or pts is None:
+            return
+        stale = float(pi_monotonic) - float(pts)
+    if float(stale) < VIDEO_STALL_WARN_S:
+        return
+    state.add_log_message(
+        f"WARNING: Sensor {sensor_id}: {label} bookmark frame is "
+        f"{float(stale):.0f}s stale — the Pi camera has stopped delivering "
+        f"frames. Video for this period is missing; capacitance data is "
+        f"unaffected. Check the Pi server log.")
+
 
 def start_sensor(sensor_id: int):
     """Start recording for a specific sensor."""
@@ -94,6 +124,7 @@ def start_sensor(sensor_id: int):
                         state.add_log_message(
                             f"Sensor {sensor_id}: video bookmark "
                             f"frame={resp.get('frame_index')} pts={resp.get('pts'):.3f}")
+                        _warn_if_video_frozen(sensor_id, resp, "start")
                     else:
                         state.add_log_message(
                             f"WARNING: Sensor {sensor_id}: bookmark failed: {resp.get('error')}")
@@ -144,6 +175,7 @@ def bookmark_stop(sensor_id: int, cycle: int):
                 state.add_log_message(
                     f"Sensor {sensor_id}: video stop bookmark "
                     f"frame={resp.get('frame_index')}")
+                _warn_if_video_frozen(sensor_id, resp, "stop")
             else:
                 state.add_log_message(
                     f"WARNING: Sensor {sensor_id}: stop bookmark failed: "

@@ -139,7 +139,9 @@ Pipeline functions:
 
 ### Concurrent Video Capture (`pi/`, `video/`, `hardware/pi_camera.py`)
 
-Desktop ↔ Pi 5 over TCP. `video/protocol.py` (shared wire format), `pi/server_core.py` (dispatcher), `pi/pi_camera_server.py` (TCP + picamera2 entry), `pi/camera_backend.py` (picamera2), `hardware/pi_camera.py` (desktop client), `hardware/pi_camera_mock.py` (no-Pi mock), `components/camera_controls.py` (UI). Bookmarks stored in HDF5 as `video_frame_index`/`video_pts`/`video_filename`. Full guide: `docs/VIDEO_CAPTURE.md`.
+Desktop ↔ Pi 5 over TCP. `video/protocol.py` (shared wire format), `pi/server_core.py` (dispatcher), `pi/pi_camera_server.py` (TCP + picamera2 entry), `pi/camera_backend.py` (picamera2 + stall watchdog), `pi/ffmpeg_output.py` (H.264→mp4 muxer, replaces picamera2's FfmpegOutput), `pi/run_server.sh` (launcher — always use it; see below), `hardware/pi_camera.py` (desktop client), `hardware/pi_camera_mock.py` (no-Pi mock), `components/camera_controls.py` (UI). Bookmarks stored in HDF5 as `video_frame_index`/`video_pts`/`video_filename`. Full guide: `docs/VIDEO_CAPTURE.md`.
+
+**Never launch the Pi server on an interactive terminal** (`pi/run_server.sh` redirects to a log file). ffmpeg inherits the server's stderr; a tty that stops draining blocks ffmpeg, which blocks its stdin, which back-pressures picamera2's request loop into a silent camera stall. `pi/ffmpeg_output.py` also pins `-framerate` on the h264 demuxer so ffmpeg never synthesizes timestamps from arrival times. Both were causes of the 2026-07-21 failure where video ended 44 min into a 2 h 19 min run while the session reported success.
 
 ## Hardware: Sensor → Board Mapping
 

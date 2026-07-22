@@ -34,11 +34,74 @@ no camera-warmup slop.
 ## Running the Pi server
 
 ```bash
-python -m pi.pi_camera_server --port 8770 --output-dir ~/cliqr_clips
+./pi/run_server.sh --port 8770 --output-dir ~/cliqr_clips
 ```
+
+The wrapper redirects stdout/stderr to `~/cliqr_camera_server.log` (previous run
+kept as `.log.1`; override with `CLIQR_LOG`).
+
+**Do not run `python -m pi.pi_camera_server` directly in an interactive
+terminal.** ffmpeg is a child process that inherits those handles. If the
+tty/ssh consumer stops draining its output, ffmpeg blocks on the stderr write,
+stops reading its stdin pipe, and the back-pressure reaches picamera2's request
+loop and stalls the camera. That is what silently ended the 2026-07-21
+recording 44 min into a 2 h 19 min session.
 
 The server pre-rolls on `START_SESSION`, bookmarks on `BOOKMARK`, finalizes the
 MP4 + `.txt` on `STOP_SESSION`, and serves files on `GET_FILE`.
+
+### Stall watchdog
+
+A watchdog thread polls the frame counter while a session records. If no frame
+arrives for `STALL_TIMEOUT_S` (3 s, ~360 frames at 120 fps), it stops the
+segment, re-acquires the camera, and resumes into `<session>_part2.mp4` /
+`.txt`, then `_part3`, and so on. A stall therefore costs a few seconds of
+video instead of the rest of the run, and never fails the session — the
+capacitance trace is what must survive.
+
+`STOP_SESSION` reports every stall in its reply, the GUI logs each one and shows
+a persistent warning, and `BOOKMARK` returns `frames_stale_s` so a frozen camera
+is visible *during* the session rather than the next day.
+
+Each segment carries its own `.txt` sidecar whose SensorTimestamps are absolute
+Pi boot-clock nanoseconds, so later segments still align to the capacitance
+trace through the original Start bookmark — they need no bookmark of their own.
+
+The watchdog also restarts a segment when ffmpeg *exits* mid-session (a full
+disk kills the muxer, not the camera — frames keep filling the sidecar while
+the mp4 is silently truncated, which frame-staleness alone would never catch).
+
+## Disk budget on the Pi
+
+Video is `-c:v copy` from a 3 Mb/s encoder, so on-disk size is set by the
+bitrate, not the container:
+
+| | |
+|---|---|
+| Video | **1.38 GB/h** (measured: 1.01 GB / 2642 s) |
+| `.txt` sidecar | ~7 MB/h (120 fps × 17 B/line) |
+| 2 h 19 m session | 3.19 GB + 17 MB |
+| 3 h session | 4.14 GB + 22 MB |
+
+`MIN_FREE_BYTES` is 5 GB, reclaimed at session start by deleting the oldest
+recordings (never the current session's). That covers a ~3 h run with little to
+spare — check the Pi's free space before anything longer.
+
+Reclaim runs only at session start and after stop, so **nothing frees space
+mid-run**. Three guards bound what a bad session can consume:
+
+- `MAX_SEGMENTS` (10) caps watchdog restarts. Past it the watchdog stops
+  restarting and the session continues without video, rather than producing
+  hundreds of files the desktop must fetch one at a time.
+- `FFMPEG_LOG_MAX_BYTES` (2 MB) caps each `.ffmpeg.log`. A muxer stuck
+  rejecting packets writes ~240 lines/s (~170 MB over a full session); past the
+  cap the log is truncated and the truncation is reported.
+- Below 1 GB free while recording, the Pi logs a warning every 60 s and reports
+  `low_disk_during_run` in the STOP_SESSION reply; the GUI surfaces it. It does
+  not delete anything mid-run — the desktop may be fetching an old file.
+
+A `.ffmpeg.log` is copied back to the desktop only if it is non-empty, so a
+healthy run still transfers exactly the two files it always did.
 
 ## Desktop usage
 
@@ -52,7 +115,10 @@ MP4 + `.txt` on `STOP_SESSION`, and serves files on `GET_FILE`.
 
 ## Output
 
-- `<session>.mp4` — H.264 video.
+- `<session>.mp4` — H.264 video (plus `<session>_part2.mp4` … if the watchdog
+  restarted recording mid-session).
+- `<session>.ffmpeg.log` — muxer stderr for that segment; normally empty.
+  Deleted along with its `.mp4` by the Pi's disk reclaim.
 - `<session>.txt` — **Pending format change:** Currently writes raw absolute `SensorTimestamp` values (nanoseconds, one per line, no header). For compatibility with `false_positive_analysis.load_frame_offsets()`, this must be changed to: 2-line header + per-frame offsets in relative nanoseconds (offset = `SensorTimestamp - first_frame_SensorTimestamp`). This change is pending validation on the Pi and will be implemented as part of on-device backend improvements.
 - HDF5 datasets per camera sensor: `video_frame_index`, `video_pts`,
   `video_filename` (cycle-suffixed like `start_time`). **Note:** `video_pts` is currently reported as absolute seconds; it must be changed to relative seconds (seconds since video start) for consistency with the planned `.txt` format.

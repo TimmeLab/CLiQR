@@ -241,6 +241,10 @@ camera_disk_warning = solara.reactive("")
 """Warning shown when the Pi is low on disk even after deleting old videos
 (the user must free up space manually before the next session)."""
 
+camera_stall_warning = solara.reactive("")
+"""Warning shown when the Pi's frame watchdog restarted recording mid-session,
+so the video is split across `_partN` segments (cleared at the next start)."""
+
 show_snapshot_dialog = solara.reactive(False)
 """Whether the camera test-snapshot dialog is open."""
 

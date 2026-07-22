@@ -70,7 +70,18 @@ class CameraServer:
                 if not self.backend.is_active:
                     return protocol.make_error("no active session")
                 files = self.backend.stop_session()
-                response = protocol.make_ok(files=files)
+                # stalls: segments the watchdog restarted because frame
+                # delivery died mid-session. Reported so the desktop can warn
+                # instead of the run looking clean (2026-07-21: it did not, and
+                # 90 min of video was silently missing). getattr keeps older /
+                # test backends without a watchdog working.
+                response = protocol.make_ok(
+                    files=files,
+                    stalls=getattr(self.backend, "stalls", []),
+                    low_disk_during_run=getattr(
+                        self.backend, "low_disk_during_run", False),
+                    ffmpeg_log_overflows=getattr(
+                        self.backend, "ffmpeg_log_overflows", 0))
                 # Disk cleanup is best-effort: the stop succeeded and the
                 # desktop needs the file list to fetch the recording, so a
                 # cleanup error must not turn this reply into an error.
