@@ -188,6 +188,12 @@ CONFIG2_VALUE = 0x20
 
 # Recording parameters
 HISTORY_SIZE = 100  # Buffer size before HDF5 write
+# Poll-rate cap (Hz). The USB/chip path can sustain ~330 Hz, but we only need
+# ~150 Hz for lick detection. Capping here gives evenly-spaced samples and
+# smaller files. Note: this caps how often we READ the chip over USB; it does
+# not change the MPR121's on-chip charge/measure timing (that's the AFE config
+# in CONFIG1/CONFIG2). Keep below the chip's distinct-output rate set by SFI*ESI.
+MAX_SAMPLE_HZ = 150
 # The wired MPR121 channels for this rack. read_sensor_data reads these in
 # order and maps them to the board's sensor IDs (see SERIAL_NUMBER_SENSOR_MAP).
 ACTIVE_CHANNELS = _RACK_CONFIGS[RACK_DESIGN]["channels"]

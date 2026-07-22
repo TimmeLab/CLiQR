@@ -13,7 +13,7 @@ from typing import Dict
 import h5py
 
 from hardware.mpr121 import MPR121Manager
-from utils.state import HISTORY_SIZE, NUM_CHANNELS
+from utils.state import HISTORY_SIZE, NUM_CHANNELS, MAX_SAMPLE_HZ
 
 
 class SensorRecorder:
@@ -88,9 +88,23 @@ class SensorRecorder:
         num_boards = len(self.controllers)
         with ThreadPoolExecutor(max_workers=num_boards) as executor:
             try:
+                # Pace the loop to MAX_SAMPLE_HZ. Use a running deadline (not a
+                # fixed per-iteration sleep) so read/flush jitter doesn't
+                # accumulate into drift.
+                sample_period = 1.0 / MAX_SAMPLE_HZ
+                next_deadline = time.monotonic() + sample_period
                 while self.recording:
-                    # Yield control to allow UI updates
-                    await asyncio.sleep(0)
+                    # Sleep until the next scheduled sample (this also yields to
+                    # the event loop for UI updates).
+                    sleep_for = next_deadline - time.monotonic()
+                    if sleep_for > 0:
+                        await asyncio.sleep(sleep_for)
+                        next_deadline += sample_period
+                    else:
+                        # Fell behind (e.g. an HDF5 flush stall). Yield and resync
+                        # the deadline instead of bursting to catch up.
+                        await asyncio.sleep(0)
+                        next_deadline = time.monotonic() + sample_period
 
                     # Launch parallel sensor reads on all boards
                     futures = []
