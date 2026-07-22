@@ -82,6 +82,12 @@ class FT232HManager:
             # bus clock is what lets us actually poll at the chip's 250 Hz ceiling.
             controller.configure(url, frequency=400000)
 
+            # FT232H defaults to a 16 ms USB latency timer, which caps polling at
+            # ~50 Hz regardless of bus/chip speed (every read blocks up to 16 ms
+            # before the USB buffer flushes). Drop it to the 1 ms minimum so the
+            # USB round-trip stops being the bottleneck.
+            controller.ftdi.set_latency_timer(1)
+
             # Try to find the correct MPR121 I2C address
             port = self._find_mpr121_address(controller)
 
