@@ -184,13 +184,14 @@ DATA = 0x04
 # iterations) trades unused rate for lower noise (~sqrt(N) on the extra samples).
 #
 # CONFIG1 = 0x90: FFI=10 (18 first-filter samples, was 6), CDC=16uA charge current.
-# CONFIG2 = 0x30: CDT=001 (0.5us charge time), SFI=10 (10 second-filter samples,
-#                 was 4), ESI=000 (1ms electrode sample interval).
+# CONFIG2 = 0x70: CDT=011 (2us charge time, was 0.5us), SFI=10 (10 second-filter
+#                 samples, was 4), ESI=000 (1ms electrode sample interval).
 # Distinct-output period = SFI * ESI = 10 * 1ms = 10ms -> 100 Hz, just under our
 # ~113 Hz poll so we catch ~every distinct sample (near 1:1, less duplication).
-# CDT still at minimum; a bump there (more charge amplitude) is a separate test.
+# CDT raised from the 0.5us minimum to 2us: longer charge time per measurement
+# gives a larger electrode voltage swing (more signal amplitude) at the same CDC.
 CONFIG1_VALUE = 0x90
-CONFIG2_VALUE = 0x30
+CONFIG2_VALUE = 0x70
 
 # Recording parameters
 HISTORY_SIZE = 100  # Buffer size before HDF5 write

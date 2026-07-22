@@ -65,7 +65,7 @@ class MPR121Manager:
             # zeros these registers, which disables the charge current/time (CDC=0,
             # CDT=000), so the signal is noisy garbage unless we set them explicitly.
             port.write_to(CONFIG1, bytes([CONFIG1_VALUE]))  # 0x5C: FFI=18, CDC=16uA
-            port.write_to(CONFIG2, bytes([CONFIG2_VALUE]))  # 0x5D: CDT=0.5us, SFI=10, ESI=1ms -> 100Hz
+            port.write_to(CONFIG2, bytes([CONFIG2_VALUE]))  # 0x5D: CDT=2us, SFI=10, ESI=1ms -> 100Hz
 
             # Enter run mode via ECR (0x8F: baseline tracking on, electrodes enabled)
             port.write_to(CONFIG, b'\x8F')
