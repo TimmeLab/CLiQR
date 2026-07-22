@@ -172,8 +172,19 @@ SERIAL_NUMBER_SENSOR_MAP = _RACK_CONFIGS[RACK_DESIGN]["map"]
 
 # MPR121 register addresses
 SOFT_RESET = 0x80
-CONFIG = 0x5E
+CONFIG1 = 0x5C  # AFE Config 1: FFI (first filter iterations) + CDC (charge current)
+CONFIG2 = 0x5D  # AFE Config 2: CDT (charge time) + SFI (second filter iter) + ESI (sample interval)
+CONFIG = 0x5E  # ECR (Electrode Configuration): calibration lock + electrode enable
 DATA = 0x04
+
+# AFE config values tuned for maximum sampling rate (~250 Hz, the MPR121 ceiling).
+# CONFIG1 = 0x10: FFI=00 (6 samples, fastest), CDC=16uA charge current.
+# CONFIG2 = 0x20: CDT=001 (0.5us charge time), SFI=00 (4 samples, fastest),
+#                 ESI=000 (1ms electrode sample interval, fastest).
+# Sample period = SFI * ESI = 4 * 1ms = 4ms -> 250 Hz. ESI/SFI already at their
+# hardware minimums; the chip cannot go faster than this.
+CONFIG1_VALUE = 0x10
+CONFIG2_VALUE = 0x20
 
 # Recording parameters
 HISTORY_SIZE = 100  # Buffer size before HDF5 write

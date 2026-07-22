@@ -6,7 +6,9 @@ connected via FT232H I2C interfaces.
 """
 import time
 from typing import Dict, List
-from utils.state import SOFT_RESET, CONFIG, DATA
+from utils.state import (
+    SOFT_RESET, CONFIG, CONFIG1, CONFIG2, CONFIG1_VALUE, CONFIG2_VALUE, DATA
+)
 
 
 class MPR121Manager:
@@ -54,11 +56,19 @@ class MPR121Manager:
             True if configuration successful, False otherwise
         """
         try:
-            # Perform soft reset
+            # Perform soft reset (leaves ECR=0 => electrodes stopped, so the AFE
+            # config registers below can be written before entering run mode).
             port.write_to(SOFT_RESET, b'\x63')
 
-            # Configure the MPR121 (0x8F starts with Adafruit library default config)
-            # This sets up baseline filtering, touch/release thresholds, etc.
+            # AFE config for maximum sampling rate (~250 Hz). Must be written while
+            # electrodes are stopped, i.e. before the ECR write. Soft reset zeros
+            # these registers, which disables the charge current/time (CDC=0,
+            # CDT=000) even though the sample interval is already fast, so the
+            # signal is noisy garbage unless we set them explicitly.
+            port.write_to(CONFIG1, bytes([CONFIG1_VALUE]))  # 0x5C: FFI=6, CDC=16uA
+            port.write_to(CONFIG2, bytes([CONFIG2_VALUE]))  # 0x5D: CDT=0.5us, SFI=4, ESI=1ms
+
+            # Enter run mode via ECR (0x8F: baseline tracking on, electrodes enabled)
             port.write_to(CONFIG, b'\x8F')
 
             # Give it time to initialize

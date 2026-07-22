@@ -77,7 +77,10 @@ class FT232HManager:
         try:
             url = f"ftdi://ftdi:232h:{serial_number}/1"
             controller = I2cController()
-            controller.configure(url)
+            # 400 kHz (I2C Fast mode) is the MPR121's max SCL. pyftdi defaults to
+            # 100 kHz; the per-poll 24-byte read dominates the loop, so raising the
+            # bus clock is what lets us actually poll at the chip's 250 Hz ceiling.
+            controller.configure(url, frequency=400000)
 
             # Try to find the correct MPR121 I2C address
             port = self._find_mpr121_address(controller)
