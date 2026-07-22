@@ -84,9 +84,11 @@ class FT232HManager:
 
             # FT232H defaults to a 16 ms USB latency timer, which caps polling at
             # ~50 Hz regardless of bus/chip speed (every read blocks up to 16 ms
-            # before the USB buffer flushes). Drop it to the 1 ms minimum so the
-            # USB round-trip stops being the bottleneck.
-            controller.ftdi.set_latency_timer(1)
+            # before the USB buffer flushes). Drop it so the USB round-trip stops
+            # being the bottleneck. 2 ms (not the 1 ms minimum) still allows a
+            # ~250 Hz ceiling -- well above our 150 Hz need -- while giving a bit
+            # more USB-transaction headroom to reduce transient read timeouts.
+            controller.ftdi.set_latency_timer(2)
 
             # Try to find the correct MPR121 I2C address
             port = self._find_mpr121_address(controller)
