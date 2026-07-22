@@ -106,6 +106,19 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
     )
 
 
+def source_fps(frame_sess):
+    """Real capture fps of the trimmed clip, from its per-frame session times.
+    The footage is VFR (coded 240, real ~120), so use the median inter-frame
+    interval (robust to occasional gaps) rather than count/duration."""
+    frame_sess = np.asarray(frame_sess, dtype=float)
+    if frame_sess.size < 2:
+        raise ValueError("cannot infer fps: clip has < 2 frames")
+    dt = np.median(np.diff(frame_sess))
+    if dt <= 0:
+        raise ValueError("cannot infer fps: non-increasing frame times")
+    return 1.0 / dt
+
+
 def n_output_frames(start, end, fps):
     return int(round((end - start) * fps))
 
@@ -176,7 +189,7 @@ def clip_trim_window(rec, start, end):
     return trim_window_seconds(rec.clock, rec.pts_ns, start, end)
 
 
-def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0,
+def render_clip(rec, start, end, out_path, fps=None, window=2.5, sync_offset=0.0,
                 intermediate_path=None):
     """Render the side-by-side clip. First stream-copies the mouse video down to
     the clip window (intermediate file, kept) so we don't decode the whole
@@ -192,11 +205,10 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
 
     ``sync_offset`` is a residual manual nudge in seconds: increase it if the
     video still runs ahead of the trace.
-    """
-    taus = frame_times(start, end, fps)
-    if taus.size == 0:
-        raise ValueError("empty clip: check --start/--end/--fps")
 
+    ``fps`` None (default) renders at the footage's real capture rate, so no
+    source frames are dropped; pass a number to force a different output rate.
+    """
     _, _, start_sec, end_sec = clip_trim_window(rec, start, end)
 
     if intermediate_path is None:
@@ -205,6 +217,13 @@ def render_clip(rec, start, end, out_path, fps=30.0, window=2.5, sync_offset=0.0
 
     # Time each trimmed frame by its real (preserved) PTS, not by seek position.
     frame_sess = probe_frame_session_times(intermediate_path, rec.clock)
+
+    if fps is None:
+        fps = source_fps(frame_sess)
+
+    taus = frame_times(start, end, fps)
+    if taus.size == 0:
+        raise ValueError("empty clip: check --start/--end/--fps")
 
     src = TrimmedFrameSource(intermediate_path, frame_sess)
 
@@ -286,7 +305,9 @@ def build_arg_parser():
     p.add_argument("--pts-txt", dest="pts_txt", default=None,
                    help="per-frame PTS sidecar (default: from the h5's "
                         "video_filename, with .txt)")
-    p.add_argument("--fps", type=float, default=30.0, help="output fps (default 30)")
+    p.add_argument("--fps", type=float, default=None,
+                   help="output fps (default: the footage's real capture rate, "
+                        "so no source frames are dropped)")
     p.add_argument("--window", type=float, default=2.5,
                    help="trace half-window seconds (default 2.5)")
     p.add_argument("--sync-offset", dest="sync_offset", type=float, default=0.0,
