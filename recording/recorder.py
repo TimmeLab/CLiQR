@@ -33,6 +33,8 @@ class SensorRecorder:
         self.controllers = controllers
         self.recording = False
         self.loop_counter = 0
+        # Count of read failures that survived retries, for rate-limited logging.
+        self._read_error_count = 0
 
         # HDF5 does not allow two concurrent open-for-write handles in one
         # process. The periodic buffer flush runs on the recording task while
@@ -55,6 +57,17 @@ class SensorRecorder:
             self.board_cap_data[sn] = {
                 sensor: deque(maxlen=HISTORY_SIZE) for sensor in sensors
             }
+
+        # Per-sensor counters that drive HDF5 writes independently of the plot
+        # ring buffers above. board_produced counts every sample appended;
+        # board_written counts those already flushed. Sizing writes off these
+        # (not loop_counter) keeps each sensor's dataset correct even when a
+        # board skips a read and produces fewer samples than its peers.
+        self.board_produced = {}
+        self.board_written = {}
+        for sn in controllers.keys():
+            self.board_produced[sn] = {s: 0 for s in self.board_cap_data[sn]}
+            self.board_written[sn] = {s: 0 for s in self.board_cap_data[sn]}
 
     def initialize_hdf5_file(self):
         """Create the HDF5 file and initialize the group structure."""
@@ -113,10 +126,25 @@ class SensorRecorder:
                             self.mpr121_manager.read_sensor_data,
                             sn
                         )
-                        futures.append(future)
+                        futures.append((sn, future))
 
-                    # Wait for all reads to complete
-                    results = [future.result() for future in futures]
+                    # Collect results. A board whose read failed even after
+                    # retries is skipped for THIS iteration only -- one transient
+                    # USB error costs a sample on one board, never the whole run.
+                    results = []
+                    for sn, future in futures:
+                        try:
+                            results.append(future.result())
+                        except Exception as e:
+                            self._read_error_count += 1
+                            # Log the first few, then only occasionally, to avoid
+                            # flooding the log if a board goes fully offline.
+                            if log_callback and (self._read_error_count <= 5
+                                                 or self._read_error_count % 100 == 0):
+                                log_callback(
+                                    f"WARN: read failed on board {sn} after retries "
+                                    f"(total skips={self._read_error_count}): {e}"
+                                )
 
                     # Append data to buffers
                     for local_time, local_cap, serial_number in results:
@@ -126,6 +154,7 @@ class SensorRecorder:
                         for idx, sensor in enumerate(sensors):
                             self.board_time_data[serial_number][sensor].append(local_time[idx])
                             self.board_cap_data[serial_number][sensor].append(local_cap[idx])
+                            self.board_produced[serial_number][sensor] += 1
 
                     # Write to HDF5 file every HISTORY_SIZE loops
                     if self.loop_counter == HISTORY_SIZE:
@@ -146,7 +175,12 @@ class SensorRecorder:
             log_callback("Recording stopped")
 
     def _write_initial_data(self):
-        """Write the first batch of data to HDF5 (creates datasets)."""
+        """Write the first batch of data to HDF5 (creates datasets).
+
+        Writes the un-flushed tail per sensor, sized from produced-vs-written
+        counters rather than a fixed HISTORY_SIZE, so a board that skipped reads
+        is handled correctly.
+        """
         with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             for sn in self.controllers.keys():
                 from utils.state import SERIAL_NUMBER_SENSOR_MAP
@@ -155,45 +189,53 @@ class SensorRecorder:
                 for sensor in sensors:
                     group = h5f[f"board_{sn}"][f"sensor_{sensor}"]
 
-                    # Create resizable datasets
+                    produced = self.board_produced[sn][sensor]
+                    n = produced - self.board_written[sn][sensor]
+                    time_tail = list(self.board_time_data[sn][sensor])[-n:] if n > 0 else []
+                    cap_tail = list(self.board_cap_data[sn][sensor])[-n:] if n > 0 else []
+
+                    # Create resizable datasets (dtypes pinned so an empty first
+                    # batch from an offline board doesn't drift to float).
                     group.create_dataset(
-                        "time_data",
-                        data=list(self.board_time_data[sn][sensor]),
-                        chunks=(HISTORY_SIZE,),
-                        maxshape=(None,)
+                        "time_data", data=time_tail, dtype="float64",
+                        chunks=(HISTORY_SIZE,), maxshape=(None,)
                     )
                     group.create_dataset(
-                        "cap_data",
-                        data=list(self.board_cap_data[sn][sensor]),
-                        chunks=(HISTORY_SIZE,),
-                        maxshape=(None,)
+                        "cap_data", data=cap_tail, dtype="int64",
+                        chunks=(HISTORY_SIZE,), maxshape=(None,)
                     )
+                    self.board_written[sn][sensor] = produced
 
     def _append_data(self):
-        """Append buffered data to existing HDF5 datasets."""
-        # Calculate the current size before this batch
-        tmp_ctr = self.loop_counter - HISTORY_SIZE
+        """Append buffered data to existing HDF5 datasets.
 
+        The number of samples written per sensor is driven by produced-vs-written
+        counters, not loop_counter, so a board that skipped reads (and thus
+        produced fewer samples) stays correctly sized and aligned. Datasets grow
+        independently per sensor.
+        """
         with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             for sn in self.controllers.keys():
                 from utils.state import SERIAL_NUMBER_SENSOR_MAP
                 sensors = SERIAL_NUMBER_SENSOR_MAP.get(sn, [])
 
                 for sensor in sensors:
-                    group = h5f[f"board_{sn}"][f"sensor_{sensor}"]
+                    produced = self.board_produced[sn][sensor]
+                    n = produced - self.board_written[sn][sensor]
+                    if n <= 0:
+                        continue
 
-                    # Resize datasets to accommodate new data
-                    new_size = tmp_ctr + HISTORY_SIZE
+                    group = h5f[f"board_{sn}"][f"sensor_{sensor}"]
+                    time_tail = list(self.board_time_data[sn][sensor])[-n:]
+                    cap_tail = list(self.board_cap_data[sn][sensor])[-n:]
+
+                    old_size = group["time_data"].shape[0]
+                    new_size = old_size + n
                     group["time_data"].resize((new_size,))
                     group["cap_data"].resize((new_size,))
-
-                    # Write the new data
-                    group["time_data"][tmp_ctr:new_size] = list(
-                        self.board_time_data[sn][sensor]
-                    )
-                    group["cap_data"][tmp_ctr:new_size] = list(
-                        self.board_cap_data[sn][sensor]
-                    )
+                    group["time_data"][old_size:new_size] = time_tail
+                    group["cap_data"][old_size:new_size] = cap_tail
+                    self.board_written[sn][sensor] = produced
 
     def stop(self):
         """Signal the recording loop to stop."""

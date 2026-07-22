@@ -194,6 +194,11 @@ HISTORY_SIZE = 100  # Buffer size before HDF5 write
 # not change the MPR121's on-chip charge/measure timing (that's the AFE config
 # in CONFIG1/CONFIG2). Keep below the chip's distinct-output rate set by SFI*ESI.
 MAX_SAMPLE_HZ = 150
+# Transient FTDI/USB reads occasionally time out ("No answer from FTDI"). Retry
+# the read a few times before giving up so a single hiccup doesn't drop a sample
+# (and, at the loop level, doesn't crash the whole session).
+READ_RETRIES = 3
+READ_RETRY_DELAY = 0.001  # seconds between read retries
 # The wired MPR121 channels for this rack. read_sensor_data reads these in
 # order and maps them to the board's sensor IDs (see SERIAL_NUMBER_SENSOR_MAP).
 ACTIVE_CHANNELS = _RACK_CONFIGS[RACK_DESIGN]["channels"]

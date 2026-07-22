@@ -96,7 +96,7 @@ class MPR121Manager:
             Tuple of (time_data, cap_data, serial_number)
         """
         from collections import deque
-        from utils.state import NUM_CHANNELS, ACTIVE_CHANNELS
+        from utils.state import NUM_CHANNELS, ACTIVE_CHANNELS, READ_RETRIES, READ_RETRY_DELAY
 
         if serial_number not in self.controllers:
             raise ValueError(f"No controller found for {serial_number}")
@@ -105,8 +105,18 @@ class MPR121Manager:
         local_time_data = deque(maxlen=NUM_CHANNELS)
         local_cap_data = deque(maxlen=NUM_CHANNELS)
 
-        # Read 24 bytes (2 bytes for each of the 12 channels)
-        raw_buffer = port.read_from(DATA, 24)
+        # Read 24 bytes (2 bytes for each of the 12 channels). Retry transient
+        # USB/FTDI read failures ("No answer from FTDI") so a single hiccup
+        # doesn't propagate up and kill the recording session.
+        raw_buffer = None
+        for attempt in range(READ_RETRIES):
+            try:
+                raw_buffer = port.read_from(DATA, 24)
+                break
+            except Exception:
+                if attempt == READ_RETRIES - 1:
+                    raise
+                time.sleep(READ_RETRY_DELAY)
 
         # Only the wired channels (ACTIVE_CHANNELS = 1, 6, 11) are recorded.
         # Order matches the 3 sensor IDs mapped to this board.
