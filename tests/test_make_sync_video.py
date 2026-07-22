@@ -255,7 +255,7 @@ def test_build_arg_parser_parses_required():
         "--start", "5", "--end", "9", "--out", "o.mp4",
     ])
     assert args.h5 == "r.h5" and args.start == 5.0 and args.end == 9.0
-    assert args.fps == 30.0 and args.window == 2.5 and args.sync_offset == 0.0
+    assert args.fps is None and args.window == 2.5 and args.sync_offset == 0.0
     assert args.intermediate is None
     # cropping is crop_video.py's job now
     assert not hasattr(args, "crop_w")
