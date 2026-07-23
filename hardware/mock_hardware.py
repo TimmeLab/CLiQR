@@ -243,8 +243,9 @@ def use_mock_hardware():
             for error in errors:
                 state.add_log_message(f"ERROR: {error}")
 
-        # Store controllers
-        state.i2c_controllers.set(controllers)
+        # Store controllers. Route through set_session (like real init) so mock
+        # hardware also survives a browser refresh for UI/refresh testing.
+        state.set_session("i2c_controllers", controllers)
 
         # Create mock MPR121 manager
         hw_status.mpr121_manager = MockMPR121Manager(controllers)
@@ -255,7 +256,7 @@ def use_mock_hardware():
 
         # Update boards_connected
         board_info = hw_status.ft232h_manager.get_controller_info()
-        state.boards_connected.set(board_info)
+        state.set_session("boards_connected", board_info)
 
         state.add_log_message(f"Mock hardware ready: {len(board_info)} boards")
 

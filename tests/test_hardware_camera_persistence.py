@@ -86,3 +86,36 @@ def test_camera_enable_and_bookmark_sensor_survive_a_refresh():
     # Cleanup.
     state.set_session("camera_enabled", False)
     state.set_session("camera_sensor_id", None)
+
+
+def test_hardware_writes_go_through_set_session():
+    # Guards against a future edit re-introducing a bare .set() that would
+    # silently drop hardware state on refresh again. We inspect source because
+    # exercising real FT232H init needs physical USB boards.
+    from components import hardware_status
+
+    # initialize_hardware is module-level; disconnect_hardware is a nested
+    # function inside the HardwareStatusCard component, so inspect the component
+    # source to cover it. Together these span every hardware write site.
+    sources = {
+        "initialize_hardware":
+            inspect.getsource(hardware_status.initialize_hardware),
+        "HardwareStatusCard (contains disconnect_hardware)":
+            inspect.getsource(hardware_status.HardwareStatusCard),
+    }
+    for where, src in sources.items():
+        assert "boards_connected.set(" not in src, (
+            f"{where} still writes boards_connected with bare .set()")
+        assert "i2c_controllers.set(" not in src, (
+            f"{where} still writes i2c_controllers with bare .set()")
+
+
+def test_mock_initialize_goes_through_set_session():
+    from hardware import mock_hardware
+
+    src = inspect.getsource(mock_hardware)
+    # mock_initialize is defined inside a setup function; check the module text.
+    assert "i2c_controllers.set(" not in src, (
+        "mock_initialize still writes i2c_controllers with bare .set()")
+    assert "boards_connected.set(" not in src, (
+        "mock_initialize still writes boards_connected with bare .set()")

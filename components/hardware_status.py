@@ -23,7 +23,8 @@ def initialize_hardware():
     num_devices = ft232h_manager.scan_devices()
     if num_devices == 0:
         state.add_log_message("ERROR: No FT232H boards found")
-        state.boards_connected.set({})
+        # Route through set_session so the cleared state survives a refresh.
+        state.set_session("boards_connected", {})
         return
 
     state.add_log_message(f"Found {num_devices} FT232H board(s)")
@@ -37,11 +38,13 @@ def initialize_hardware():
 
     if not controllers:
         state.add_log_message("ERROR: No controllers initialized")
-        state.boards_connected.set({})
+        state.set_session("boards_connected", {})
         return
 
-    # Store controllers in state
-    state.i2c_controllers.set(controllers)
+    # Store controllers in state. set_session mirrors the live controller dict
+    # into the authoritative global so a browser refresh can re-point the fresh
+    # kernel context's reactive at the same open USB handles (no re-scan).
+    state.set_session("i2c_controllers", controllers)
 
     # Configure MPR121 sensors
     mpr121_manager = MPR121Manager(controllers)
@@ -52,7 +55,7 @@ def initialize_hardware():
 
     # Update boards_connected state
     board_info = ft232h_manager.get_controller_info()
-    state.boards_connected.set(board_info)
+    state.set_session("boards_connected", board_info)
 
     # Update sensor states with animal IDs from layout if available
     if not state.layout_df.value.empty:
@@ -113,8 +116,8 @@ def HardwareStatusCard():
                 if not state.recording_all.value:
                     def disconnect_hardware():
                         ft232h_manager.close_all()
-                        state.boards_connected.set({})
-                        state.i2c_controllers.set({})
+                        state.set_session("boards_connected", {})
+                        state.set_session("i2c_controllers", {})
                         state.add_log_message("Hardware disconnected")
 
                     solara.Button(
