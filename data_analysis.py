@@ -12,6 +12,27 @@ import h5py
 import numpy as np
 import scipy.signal as scs
 
+from utils.state import SERIAL_NUMBER_SENSOR_MAP
+
+
+# ---------------------------------------------------------------------------
+# Sensor number -> HDF5 board group name
+# ---------------------------------------------------------------------------
+# The recorder stores each board's data under a group named "board_{serial}"
+# (e.g. "board_FT232H0"). To find a given sensor's data we need the reverse of
+# SERIAL_NUMBER_SENSOR_MAP (which maps serial -> list of sensor numbers).
+#
+# We DERIVE this reverse map from that single source of truth in utils.state
+# instead of hardcoding it. A previously hardcoded copy here silently encoded
+# only the retired 4-board rack and produced KeyErrors on 8-board recordings;
+# deriving it means the analysis follows whatever rack the recorder actually
+# wrote (selected by CLIQR_RACK / RACK_DESIGN).
+SENSOR_BOARD_MAP = {
+    sensor_number: f"board_{serial_number}"
+    for serial_number, sensor_numbers in SERIAL_NUMBER_SENSOR_MAP.items()
+    for sensor_number in sensor_numbers
+}
+
 
 # Control cages have sippers (so volume is recorded) but no animal, hence no
 # weight. IDs are "Control1", "Control2", ... (1-indexed) in the layout file.
@@ -47,19 +68,23 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
             # Initialize with the start and stop indices indicating the entire time series
             start_idx = 0
             stop_idx = -1
-            # Determine which start time keys we have
+            # A sensor may have been started and stopped several times in one
+            # session. Each cycle writes a start_time key: the first is plain
+            # "start_time", later ones are "start_time1", "start_time2", ...
+            # We want the LAST cycle, so collect every start_time key and index
+            # it by its cycle number (the unnumbered first cycle is treated as
+            # cycle -1 so it sorts before the numbered ones).
             pattern = re.compile(r'^start_time(\d+)?$')
-            matches = {}
+            cycle_number_to_key = {}
             for k in sensor_data.keys():
                 m = pattern.match(k)
                 if m:
-                    num = int(m.group(1)) if m.group(1) else -1
-                    matches[num] = k
-            if matches:
-                num = -np.inf
-                for n in matches.keys():
-                    if n > num: num = n
-                last_start = matches[num]
+                    cycle_number = int(m.group(1)) if m.group(1) else -1
+                    cycle_number_to_key[cycle_number] = k
+            if cycle_number_to_key:
+                # The most recent cycle is the one with the largest cycle number.
+                last_cycle_number = max(cycle_number_to_key)
+                last_start = cycle_number_to_key[last_cycle_number]
                 start_time = sensor_data[last_start][()]
                 # Try the stop_time corresponding to the start_time above
                 try:
@@ -119,15 +144,12 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
     for idx,row in sensor_animal_map.iterrows():
         sensor = row.name
         animal = row.item()
-        # We need to determine which FT232H was used for the recordings
-        if sensor in [1,2,3,7,8,9]:
-            board_id = 'board_FT232H0'
-        elif sensor in [4,5,6,10,11,12]:
-            board_id = 'board_FT232H1'
-        elif sensor in [13,14,15,19,20,21]:
-            board_id = 'board_FT232H2'
-        elif sensor in [16,17,18,22,23,24]:
-            board_id = 'board_FT232H3'
+        # Look up which board's HDF5 group holds this sensor (derived from the
+        # rack wiring in utils.state, so it stays correct across rack designs).
+        board_id = SENSOR_BOARD_MAP.get(sensor)
+        if board_id is None:
+            print(f"Sensor {sensor} is not part of the current rack layout; skipping.")
+            continue
         try:
             data_by_animal[animal] = data_dict[board_id][f"sensor_{sensor}"]
         except KeyError as e:
@@ -144,11 +166,48 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
 
 
 def basic_algorithm(data_by_animal, filtered_h5f, logfile):
-    """Basic algorithm based on thresholding"""
+    """Detect licks by scanning every possible amplitude threshold.
+
+    Scientific idea
+    ---------------
+    A lick briefly pulls the sipper capacitance DOWN, so each lick is a narrow
+    downward dip in the trace. A dip is detected by asking "where does the trace
+    drop below some threshold?". The hard part is choosing the threshold. Rather
+    than guess one value, this routine tries every candidate threshold and keeps
+    the one that yields the most licks that also satisfy the shape rules below.
+
+    Because the MPR121 reports capacitance as discrete integer counts, there are
+    only finitely many meaningful thresholds: one sitting halfway between each
+    pair of adjacent observed values. Scanning those midpoints covers every
+    distinguishable threshold with no wasted work.
+
+    For a candidate threshold, a "peak" (dip) is a run of consecutive samples
+    below the threshold. A run is accepted as a real lick only if it is:
+      1. short enough in time  (< max_lick_time; a real lick is brief), and
+      2. deep enough           (it must also cross a threshold two levels lower,
+                                the "2-threshold-deep" rule, so shallow noise
+                                wiggles are rejected).
+    The lick time is taken at the minimum (deepest) sample of the accepted dip.
+
+    This mirrors the original MATLAB lickDetector logic, reimplemented in numpy.
+
+    Parameters
+    ----------
+    data_by_animal : dict {animal_id -> data dict with 'cap_data', 'time_data'}
+    filtered_h5f : open writable h5py.File to save per-animal results into
+    logfile : path to a text log for recording missing weights/volumes
+
+    Returns
+    -------
+    bool : True if any animal was missing required weight/volume data.
+    """
     for (animal, data) in data_by_animal.items():
         trace = data['cap_data']
         times = data['time_data']
 
+        # Longest a single lick may stay below threshold. Mice lick at roughly
+        # 6-10 Hz, so one lick lasts well under 1/6 s (~167 ms); anything longer
+        # below threshold is a sustained contact or artifact, not a lick.
         max_lick_time = 1. / 6. # in seconds
 
         peak_info = {}
@@ -251,7 +310,13 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
             pb_ = peak_info[animal]['peak_bins'][i_thr]
             lick_times_arr = times[pb_]
 
-            # Keep only licks with at least one neighbor within 0.5s
+            # Isolated single dips are usually noise, not licking (mice lick in
+            # rhythmic bouts). So keep a lick only if it has at least one OTHER
+            # detected lick within 1.0 s. Implementation: build the full matrix
+            # of pairwise time differences, blank the diagonal (a lick's distance
+            # to itself) with infinity, then keep a lick when its nearest
+            # neighbor is <= 1.0 s away. (The 1.0 s window is intentional here and
+            # differs from the hilbert algorithm's 0.5 s window below.)
             if len(lick_times_arr) >= 2:
                 diffs = np.abs(lick_times_arr[:, None] - lick_times_arr[None, :])
                 np.fill_diagonal(diffs, np.inf)
@@ -280,20 +345,54 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
         # 8–12 Hz band-pass applied as high- then low-pass
         bh, ah = scs.butter(4, 8, btype='high', fs=fs)
         bl, al = scs.butter(8, 12, btype='low', fs=fs)
+        # scs.filtfilt applies the filter forward and then backward. This
+        # doubles the effective filter order but produces ZERO phase shift, so
+        # detected lick times are not delayed relative to the raw trace. That
+        # timing fidelity is why filtfilt is used instead of a single-pass filter.
         filtered_data = scs.filtfilt(bh, ah, trace)
         filtered_data = scs.filtfilt(bl, al, filtered_data)
-        # TODO: revisit number of filter passes and their effect on lick detection accuracy
-        filtered_data = [scs.filtfilt(bh, ah, filtered_data) for _ in range(6)][-1]
-        filtered_data = [scs.filtfilt(bl, al, filtered_data) for _ in range(6)][-1]
 
-        # Convert filtered data to Hilbert envelope
+        # A second high-pass then low-pass pass, applied once each. This sharpens
+        # the band edges (steeper roll-off) at a small cost in signal amplitude.
+        #
+        # NOTE / correction of a previous "clever" one-liner: these two lines
+        # used to read
+        #     filtered_data = [scs.filtfilt(bh, ah, filtered_data)
+        #                      for _ in range(6)][-1]
+        # which LOOKS like six stacked passes but is not. Inside a list
+        # comprehension `filtered_data` is never reassigned, so all six entries
+        # are identical (one pass over the same input) and taking [-1] keeps
+        # exactly ONE of them. The net effect was a single extra pass; the five
+        # discarded copies only wasted memory and time, and the old docs claiming
+        # "7 filter passes" were inaccurate. The plain single application below
+        # reproduces the ACTUAL past numerical behavior (two high-pass and two
+        # low-pass passes total) while being honest about it. Do NOT "restore" a
+        # real 6x loop without re-validating downstream results -- it would
+        # change every lick count this function produces.
+        filtered_data = scs.filtfilt(bh, ah, filtered_data)
+        filtered_data = scs.filtfilt(bl, al, filtered_data)
+
+        # The analytic (Hilbert) transform turns the oscillating band-passed
+        # signal into a smooth amplitude envelope: env[i] is the instantaneous
+        # strength of the 8-12 Hz rhythm at sample i. Licking bouts show up as
+        # sustained high-envelope regions, so the envelope is a good gate for
+        # "is the animal rhythmically licking right now?".
         env = np.abs(scs.hilbert(filtered_data))
 
-        # Thresholding with Hilbert envelope
+        # Keep only samples where the licking-band envelope is strong. The
+        # threshold is an empirically tuned fraction (0.261) of this trace's peak
+        # envelope; it scales per-animal because absolute capacitance amplitude
+        # varies between sensors/animals. Samples below it are treated as no
+        # rhythmic licking.
         env_thr  = 0.261 * np.max(env)
         env_mask = env > env_thr
 
-        # Where the value decreases from one point to the next
+        # A lick is marked on the RAW trace by a sharp downward step: a single
+        # lick briefly pulls the sipper capacitance down. `downs` are the sample
+        # indices where the raw value drops by more than 15 capacitance units
+        # from one sample to the next. The +15 deadband ignores small
+        # sample-to-sample wiggle so only genuine lick-sized drops qualify.
+        # (+1 shifts the index to the sample AFTER the drop, i.e. the low point.)
         downs = np.where((trace[:-1] > trace[1:] + 15))[0] + 1
 
         # Apply envelope mask
