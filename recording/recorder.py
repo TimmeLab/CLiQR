@@ -13,13 +13,14 @@ from typing import Dict
 import h5py
 
 from hardware.mpr121 import MPR121Manager
-from utils.state import HISTORY_SIZE, NUM_CHANNELS, MAX_SAMPLE_HZ
+from utils.state import HISTORY_SIZE, NUM_CHANNELS, MAX_SAMPLE_HZ, MEASUREMENT_PERSIST_SECONDS
 
 
 class SensorRecorder:
     """Manages asynchronous sensor data recording."""
 
-    def __init__(self, mpr121_manager: MPR121Manager, filename: str, controllers: Dict):
+    def __init__(self, mpr121_manager: MPR121Manager, filename: str,
+                 controllers: Dict, measurements_provider=None):
         """
         Initialize the sensor recorder.
 
@@ -27,6 +28,9 @@ class SensorRecorder:
             mpr121_manager: MPR121Manager instance for reading sensors
             filename: Path to HDF5 file for saving data
             controllers: Dictionary of I2C controllers
+            measurements_provider: Optional callable returning
+                {sensor_id: SensorState}, read from the context-immune session
+                global, used for periodic measurement persistence.
         """
         self.mpr121_manager = mpr121_manager
         self.filename = filename
@@ -35,6 +39,17 @@ class SensorRecorder:
         self.loop_counter = 0
         # Count of read failures that survived retries, for rate-limited logging.
         self._read_error_count = 0
+
+        # Injected callback returning {sensor_id: SensorState}, read from the
+        # context-immune session global. None disables measurement persistence
+        # (e.g. in tests that don't exercise it). Kept as a callback so the
+        # recorder never imports UI/state-write code.
+        self.measurements_provider = measurements_provider
+        # Wall-clock of the last measurement persist; 0.0 makes the first flush
+        # persist ASAP so pre-entered volumes reach disk before any reset.
+        self._last_persist = 0.0
+        # Last value written per sensor per dataset name, to skip unchanged writes.
+        self._persisted = {}
 
         # HDF5 does not allow two concurrent open-for-write handles in one
         # process. The periodic buffer flush runs on the recording task while
@@ -163,6 +178,14 @@ class SensorRecorder:
                     elif self.loop_counter > 0 and self.loop_counter % HISTORY_SIZE == 0:
                         # Subsequent writes - append data
                         self._append_data()
+
+                    # Periodically persist volume/weight (piggybacked on the
+                    # flush cadence, gated by wall-clock so it stays ~5 min).
+                    if (self.measurements_provider is not None
+                            and time.monotonic() - self._last_persist
+                            >= MEASUREMENT_PERSIST_SECONDS):
+                        self._flush_measurements()
+                        self._last_persist = time.monotonic()
 
                     self.loop_counter += 1
 
@@ -294,6 +317,49 @@ class SensorRecorder:
                 if weight_name in group:
                     del group[weight_name]
                 group.create_dataset(weight_name, data=weight)
+
+    def _flush_measurements(self):
+        """Persist changed, >0 volume/weight values for started sensors.
+
+        Reads the injected session snapshot, opens the h5 once under the lock,
+        and for each sensor that has started a recording writes start_vol /
+        stop_vol / weight (at the sensor's current cycle) only when the value is
+        > 0 and differs from the last persisted value. The >0 guard means a
+        later reset (source reads 0.0) never overwrites a saved value.
+        """
+        if self.measurements_provider is None:
+            return
+        sensor_states = self.measurements_provider()
+        from utils.state import SERIAL_NUMBER_SENSOR_MAP
+
+        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
+            for sn in self.controllers.keys():
+                for sensor_id in SERIAL_NUMBER_SENSOR_MAP.get(sn, []):
+                    s = sensor_states.get(sensor_id)
+                    if s is None:
+                        continue
+                    # Only sensors that have actually started recording.
+                    if not (s.is_recording or s.start_time > 0):
+                        continue
+
+                    cycle = s.recording_cycle
+                    suffix = "" if cycle == 0 else str(cycle)
+                    fields = {
+                        f"start_vol{suffix}": s.start_volume,
+                        f"stop_vol{suffix}": s.stop_volume,
+                        f"weight{suffix}": s.weight,
+                    }
+                    grp = h5f[f"board_{sn}/sensor_{sensor_id}"]
+                    cache = self._persisted.setdefault(sensor_id, {})
+                    for name, value in fields.items():
+                        if value is None or value <= 0:
+                            continue
+                        if cache.get(name) == value:
+                            continue
+                        if name in grp:
+                            del grp[name]
+                        grp.create_dataset(name, data=value)
+                        cache[name] = value
 
     def _serial_for_sensor(self, sensor_id: int) -> str:
         """Return the board serial number that owns the given sensor."""

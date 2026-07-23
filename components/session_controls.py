@@ -136,7 +136,8 @@ def start_recording():
     current_recorder = SensorRecorder(
         mpr121_manager=mpr121_manager,
         filename=full_path,
-        controllers=state.i2c_controllers.value
+        controllers=state.i2c_controllers.value,
+        measurements_provider=lambda: state.session["sensor_states"],
     )
 
     # Start async recording task
