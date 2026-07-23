@@ -145,7 +145,9 @@ Desktop ↔ Pi 5 over TCP. `video/protocol.py` (shared wire format), `pi/server_
 
 ## Hardware: Sensor → Board Mapping
 
-Hardcoded in **two places** — `utils/state.py` (SERIAL_NUMBER_SENSOR_MAP) and `data_analysis.py:114–121`. Change both if layout changes.
+**Single source of truth:** `utils/state.py` (`SERIAL_NUMBER_SENSOR_MAP`, selected by `RACK_DESIGN` / `CLIQR_RACK`). `data_analysis.py` and `false_positive_analysis.py` both DERIVE their sensor→board lookup (`SENSOR_BOARD_MAP`) from it — do not hardcode a copy.
+
+4-board rack (`RACK_DESIGN="4board"`, default):
 
 | Board | Sensors |
 |---|---|
@@ -154,13 +156,13 @@ Hardcoded in **two places** — `utils/state.py` (SERIAL_NUMBER_SENSOR_MAP) and 
 | FT232H2 | 13, 14, 15, 19, 20, 21 |
 | FT232H3 | 16, 17, 18, 22, 23, 24 |
 
-MPR121 reads every other channel: 1, 3, 5, 7, 9, 11 (6 sensors per board).
+MPR121 reads every other channel: 1, 3, 5, 7, 9, 11 (6 sensors per board). The 8-board rack uses channels 1, 6, 11 (3 sensors per board) — see `_RACK_CONFIGS` in `utils/state.py`.
 
 ## Known Issues / Technical Debt
 
-1. **Sensor-board mapping duplicated** — `utils/state.py` and `data_analysis.py:114–121` both hardcode the same mapping.
-2. **`hilbert_algorithm()` filter passes** — `data_analysis.py:276` TODO: currently applies bandpass 7× total, may over-smooth.
-3. **`compute_bout_structure()` param inconsistency** — function defaults are `ibi_threshold=0.25, min_licks=3`; notebook call sites use `ibi_threshold=1.0, min_licks=2`.
+1. ~~**Sensor-board mapping duplicated**~~ — RESOLVED. `data_analysis.py` now derives `SENSOR_BOARD_MAP` from `utils/state.SERIAL_NUMBER_SENSOR_MAP` (matching `false_positive_analysis.py`). The old hardcoded copy also encoded only the retired 4-board layout and raised KeyErrors on 8-board recordings.
+2. **`hilbert_algorithm()` filter passes** — CORRECTED. Previously described as "7 passes / may over-smooth". False: the old `[filtfilt(...) for _ in range(6)][-1]` one-liner never rebound its input, so it applied only ONE extra pass (the other 5 copies were discarded). Actual behavior is 2 high-pass + 2 low-pass filtfilt passes total. Code now spells this out plainly; behavior unchanged. `hilbert_algorithm()` is experimental — the manuscript pipeline uses `basic_algorithm()`.
+3. **`compute_bout_structure()` param inconsistency** — function defaults are `ibi_threshold=0.25, min_licks=3`; notebook + `save_filtered_data()` call sites use `ibi_threshold=1.0, min_licks=2`.
 4. **ML experiments not integrated** — `checkpoints/best.pt` and training data exist but no training or inference code is in the repo.
 
 ## Important Notes

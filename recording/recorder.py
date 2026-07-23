@@ -383,12 +383,18 @@ class SensorRecorder:
                         cache[name] = value
 
     def _serial_for_sensor(self, sensor_id: int) -> str:
-        """Return the board serial number that owns the given sensor."""
-        from utils.state import SERIAL_NUMBER_SENSOR_MAP
-        import numpy as np
+        """Return the board serial number that owns the given sensor.
 
-        sn_idx = [sensor_id in sensors for sensors in SERIAL_NUMBER_SENSOR_MAP.values()]
-        return str(np.array(list(SERIAL_NUMBER_SENSOR_MAP.keys()))[sn_idx].item())
+        SERIAL_NUMBER_SENSOR_MAP maps each board serial to the list of sensor
+        numbers wired to it, so we simply walk the boards and return the first
+        one whose sensor list contains this sensor.
+        """
+        from utils.state import SERIAL_NUMBER_SENSOR_MAP
+
+        for serial_number, sensor_numbers in SERIAL_NUMBER_SENSOR_MAP.items():
+            if sensor_id in sensor_numbers:
+                return serial_number
+        raise ValueError(f"Sensor {sensor_id} is not mapped to any board.")
 
     def write_video_metadata(self, sensor_id: int, frame_index=None, pts=None,
                              video_filename=None, cycle=0,
