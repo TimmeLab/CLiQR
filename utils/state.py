@@ -240,13 +240,19 @@ CONFIG1_VALUE = 0x90
 CONFIG2_VALUE = 0x70
 
 # Recording parameters
-HISTORY_SIZE = 100  # Buffer size before HDF5 write
+HISTORY_SIZE = 500  # Buffer size before HDF5 write. Sized for ~112 Hz sampling
+# so flushes fire ~every 4.5 s (near the old cadence) and HDF5 chunks are ~4 KB.
+# Crash exposure = up to HISTORY_SIZE unflushed samples (~4.5 s), acceptable.
 # Poll-rate cap (Hz). The USB/chip path can sustain ~330 Hz, but we only need
 # ~150 Hz for lick detection. Capping here gives evenly-spaced samples and
 # smaller files. Note: this caps how often we READ the chip over USB; it does
 # not change the MPR121's on-chip charge/measure timing (that's the AFE config
 # in CONFIG1/CONFIG2). Keep below the chip's distinct-output rate set by SFI*ESI.
 MAX_SAMPLE_HZ = 150
+# How often (wall-clock seconds) the recorder persists changed volume/weight
+# values to the h5 during a run, checked at existing flush points. Elapsed-time
+# based so it stays ~5 min regardless of HISTORY_SIZE or sample-rate changes.
+MEASUREMENT_PERSIST_SECONDS = 300
 # Transient FTDI/USB reads occasionally time out ("No answer from FTDI"). Retry
 # the read a few times before giving up so a single hiccup doesn't drop a sample
 # (and, at the loop level, doesn't crash the whole session).
