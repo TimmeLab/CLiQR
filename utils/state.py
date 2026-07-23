@@ -99,6 +99,20 @@ session = {
     "filename": "",
     "comments": "",
     "sensor_states": {i: SensorState(sensor_id=i) for i in range(1, 25)},
+    # Hardware — live handles stay open in the server process across a browser
+    # refresh; these hold the same references so a fresh context can be
+    # re-pointed at them without a USB re-scan.
+    "boards_connected": {},
+    "i2c_controllers": {},
+    # Camera run-state + config (concurrent Pi video capture).
+    "camera_enabled": False,
+    "camera_sensor_id": None,
+    "camera_host": "picamera0.local",
+    "camera_port": 8770,
+    "camera_video_filename": "",
+    "camera_disk_warning": "",
+    "camera_stall_warning": "",
+    "camera_status": "unknown",
 }
 
 _REACTIVE_FOR = {
@@ -106,6 +120,11 @@ _REACTIVE_FOR = {
     "filename": filename,
     "comments": comments,
     "sensor_states": sensor_states,
+    # Hardware (these reactives are defined above, near the top of the module).
+    "boards_connected": boards_connected,
+    "i2c_controllers": i2c_controllers,
+    # Camera keys are registered further down, right after the camera reactives
+    # are defined (they live near the end of this module, below this point).
 }
 
 
@@ -308,6 +327,24 @@ snapshot_error = solara.reactive("")
 
 snapshot_pending = solara.reactive(False)
 """True while a test snapshot is being captured (camera opens ~1-2 s)."""
+
+
+# Register the camera run-state/config reactives with the persistence mechanism.
+# This must happen here, AFTER the reactives above are defined, because
+# _REACTIVE_FOR (defined earlier in the module) cannot reference names that do
+# not yet exist at that point. The snapshot_* and show_*_dialog reactives are
+# deliberately left out: they are transient UI state that should NOT survive a
+# refresh.
+_REACTIVE_FOR.update({
+    "camera_enabled": camera_enabled,
+    "camera_sensor_id": camera_sensor_id,
+    "camera_host": camera_host,
+    "camera_port": camera_port,
+    "camera_video_filename": camera_video_filename,
+    "camera_disk_warning": camera_disk_warning,
+    "camera_stall_warning": camera_stall_warning,
+    "camera_status": camera_status,
+})
 
 
 def make_camera_client(timeout=None):

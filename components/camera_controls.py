@@ -50,7 +50,8 @@ def test_connection() -> bool:
         ok = client.ping()
     except Exception:
         ok = False
-    state.camera_status.set("connected" if ok else "disconnected")
+    # Persist status so it survives a refresh (via set_session, not bare .set).
+    state.set_session("camera_status", "connected" if ok else "disconnected")
     return ok
 
 
@@ -61,7 +62,7 @@ def CameraControlsCard():
                      style={"margin-bottom": "20px"}):
         solara.Switch(label="Enable concurrent video",
                       value=state.camera_enabled.value,
-                      on_value=state.camera_enabled.set,
+                      on_value=lambda v: state.set_session("camera_enabled", v),
                       disabled=state.recording_all.value)
 
         if state.camera_disk_warning.value:
@@ -74,18 +75,18 @@ def CameraControlsCard():
             with solara.Row(style={"gap": "10px"}):
                 solara.InputText(label="Pi host/IP",
                                  value=state.camera_host.value,
-                                 on_value=state.camera_host.set,
+                                 on_value=lambda v: state.set_session("camera_host", v),
                                  disabled=state.recording_all.value)
                 solara.InputInt(label="Port",
                                 value=state.camera_port.value,
-                                on_value=state.camera_port.set,
+                                on_value=lambda v: state.set_session("camera_port", v),
                                 disabled=state.recording_all.value)
 
             solara.Select(
                 label="Camera sensor (whose Start bookmarks the video)",
                 value=state.camera_sensor_id.value,
                 values=list(range(1, 25)),
-                on_value=state.camera_sensor_id.set,
+                on_value=lambda v: state.set_session("camera_sensor_id", v),
                 disabled=state.recording_all.value)
 
             with solara.Row(style={"margin-top": "10px", "gap": "10px"}):
