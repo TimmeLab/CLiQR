@@ -16,6 +16,27 @@ from hardware.mpr121 import MPR121Manager
 from utils.state import HISTORY_SIZE, NUM_CHANNELS, MAX_SAMPLE_HZ, MEASUREMENT_PERSIST_SECONDS
 
 
+def measurement_warnings(sensor_states):
+    """Return one warning string per started sensor missing any measurement.
+
+    A sensor is "started" if it is recording or has a start_time. A field is
+    missing when its value is None or <= 0. Used at stop to make silent
+    measurement loss visible in the activity log.
+    """
+    warnings = []
+    for sid, s in sensor_states.items():
+        if not (s.is_recording or s.start_time > 0):
+            continue
+        missing = [name for name, value in (
+            ("start_vol", s.start_volume),
+            ("stop_vol", s.stop_volume),
+            ("weight", s.weight),
+        ) if value is None or value <= 0]
+        if missing:
+            warnings.append(f"Sensor {sid}: no {', '.join(missing)} recorded")
+    return warnings
+
+
 class SensorRecorder:
     """Manages asynchronous sensor data recording."""
 

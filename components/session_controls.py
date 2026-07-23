@@ -10,7 +10,7 @@ import threading
 import pandas as pd
 from dataclasses import replace
 from utils import state
-from recording.recorder import SensorRecorder
+from recording.recorder import SensorRecorder, measurement_warnings
 
 
 # Global recorder instance
@@ -269,6 +269,11 @@ def stop_recording():
                     weight=sensor.weight,
                     cycle=cycle
                 )
+
+    # Surface any started sensor whose measurements never made it to disk, so a
+    # silent loss (e.g. a mid-run reset that zeroed the store) is visible.
+    for msg in measurement_warnings(state.session["sensor_states"]):
+        state.add_log_message(f"WARNING: {msg}")
 
     # Write comments to file
     if current_recorder and state.comments.value:

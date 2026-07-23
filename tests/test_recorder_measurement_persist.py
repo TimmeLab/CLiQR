@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import h5py
 
-from recording.recorder import SensorRecorder
+from recording.recorder import SensorRecorder, measurement_warnings
 from utils.state import SERIAL_NUMBER_SENSOR_MAP, SensorState
 
 
@@ -67,3 +67,18 @@ def test_later_zero_does_not_clobber_saved_value(tmp_path):
         g = f[f"board_{serial}/sensor_{sid}"]
         assert g["start_vol"][()] == 6.5   # preserved, not clobbered
         assert g["weight"][()] == 20.0
+
+
+def test_measurement_warnings_flags_started_missing():
+    sensors = {
+        1: replace(SensorState(sensor_id=1), start_time=1.0,
+                   start_volume=5.0, stop_volume=4.0, weight=20.0),  # complete
+        2: replace(SensorState(sensor_id=2), start_time=1.0,
+                   start_volume=5.0),                                 # missing stop_vol+weight
+        3: SensorState(sensor_id=3),                                 # never started
+    }
+    msgs = measurement_warnings(sensors)
+    assert len(msgs) == 1
+    assert "Sensor 2" in msgs[0]
+    assert "stop_vol" in msgs[0] and "weight" in msgs[0]
+    assert "start_vol" not in msgs[0]
