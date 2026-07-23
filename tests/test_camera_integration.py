@@ -154,7 +154,10 @@ def test_global_stop_bookmarks_before_stop_session(tmp_path):
     sensors = state.sensor_states.value.copy()
     sensors[sensor_id] = replace(sensors[sensor_id], is_recording=True,
                                  recording_cycle=0, start_time=1.0)
-    state.sensor_states.set(sensors)
+    # stop_recording() reads the recording sensors from the authoritative
+    # session global (state.session["sensor_states"]), not the reactive, so we
+    # must publish through set_session or the stop-bookmark loop finds nothing.
+    state.set_session("sensor_states", sensors)
 
     state.camera_enabled.set(True)
     state.camera_sensor_id.set(sensor_id)

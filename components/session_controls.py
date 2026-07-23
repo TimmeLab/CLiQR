@@ -61,9 +61,10 @@ def _start_camera(video_base):
     """
     global camera_client
     camera_client = None
-    state.camera_video_filename.set("")
-    state.camera_disk_warning.set("")
-    state.camera_stall_warning.set("")
+    # Route through set_session so these clear/set operations survive a refresh.
+    state.set_session("camera_video_filename", "")
+    state.set_session("camera_disk_warning", "")
+    state.set_session("camera_stall_warning", "")
 
     try:
         client = state.make_camera_client(timeout=CAMERA_START_TIMEOUT)
@@ -74,7 +75,7 @@ def _start_camera(video_base):
 
     if resp.get("ok"):
         camera_client = client
-        state.camera_video_filename.set(resp.get("video_filename", ""))
+        state.set_session("camera_video_filename", resp.get("video_filename", ""))
         state.add_log_message(f"Camera pre-roll started: {resp.get('video_filename')}")
         # The Pi also reclaims disk space at session start (a crashed run
         # never reaches the post-stop cleanup), so surface that here too.
@@ -177,7 +178,7 @@ def _report_pi_disk_cleanup(resp):
             f"Pi disk space low: only {free_gb:.1f} GB free even after "
             "deleting old videos. Free up space on the Pi manually before "
             "the next session, or the video may not fit.")
-        state.camera_disk_warning.set(message)
+        state.set_session("camera_disk_warning", message)
         state.add_log_message(f"WARNING: {message}")
 
 
@@ -211,7 +212,8 @@ def _report_camera_stalls(resp):
             f"segment {stall.get('segment')} "
             f"({stall.get('reason', 'no frames')}); recording was restarted "
             f"into a new segment.")
-    state.camera_stall_warning.set(
+    state.set_session(
+        "camera_stall_warning",
         f"Camera stalled {len(stalls)} time(s) this session; the video is split "
         f"across multiple files (_part2, _part3, ...). Each has its own .txt "
         f"sidecar of absolute frame timestamps, so all segments still align to "

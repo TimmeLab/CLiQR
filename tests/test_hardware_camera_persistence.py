@@ -119,3 +119,24 @@ def test_mock_initialize_goes_through_set_session():
         "mock_initialize still writes i2c_controllers with bare .set()")
     assert "boards_connected.set(" not in src, (
         "mock_initialize still writes boards_connected with bare .set()")
+
+
+def test_camera_writes_go_through_set_session():
+    # Same source-inspection guard as the hardware writes: these on_value
+    # handlers and status writes must persist, or the video button and bookmark
+    # gate reset on refresh.
+    from components import camera_controls
+    from components import session_controls
+
+    camera_src = inspect.getsource(camera_controls)
+    # The Switch/Select/InputText handlers must not bind the bare reactive setter.
+    assert "on_value=state.camera_enabled.set" not in camera_src
+    assert "on_value=state.camera_sensor_id.set" not in camera_src
+    assert "on_value=state.camera_host.set" not in camera_src
+    assert "on_value=state.camera_port.set" not in camera_src
+    assert "state.camera_status.set(" not in camera_src
+
+    session_src = inspect.getsource(session_controls)
+    assert "camera_video_filename.set(" not in session_src
+    assert "camera_disk_warning.set(" not in session_src
+    assert "camera_stall_warning.set(" not in session_src
