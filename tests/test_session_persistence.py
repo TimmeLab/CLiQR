@@ -46,3 +46,15 @@ def test_rehydrate_restores_reactives_from_session():
     state.set_session("recording_all", False)
     state.set_session("sensor_states",
                       {i: state.SensorState(sensor_id=i) for i in range(1, 25)})
+
+
+def test_page_registers_rehydrate_and_imports_clean():
+    """Page must call the rehydrate helper once on mount. We can't easily mount
+    Solara here, so assert the helper is referenced in the Page module and that
+    importing it does not error."""
+    import inspect
+    import recording_gui
+
+    src = inspect.getsource(recording_gui.Page)
+    assert "rehydrate_reactives_from_session" in src
+    assert "use_effect" in src

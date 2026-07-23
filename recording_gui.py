@@ -20,6 +20,11 @@ from components.camera_controls import CameraControlsCard, SnapshotDialog
 def Page():
     """Main application page."""
 
+    # Restore this kernel context's reactives from the authoritative session
+    # global on mount. On a fresh start this is a no-op; after a mid-run
+    # reconnect it repopulates the new context so the UI shows the live run.
+    solara.use_effect(state.rehydrate_reactives_from_session, [])
+
     with solara.Column(style={"padding": "20px", "max-width": "1800px", "margin": "0 auto"}):
         # Header
         with solara.Card():
