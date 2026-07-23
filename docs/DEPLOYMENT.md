@@ -13,14 +13,14 @@
    - Download Zadig from: https://zadig.akeo.ie/
    - Connect one FT232H board via USB
    - Run Zadig and select the FT232H device
-   - Install the WinUSB driver
+   - Install the libusbK driver
    - Repeat for each FT232H board
 
 3. **Set up the CLiQR environment**
    - Open Miniforge Prompt (search for it in Start menu)
-   - Navigate to the CLiQR-GUI folder:
+   - Navigate to the CLiQR folder:
      ```
-     cd path\to\CLiQR-GUI
+     cd path\to\CLiQR
      ```
    - Create the environment:
      ```
@@ -36,7 +36,7 @@
 ### Daily Use
 
 1. **Connect Hardware**
-   - Connect all 4 FT232H boards via USB
+   - Connect all FT232H boards via USB
    - Ensure MPR121 sensors are properly connected via I2C
 
 2. **Start the Application**
@@ -46,7 +46,7 @@
 
 3. **Initialize Hardware**
    - Click the "Initialize Hardware" button
-   - Wait for all 4 boards to show as connected
+   - Wait for all boards to show as connected
 
 4. **Start Recording**
    - (Optional) Upload a cage layout CSV file
@@ -125,46 +125,6 @@ CLiQR-GUI/
 - Use type hints where appropriate
 - Keep component functions pure (no side effects)
 
-## Packaging for Distribution
-
-### Option 1: Conda Environment (Recommended)
-
-Users install Miniforge and create the environment from `environment.yml`.
-
-**Pros:**
-- Easy updates (git pull + conda env update)
-- Works on all platforms
-- No build step required
-
-**Cons:**
-- Requires Miniforge installation
-- Users must use command line initially
-
-### Option 2: PyInstaller (Future Work)
-
-Package the app as a standalone executable.
-
-```bash
-# Install PyInstaller
-pip install pyinstaller
-
-# Create executable
-pyinstaller --onefile --windowed --name CLiQR recording_gui.py
-
-# Executable will be in dist/
-```
-
-**Pros:**
-- No Python installation required
-- Single-file distribution
-
-**Cons:**
-- Large file size (~100MB)
-- Platform-specific (must build on Windows for Windows)
-- Harder to update
-- May have issues with Solara
-
-**Status:** Not yet implemented - requires testing
 
 ## Troubleshooting
 

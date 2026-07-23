@@ -145,7 +145,9 @@ Desktop ↔ Pi 5 over TCP. `video/protocol.py` (shared wire format), `pi/server_
 
 ## Hardware: Sensor → Board Mapping
 
-Hardcoded in **two places** — `utils/state.py` (SERIAL_NUMBER_SENSOR_MAP) and `data_analysis.py:114–121`. Change both if layout changes.
+**Single source of truth:** `utils/state.py` (`SERIAL_NUMBER_SENSOR_MAP`, selected by `RACK_DESIGN` / `CLIQR_RACK`). `data_analysis.py` and `false_positive_analysis.py` both DERIVE their sensor→board lookup (`SENSOR_BOARD_MAP`) from it — do not hardcode a copy.
+
+4-board rack (`RACK_DESIGN="4board"`, default):
 
 | Board | Sensors |
 |---|---|
@@ -154,20 +156,19 @@ Hardcoded in **two places** — `utils/state.py` (SERIAL_NUMBER_SENSOR_MAP) and 
 | FT232H2 | 13, 14, 15, 19, 20, 21 |
 | FT232H3 | 16, 17, 18, 22, 23, 24 |
 
-MPR121 reads every other channel: 1, 3, 5, 7, 9, 11 (6 sensors per board).
+MPR121 reads every other channel: 1, 3, 5, 7, 9, 11 (6 sensors per board). The 8-board rack uses channels 1, 6, 11 (3 sensors per board) — see `_RACK_CONFIGS` in `utils/state.py`.
 
 ## Known Issues / Technical Debt
 
-1. **Sensor-board mapping duplicated** — `utils/state.py` and `data_analysis.py:114–121` both hardcode the same mapping.
-2. **`hilbert_algorithm()` filter passes** — `data_analysis.py:276` TODO: currently applies bandpass 7× total, may over-smooth.
-3. **`compute_bout_structure()` param inconsistency** — function defaults are `ibi_threshold=0.25, min_licks=3`; notebook call sites use `ibi_threshold=1.0, min_licks=2`.
-4. **ML experiments not integrated** — `checkpoints/best.pt` and training data exist but no training or inference code is in the repo.
+1. **`compute_bout_structure()` param inconsistency** — function defaults are `ibi_threshold=0.25, min_licks=3`; notebook + `save_filtered_data()` call sites use `ibi_threshold=1.0, min_licks=2`.
+2. **ML experiments not integrated**
+
 
 ## Important Notes
 
 - **Recording:** Initialize hardware before starting sessions. Volume/weight inputs disabled once sensor is recording.
 - **Layout files:** CSV or XLSX. Format: sensor number in index, animal ID in first column. Template at `layouts/default_layout.csv`.
 - **Timestamps:** `time.time()` (Unix epoch) throughout. `time_data` in raw HDF5 is absolute Unix seconds.
-- **False positive data:** CVAT annotations, picamera MP4/TXT files, and raw/filtered HDF5s all live under `Lickometry Data/ACG-26-3/`. Pipeline driven by `session_manifest.csv` in that directory.
+- **False positive data:** CVAT annotations, picamera MP4/TXT files, and raw/filtered HDF5s all live under `Lickometry Data/ACG-26-3/` currently (ACG-26-3 is the current cohort of animals in the lab). Pipeline driven by `session_manifest.csv` in that directory.
 - **Mock mode:** `solara run recording_gui_mock.py` for UI testing without physical hardware.
 - **Browser:** Chrome/Firefox/Edge. Safari may have issues with Solara.
