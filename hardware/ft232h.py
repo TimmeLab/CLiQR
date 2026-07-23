@@ -144,7 +144,8 @@ class FT232HManager:
 
         info = {}
         for sn in self.controllers.keys():
-            # Each board controls 6 sensors
+            # Sensors per board depends on the rack design (6 on the 4-board
+            # rack, 3 on the 8-board rack); read it from the mapping directly.
             sensor_count = len(SERIAL_NUMBER_SENSOR_MAP.get(sn, []))
             info[sn] = sensor_count
 

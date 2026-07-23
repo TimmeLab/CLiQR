@@ -36,7 +36,7 @@ Entry point: `recording_gui.py` (Solara web app, `localhost:8765`)
 |---|---|
 | `filter_data()` | Top-level: loads raw HDF5, trims to start/stop times, calls algorithm |
 | `basic_algorithm()` | Threshold-based peak detection. Scans all inter-value thresholds, picks the one maximizing peak count. Requires 2-threshold depth. |
-| `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. Known issue: 7 filter passes (see Known Issues). |
+| `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. Experimental (manuscript uses `basic_algorithm()`). Applies 2 high-pass + 2 low-pass filtfilt passes (see corrected Known Issue #2). |
 | `_run_optimal_threshold()` | Grid-search threshold fraction maximizing R² vs. volume. Comparison baseline. |
 | `compute_bout_structure()` | ILIs, bout lick counts, bout durations. |
 | `save_filtered_data()` | Writes per-animal HDF5 group. |
@@ -187,8 +187,8 @@ Dev: pyenv-virtualenv (`cliqr` env), macOS. Deploy: Miniforge/conda, Windows.
 
 ## Known Issues / Technical Debt
 
-1. **Sensor-board mapping duplicated** — `utils/state.py:SERIAL_NUMBER_SENSOR_MAP` and `data_analysis.py:114–121` both hardcode the same mapping. Change one → change both.
-2. **`hilbert_algorithm()` filter passes** — `data_analysis.py:276` TODO: currently applies bandpass 7× total (1 + 6 extra passes), likely excessive.
-3. **`compute_bout_structure()` param inconsistency** — function signature defaults `ibi_threshold=0.25, min_licks=3`; notebook call sites pass `ibi_threshold=1.0, min_licks=2`.
+1. ~~**Sensor-board mapping duplicated**~~ — RESOLVED. `data_analysis.py` now derives `SENSOR_BOARD_MAP` from `utils/state.SERIAL_NUMBER_SENSOR_MAP` (single source of truth, same as `false_positive_analysis.py`). The old hardcoded copy encoded only the retired 4-board layout and raised KeyErrors on 8-board recordings.
+2. ~~**`hilbert_algorithm()` filter passes (7×)**~~ — CORRECTED, claim was false. The old `[filtfilt(...) for _ in range(6)][-1]` one-liner never rebound its input, so all 6 list entries were identical and only ONE survived `[-1]`. Real behavior = 2 high-pass + 2 low-pass filtfilt passes total, not 7. Code now spells this out; numerical behavior unchanged. `hilbert_algorithm()` is experimental; manuscript uses `basic_algorithm()`.
+3. **`compute_bout_structure()` param inconsistency** — function signature defaults `ibi_threshold=0.25, min_licks=3`; notebook + `save_filtered_data()` call sites pass `ibi_threshold=1.0, min_licks=2`.
 4. **ML experiments not integrated** — `checkpoints/best.pt` and `Training Data/*.pt` exist but no training script or inference path is in the repo.
 5. **Two raw HDF5 files unorganized** — `Lickometry Data/raw_data_2026-02-18_*.h5` not in a cohort folder and not analyzed.

@@ -117,8 +117,10 @@ class MPR121Manager:
                     raise
                 time.sleep(READ_RETRY_DELAY)
 
-        # Only the wired channels (ACTIVE_CHANNELS = 1, 6, 11) are recorded.
-        # Order matches the 3 sensor IDs mapped to this board.
+        # Only the physically wired MPR121 channels are recorded. ACTIVE_CHANNELS
+        # is set by the selected rack design (e.g. [1, 3, 5, 7, 9, 11] on the
+        # 4-board rack, [1, 6, 11] on the 8-board rack); its order matches the
+        # order of the sensor IDs mapped to this board in SERIAL_NUMBER_SENSOR_MAP.
         for chan in ACTIVE_CHANNELS:
             # Combine two bytes (little-endian)
             value = raw_buffer[2 * chan] | (raw_buffer[2 * chan + 1] << 8)
@@ -153,18 +155,20 @@ class MPR121Manager:
             from utils import state
             import h5py
             from utils.state import SERIAL_NUMBER_SENSOR_MAP
-            import numpy as np
 
             filename = state.filename.value
             if not filename:
                 return None, None
 
-            # Find which board this sensor is on
-            sn_idx = [sensor_id in sensors for sensors in SERIAL_NUMBER_SENSOR_MAP.values()]
-            if not any(sn_idx):
+            # Find which board this sensor is on: walk the board->sensors map and
+            # take the serial number whose sensor list contains this sensor.
+            sn = None
+            for serial_number, sensor_numbers in SERIAL_NUMBER_SENSOR_MAP.items():
+                if sensor_id in sensor_numbers:
+                    sn = serial_number
+                    break
+            if sn is None:
                 return None, None
-
-            sn = str(np.array(list(SERIAL_NUMBER_SENSOR_MAP.keys()))[sn_idx].item())
 
             with h5py.File(filename, "r") as h5f:
                 group_path = f"board_{sn}/sensor_{sensor_id}"

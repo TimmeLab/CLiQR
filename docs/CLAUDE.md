@@ -160,9 +160,16 @@ MPR121 reads every other channel: 1, 3, 5, 7, 9, 11 (6 sensors per board). The 8
 
 ## Known Issues / Technical Debt
 
+<<<<<<< HEAD
 1. **`compute_bout_structure()` param inconsistency** — function defaults are `ibi_threshold=0.25, min_licks=3`; notebook + `save_filtered_data()` call sites use `ibi_threshold=1.0, min_licks=2`.
 2. **ML experiments not integrated**
 
+=======
+1. ~~**Sensor-board mapping duplicated**~~ — RESOLVED. `data_analysis.py` now derives `SENSOR_BOARD_MAP` from `utils/state.SERIAL_NUMBER_SENSOR_MAP` (matching `false_positive_analysis.py`). The old hardcoded copy also encoded only the retired 4-board layout and raised KeyErrors on 8-board recordings.
+2. **`hilbert_algorithm()` filter passes** — CORRECTED. Previously described as "7 passes / may over-smooth". False: the old `[filtfilt(...) for _ in range(6)][-1]` one-liner never rebound its input, so it applied only ONE extra pass (the other 5 copies were discarded). Actual behavior is 2 high-pass + 2 low-pass filtfilt passes total. Code now spells this out plainly; behavior unchanged. `hilbert_algorithm()` is experimental — the manuscript pipeline uses `basic_algorithm()`.
+3. **`compute_bout_structure()` param inconsistency** — function defaults are `ibi_threshold=0.25, min_licks=3`; notebook + `save_filtered_data()` call sites use `ibi_threshold=1.0, min_licks=2`.
+4. **ML experiments not integrated** — `checkpoints/best.pt` and training data exist but no training or inference code is in the repo.
+>>>>>>> 49ea6093b251adab53381c27903eb1e3d1bc426c
 
 ## Important Notes
 
