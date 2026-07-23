@@ -133,7 +133,7 @@ def start_sensor(sensor_id: int):
         cycle=current_cycle
     )
 
-    state.sensor_states.set(sensors)
+    state.set_session("sensor_states", sensors)
     cycle_text = f" (cycle {current_cycle + 1})" if current_cycle > 0 else ""
     state.add_log_message(f"Sensor {sensor_id}: Recording started{cycle_text}")
 
@@ -272,7 +272,7 @@ def stop_sensor(sensor_id: int):
     # active on an individual stop, so fire-and-forget like the start bookmark.
     bookmark_stop(sensor_id, current_cycle)
 
-    state.sensor_states.set(sensors)
+    state.set_session("sensor_states", sensors)
 
     # Format elapsed time for log
     hours = int(elapsed // 3600)
@@ -299,7 +299,7 @@ async def update_sensor_timer(sensor_id: int):
             sensor,
             elapsed_seconds=int(time_module.time() - sensor.start_time)
         )
-        state.sensor_states.set(sensors)
+        state.set_session("sensor_states", sensors)
 
 
 def test_sensor(sensor_id: int):
@@ -429,7 +429,7 @@ def SensorCard(sensor_id: int):
             def set_start_vol(value):
                 sensors = state.sensor_states.value.copy()
                 sensors[sensor_id] = replace(sensors[sensor_id], start_volume=value)
-                state.sensor_states.set(sensors)
+                state.set_session("sensor_states", sensors)
 
             solara.InputFloat(
                 label="Start Vol (mL)",
@@ -443,7 +443,7 @@ def SensorCard(sensor_id: int):
             def set_stop_vol(value):
                 sensors = state.sensor_states.value.copy()
                 sensors[sensor_id] = replace(sensors[sensor_id], stop_volume=value)
-                state.sensor_states.set(sensors)
+                state.set_session("sensor_states", sensors)
 
             solara.InputFloat(
                 label="Stop Vol (mL)",
@@ -457,7 +457,7 @@ def SensorCard(sensor_id: int):
             def set_weight(value):
                 sensors = state.sensor_states.value.copy()
                 sensors[sensor_id] = replace(sensors[sensor_id], weight=value)
-                state.sensor_states.set(sensors)
+                state.set_session("sensor_states", sensors)
 
             solara.InputFloat(
                 label="Weight (g)",

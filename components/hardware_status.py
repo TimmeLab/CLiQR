@@ -75,7 +75,7 @@ def update_animal_ids_from_layout():
                     animal_id=str(animal_id)
                 )
 
-    state.sensor_states.set(sensors)
+    state.set_session("sensor_states", sensors)
 
 
 @solara.component

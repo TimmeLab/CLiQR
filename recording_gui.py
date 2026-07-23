@@ -60,7 +60,7 @@ def Page():
                 solara.InputTextArea(
                     label="",
                     value=state.comments.value,
-                    on_value=state.comments.set,
+                    on_value=lambda v: state.set_session("comments", v),
                     continuous_update=True,
                     rows=6
                 )

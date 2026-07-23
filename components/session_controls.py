@@ -42,13 +42,13 @@ def _reset_sensor_lifecycle():
     (start_time1, video_pts1, ...) that the analysis, which reads cycle 0, could
     not find. Animal IDs and volume/weight inputs are preserved.
     """
-    sensors = state.sensor_states.value.copy()
+    sensors = state.session["sensor_states"].copy()
     for sid, s in sensors.items():
         sensors[sid] = replace(
             s, is_recording=False, status="idle",
             recording_cycle=0, elapsed_seconds=0, start_time=0.0,
         )
-    state.sensor_states.set(sensors)
+    state.set_session("sensor_states", sensors)
 
 
 def _start_camera(video_base):
@@ -119,8 +119,8 @@ def start_recording():
         full_path = filename
 
     # Update state
-    state.filename.set(full_path)
-    state.recording_all.set(True)
+    state.set_session("filename", full_path)
+    state.set_session("recording_all", True)
     state.session_error.set("")  # Clear error on successful start
 
     # Fresh file -> restart every sensor's recording cycle at 0.
@@ -130,7 +130,7 @@ def start_recording():
     from components.hardware_status import mpr121_manager
     if mpr121_manager is None:
         state.add_log_message("ERROR: MPR121 manager not initialized")
-        state.recording_all.set(False)
+        state.set_session("recording_all", False)
         return
 
     current_recorder = SensorRecorder(
@@ -145,7 +145,7 @@ def start_recording():
             await current_recorder.record_sensors(log_callback=state.add_log_message)
         except Exception as e:
             state.add_log_message(f"Recording error: {str(e)}")
-            state.recording_all.set(False)
+            state.set_session("recording_all", False)
 
     recording_task = asyncio.create_task(run_recording())
 
@@ -229,7 +229,7 @@ def stop_recording():
 
     # Stop all sensors that are still recording and write all volume/weight metadata
     stop_bookmark_thread = None
-    sensors = state.sensor_states.value.copy()
+    sensors = state.session["sensor_states"].copy()
     for sensor_id, sensor in sensors.items():
         if sensor.is_recording:
             # Write stop time for sensors still recording
@@ -254,7 +254,7 @@ def stop_recording():
                 recording_cycle=sensor.recording_cycle + 1
             )
 
-    state.sensor_states.set(sensors)
+    state.set_session("sensor_states", sensors)
 
     # Now write volume/weight metadata for ALL sensors that have recording cycles > 0
     if current_recorder:
@@ -315,7 +315,7 @@ def stop_recording():
     camera_client = None
 
     # Update state
-    state.recording_all.set(False)
+    state.set_session("recording_all", False)
     state.add_log_message(f"Recording session stopped - file saved: {state.filename.value}")
 
 

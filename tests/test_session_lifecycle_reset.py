@@ -11,7 +11,7 @@ import components.session_controls as sc
 
 
 def test_reset_clears_cycle_but_keeps_inputs():
-    sensors = state.sensor_states.value.copy()
+    sensors = state.session["sensor_states"].copy()
     sid = next(iter(sensors))
     sensors[sid] = replace(
         sensors[sid],
@@ -24,7 +24,7 @@ def test_reset_clears_cycle_but_keeps_inputs():
         start_volume=5.0,
         weight=22.0,
     )
-    state.sensor_states.set(sensors)
+    state.set_session("sensor_states", sensors)
 
     sc._reset_sensor_lifecycle()
 
@@ -41,6 +41,28 @@ def test_reset_clears_cycle_but_keeps_inputs():
     assert s.weight == 22.0
 
     # Cleanup for other tests.
-    state.sensor_states.set({
+    state.set_session("sensor_states", {
         i: state.SensorState(sensor_id=i) for i in range(1, 25)
     })
+
+
+def test_reset_keeps_session_global_in_sync():
+    """_reset_sensor_lifecycle must update the authoritative global, not just
+    the reactive, so a reconnect during the run rehydrates correct lifecycle."""
+    sensors = {i: state.SensorState(sensor_id=i) for i in range(1, 25)}
+    sensors[4] = replace(sensors[4], recording_cycle=3, is_recording=True,
+                         start_volume=7.0, weight=21.0)
+    state.set_session("sensor_states", sensors)
+
+    sc._reset_sensor_lifecycle()
+
+    s_global = state.session["sensor_states"][4]
+    assert s_global.recording_cycle == 0        # lifecycle reset...
+    assert s_global.is_recording is False
+    assert s_global.start_volume == 7.0         # ...inputs preserved...
+    # ...and the global matches the reactive.
+    assert state.sensor_states.value[4].recording_cycle == 0
+    assert state.sensor_states.value[4].start_volume == 7.0
+
+    state.set_session("sensor_states",
+                      {i: state.SensorState(sensor_id=i) for i in range(1, 25)})
