@@ -77,6 +77,60 @@ sensor_states = solara.reactive({
 
 
 # ============================================================================
+# Comments
+# ============================================================================
+
+comments = solara.reactive("")
+"""User comments to be saved to HDF5 file on session stop."""
+
+
+# ============================================================================
+# Authoritative session state (context-immune)
+# ============================================================================
+#
+# Solara stores each module-level reactive value PER kernel context
+# (toestand.py KernelStore._get_dict): a reconnect/refresh gives the browser a
+# fresh context whose reactives all read their defaults, while plain module
+# globals (like current_recorder) are shared. So session-critical values are
+# held here in a plain dict and MIRRORED into the reactives, and Page rehydrates
+# the reactives from here on mount. This is what survives a mid-run reconnect.
+session = {
+    "recording_all": False,
+    "filename": "",
+    "comments": "",
+    "sensor_states": {i: SensorState(sensor_id=i) for i in range(1, 25)},
+}
+
+_REACTIVE_FOR = {
+    "recording_all": recording_all,
+    "filename": filename,
+    "comments": comments,
+    "sensor_states": sensor_states,
+}
+
+
+def set_session(key, value):
+    """Update authoritative session state and mirror it into the reactive.
+
+    All session-critical writes must go through here so the durable global and
+    the per-context reactive never diverge.
+    """
+    session[key] = value
+    _REACTIVE_FOR[key].set(value)
+
+
+def rehydrate_reactives_from_session():
+    """Restore this kernel context's reactives from the authoritative global.
+
+    Called once per Page mount. On a fresh first mount this is a no-op (global
+    == defaults); after a mid-run reconnect it repopulates the new context's
+    reactives with the live run.
+    """
+    for key, rx in _REACTIVE_FOR.items():
+        rx.set(session[key])
+
+
+# ============================================================================
 # Activity Log
 # ============================================================================
 
@@ -91,14 +145,6 @@ def add_log_message(message: str):
     current = log_messages.value.copy()
     current.append(f"[{timestamp}] {message}")
     log_messages.set(current)
-
-
-# ============================================================================
-# Comments
-# ============================================================================
-
-comments = solara.reactive("")
-"""User comments to be saved to HDF5 file on session stop."""
 
 
 # ============================================================================
