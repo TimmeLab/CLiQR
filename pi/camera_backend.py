@@ -40,6 +40,15 @@ TARGET_FPS = 120
 BITRATE = 3_000_000  # bits/s; keeps 720p120 software H.264 drop-free
 _FRAME_DURATION_US = round(1_000_000 / TARGET_FPS)  # 8333 us
 
+# Fixed focus for both recording and the pre-recording snapshot. AfMode 0 is
+# manual (autofocus off); LensPosition is in dioptres, and the Camera 3's max of
+# 10.0 focuses as close as the lens allows. Using 1000 here as a large value the
+# driver clamps to that near limit -- so the snapshot's focus matches the
+# recording instead of the camera autofocusing to a different plane.
+_AF_MODE_MANUAL = 0
+_LENS_POSITION_NEAR = 1000
+_FOCUS_CONTROLS = {"AfMode": _AF_MODE_MANUAL, "LensPosition": _LENS_POSITION_NEAR}
+
 # Frame-delivery watchdog. On 2026-07-21 the camera stopped delivering frames
 # 44 min into a 2 h 19 min session and nothing noticed: the server kept
 # answering TCP, and the Stop bookmark happily returned a frame that was 90 min
@@ -89,8 +98,7 @@ def video_config_kwargs() -> dict:
         "raw": {"size": SENSOR_FAST_MODE_SIZE},
         "controls": {
             "FrameDurationLimits": (_FRAME_DURATION_US, _FRAME_DURATION_US),
-            "AfMode": 0,
-            "LensPosition": 1000,
+            **_FOCUS_CONTROLS,
         },
     }
 
@@ -206,7 +214,8 @@ class Picamera2Backend:
         """
         cam = self._create_camera()
         try:
-            cam.configure(cam.create_still_configuration(main={"size": RECORD_SIZE}))
+            cam.configure(cam.create_still_configuration(
+                main={"size": RECORD_SIZE}, controls=dict(_FOCUS_CONTROLS)))
             cam.start()
             return self._capture_jpeg(cam)
         finally:

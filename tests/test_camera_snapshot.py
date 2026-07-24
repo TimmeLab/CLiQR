@@ -20,8 +20,10 @@ class _FakeStillCamera:
     def __init__(self):
         self.started = False
         self.closed = False
+        self.still_kwargs = None
 
     def create_still_configuration(self, **kwargs):
+        self.still_kwargs = kwargs
         return {}
 
     def configure(self, config):
@@ -57,6 +59,21 @@ def test_snapshot_returns_jpeg_bytes(tmp_path):
     backend = _SnapshotBackend(str(tmp_path))
     jpeg = backend.snapshot()
     assert jpeg == b"JPEGBYTES"
+
+
+def test_snapshot_uses_recording_focus(tmp_path):
+    # Snapshot must fix focus to the same near plane the recording uses (manual
+    # AF, LensPosition near limit) so the alignment still matches the video.
+    from pi import camera_backend
+    backend = _SnapshotBackend(str(tmp_path))
+    backend.snapshot()
+    controls = backend.last_camera.still_kwargs["controls"]
+    assert controls["AfMode"] == camera_backend._AF_MODE_MANUAL
+    assert controls["LensPosition"] == camera_backend._LENS_POSITION_NEAR
+    # Same focus the video config requests.
+    vid = camera_backend.video_config_kwargs()["controls"]
+    assert controls["AfMode"] == vid["AfMode"]
+    assert controls["LensPosition"] == vid["LensPosition"]
 
 
 def test_snapshot_releases_the_camera(tmp_path):
