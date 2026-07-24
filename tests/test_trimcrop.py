@@ -493,10 +493,47 @@ def test_frame_session_times_scales_with_slope():
     assert sess[300] == pytest.approx(0.05 + 1.002 * (0.3 - 0.1))
 
 
+def test_encoded_sidecar_path():
+    assert tc.encoded_sidecar_path("/a/b/rec.txt") == "/a/b/rec.encpts.txt"
+    assert tc.encoded_sidecar_path("rec.txt") == "rec.encpts.txt"
+
+
 def test_probe_frame_session_times_applies_same_clock(monkeypatch):
-    # ffprobe path must use the identical transform as the sidecar path.
+    # ffprobe path must use the identical transform as the sidecar path. Container
+    # is CFR 10 fps, sidecar identical rate (0.1 s/frame): container pts_time 0.3
+    # -> frame index 3 -> sidecar second 0.3, then the SAME clock transform.
     calls = []
     monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="0.3\n"))
+    pts_ns = (np.arange(0, 20) * 100_000_000).astype(np.int64)  # 0.1 s / frame
     clock = tc.SessionClock(pts_start_sec=0.1, latency=0.05, slope=1.002)
-    got = tc.probe_frame_session_times("clip.mp4", clock)
+    got = tc.probe_frame_session_times("clip.mp4", clock, pts_ns, framerate=10.0)
     assert got[0] == pytest.approx(0.05 + 1.002 * (0.3 - 0.1))
+
+
+def test_probe_frame_session_times_uses_sidecar_by_index_not_container_pts(monkeypatch):
+    # The mp4 is muxed at a constant -framerate (pi/ffmpeg_output.py), so its PTS
+    # are evenly spaced and drift from the real (slightly off-nominal) capture
+    # clock. Frame timing must come from the sidecar SensorTimestamps BY FRAME
+    # INDEX, never from the container PTS. Here the container runs CFR 10 fps but
+    # the real capture ran at 0.11 s/frame, so container frame k (pts k/10) must
+    # be timed 0.11*k, not 0.1*k.
+    calls = []
+    # two clip frames at container pts_time 0.4 and 0.5 -> indices 4 and 5
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="0.4\n0.5\n"))
+    pts_ns = (np.arange(0, 20) * 110_000_000).astype(np.int64)  # real 0.11 s/frame
+    clock = tc.SessionClock(pts_start_sec=0.0, latency=0.0, slope=1.0)
+    got = tc.probe_frame_session_times("clip.mp4", clock, pts_ns, framerate=10.0)
+    assert got[0] == pytest.approx(0.44)  # index 4 -> 0.11*4, NOT container 0.4
+    assert got[1] == pytest.approx(0.55)  # index 5 -> 0.11*5, NOT container 0.5
+
+
+def test_probe_frame_session_times_clamps_surplus_container_frames(monkeypatch):
+    # `-c:v copy` can leave a few more container frames than sidecar lines (frames
+    # encoded but not logged). A clip frame whose index runs past the sidecar must
+    # clamp to the last sidecar timestamp rather than index out of bounds.
+    calls = []
+    monkeypatch.setattr(tc.subprocess, "run", _fake_run(calls, stdout="1.9\n"))
+    pts_ns = (np.arange(0, 10) * 100_000_000).astype(np.int64)  # indices 0..9
+    clock = tc.SessionClock(pts_start_sec=0.0, latency=0.0, slope=1.0)
+    got = tc.probe_frame_session_times("clip.mp4", clock, pts_ns, framerate=10.0)
+    assert got[0] == pytest.approx(0.9)  # index 19 clamped to last (0.9 s)

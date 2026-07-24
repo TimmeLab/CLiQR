@@ -60,11 +60,57 @@ def log_path_for(video_path) -> Path:
     return video_path.with_suffix(".ffmpeg.log")
 
 
-def spawn_muxer(video_path, framerate: int):
+def encoded_sensor_ns(first_sensor_ns: int, timestamp_us) -> int:
+    """Absolute SensorTimestamp (ns) of an encoded frame.
+
+    picamera2 hands ``Output.outputframe`` a ``timestamp`` in MICROSECONDS,
+    relative to the segment's first encoded frame, on the SensorTimestamp clock
+    (probed on the Pi: ``timestamp_us == (SensorTimestamp_ns - first_ns) / 1000``).
+    Adding the segment's first SensorTimestamp restores absolute ns, so the
+    ``.encpts.txt`` sidecar matches the capture ``.txt`` sidecar and the bookmark
+    clock exactly."""
+    return int(first_sensor_ns) + int(timestamp_us) * 1000
+
+
+def make_sidecar_output(fileobj, encpts_fh, first_ns_getter):
+    """A picamera2 Output that muxes to ``fileobj`` (ffmpeg's stdin) AND appends
+    each ENCODED frame's absolute SensorTimestamp to ``encpts_fh`` -- one line per
+    CONTAINER frame, so encoder drops are excluded and the desktop can time
+    container frames exactly (see ``video/trimcrop.probe_frame_session_times``).
+
+    ``first_ns_getter`` returns the segment's first SensorTimestamp (ns), set by
+    the capture callback on frame 0 -- which always precedes that frame's encode,
+    so it is populated before the first ``outputframe``. Defined here so the
+    picamera2 import stays Pi-only. Sidecar writes never raise: a fault here must
+    not kill the encoder thread (the video and trace matter more than the map)."""
+    from picamera2.outputs import FileOutput
+
+    class _SidecarOutput(FileOutput):
+        def outputframe(self, frame, keyframe=True, timestamp=None,
+                        *args, **kwargs):
+            try:
+                if (encpts_fh is not None and not encpts_fh.closed
+                        and timestamp is not None):
+                    base = first_ns_getter()
+                    if base is not None:
+                        encpts_fh.write(
+                            f"{encoded_sensor_ns(base, timestamp)}\n")
+            except Exception:  # noqa: BLE001 - never kill the encoder thread
+                pass
+            return super().outputframe(frame, keyframe, timestamp,
+                                       *args, **kwargs)
+
+    return _SidecarOutput(fileobj)
+
+
+def spawn_muxer(video_path, framerate: int, encpts_fh=None, first_ns_getter=None):
     """Start ffmpeg for ``video_path``; return (picamera2 Output, Popen).
 
-    The returned Output writes the encoder's stream into ffmpeg's stdin. The
-    caller owns shutdown: stop the recording, then call ``finish_muxer``.
+    The returned Output writes the encoder's stream into ffmpeg's stdin. When
+    ``encpts_fh`` is given it ALSO logs each encoded frame's absolute
+    SensorTimestamp there (one line per container frame; see
+    ``make_sidecar_output``), so the desktop can time frames past encoder drops.
+    The caller owns shutdown: stop the recording, then call ``finish_muxer``.
     """
     from picamera2.outputs import FileOutput
 
@@ -77,7 +123,11 @@ def spawn_muxer(video_path, framerate: int):
         # ffmpeg holds its own dup of the fd; ours would otherwise leak per
         # session, and a long run may open several segments.
         log.close()
-    return FileOutput(proc.stdin), proc
+    if encpts_fh is not None:
+        output = make_sidecar_output(proc.stdin, encpts_fh, first_ns_getter)
+    else:
+        output = FileOutput(proc.stdin)
+    return output, proc
 
 
 def finish_muxer(proc, timeout: float = MUX_FINISH_TIMEOUT_S) -> None:

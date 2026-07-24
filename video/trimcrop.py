@@ -21,7 +21,12 @@ def find_video_sensor(raw_h5):
         if not isinstance(board, h5py.Group):
             continue
         for sensor_name, group in board.items():
-            if isinstance(group, h5py.Group) and "video_filename" in group:
+            if not isinstance(group, h5py.Group):
+                continue
+            # A multi-cycle recording (Start/Stop restart) writes the bookmark
+            # datasets suffixed with the cycle number, so match video_filename
+            # OR video_filename{N} -- mirroring _resolve_cycle's suffix handling.
+            if any(re.match(r"video_filename\d*$", k) for k in group.keys()):
                 m = re.match(r"sensor_(\d+)$", sensor_name)
                 if not m:
                     continue
@@ -186,12 +191,59 @@ def trim_window_seconds(clock, pts_ns, start, end, tail_margin=TAIL_MARGIN):
     return sf, ef, start_sec, end_sec
 
 
-def probe_frame_session_times(path, clock):
-    """Session time τ of every frame in ``path``, read from the file's real
-    presentation timestamps via ffprobe. Because trimmed clips keep their original
-    PTS (``-copyts``), each frame self-reports its true video-second, so
-    ``clock.session_time(pts)`` is its session time (0 = start_time). Uses the
-    SAME clock as the sidecar path, so drift and latency are applied identically."""
+def encoded_sidecar_path(pts_txt_path):
+    """Companion sidecar of per-ENCODED-frame SensorTimestamps -- one line per
+    frame the encoder actually emitted, i.e. one per CONTAINER frame, written by
+    the Pi output wrapper. ``<stem>.txt`` (every captured frame) -> ``<stem>``
+    ``.encpts.txt``.
+
+    When present it times container frames EXACTLY: the software encoder drops
+    frames under load (the capture sidecar still logs their SensorTimestamps, so
+    it slowly out-counts the CFR container), and this sidecar excludes exactly
+    those drops, so container index k maps straight to its real capture time.
+    When absent the capture sidecar is the fallback, which drifts by the dropped
+    frames (grows with distance from the bookmark)."""
+    stem, _ = os.path.splitext(pts_txt_path)
+    return stem + ".encpts.txt"
+
+
+def probe_frame_rate(path):
+    """The container's constant frame rate (the ``-framerate`` the mp4 was muxed
+    at, see ``pi/ffmpeg_output.py``), from ffprobe's ``r_frame_rate`` ("120/1")."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", path],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}:\n{r.stderr[-800:]}")
+    tok = r.stdout.strip()
+    num, _, den = tok.partition("/")
+    return float(num) / float(den) if den else float(num)
+
+
+def probe_frame_session_times(path, clock, container_pts_ns, framerate):
+    """Session time τ of every frame in ``path``, timed by real SensorTimestamps
+    rather than the mp4 container's own presentation timestamps.
+
+    The container is muxed at a constant ``-framerate`` (``pi/ffmpeg_output.py``),
+    so its PTS are evenly spaced and do NOT track the real capture clock: the
+    sensor runs at a slightly off-nominal, faintly variable rate, so container
+    time drifts from capture time — a fraction of a percent, but seconds over a
+    long session, which slides the video against the trace (worse the later in the
+    session the clip sits). The container's own docstring says as much: time from
+    the sidecar, not the container.
+
+    Because the container is CFR and ``-c:v copy`` keeps frames in emission order,
+    each frame's PTS gives its container index (``round(pts * framerate)``), which
+    selects that frame's SensorTimestamp from ``container_pts_ns`` -- one entry per
+    CONTAINER frame. Prefer the encoded sidecar (``encoded_sidecar_path``): it has
+    exactly the frames the encoder emitted, so index k is frame k even when the
+    encoder dropped captured frames. The capture sidecar is the fallback and
+    drifts by those drops. The resulting elapsed-since-first-frame seconds go
+    through the SAME ``clock`` as ``frame_session_times``, so the ffprobe path and
+    the sidecar path stay identical (drift/latency included). Trimmed clips keep
+    original PTS (``-copyts``), so the index is into the full-recording array; a
+    few frames past its end clamp to the last entry."""
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
@@ -202,7 +254,10 @@ def probe_frame_session_times(path, clock):
                     for tok in r.stdout.split() if tok.strip().rstrip(",")])
     if pts.size == 0:
         raise RuntimeError(f"ffprobe found no frames in {path}")
-    return clock.session_time(pts)
+    container_pts_ns = np.asarray(container_pts_ns)
+    idx = np.clip(np.rint(pts * framerate).astype(int), 0, container_pts_ns.size - 1)
+    real_sec = (container_pts_ns[idx] - container_pts_ns[0]) / 1e9
+    return clock.session_time(real_sec)
 
 
 @dataclass

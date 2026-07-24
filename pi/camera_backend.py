@@ -130,6 +130,12 @@ class Picamera2Backend:
         self._encoder = None
         self._pts_fh = None
         self._pts_path = None
+        # Companion sidecar of per-ENCODED-frame SensorTimestamps (one line per
+        # container frame), and the segment's first SensorTimestamp used to make
+        # those absolute. See pi/ffmpeg_output.make_sidecar_output.
+        self._encpts_fh = None
+        self._encpts_path = None
+        self._first_sensor_ns = None
         self._video_path = None
         self._mux_proc = None
         self._frame_count = 0
@@ -171,8 +177,15 @@ class Picamera2Backend:
         Not picamera2's FfmpegOutput: that one lets ffmpeg guess presentation
         timestamps from packet arrival times, which is what killed the
         2026-07-21 recording. See pi/ffmpeg_output.py.
+
+        The muxer also logs each encoded frame's SensorTimestamp to the segment's
+        .encpts.txt (one line per container frame), using the first captured
+        frame's SensorTimestamp to make them absolute.
         """
-        output, proc = ffmpeg_output.spawn_muxer(video_path, TARGET_FPS)
+        output, proc = ffmpeg_output.spawn_muxer(
+            video_path, TARGET_FPS,
+            encpts_fh=self._encpts_fh,
+            first_ns_getter=lambda: self._first_sensor_ns)
         self._mux_proc = proc
         return output
 
@@ -263,11 +276,14 @@ class Picamera2Backend:
             stem = segment_stem(self._session_name, segment)
             self._video_path = self.output_dir / f"{stem}.mp4"
             self._pts_path = self.output_dir / f"{stem}.txt"
+            self._encpts_path = self.output_dir / f"{stem}.encpts.txt"
             self._frame_count = 0
+            self._first_sensor_ns = None
             self._last_frame = None
             self._last_frame_monotonic = time.monotonic()
             self._mux_proc = None
             self._pts_fh = open(self._pts_path, "w")
+            self._encpts_fh = open(self._encpts_path, "w")
             self._picam2.pre_callback = self._on_frame
 
             self._encoder = self._create_encoder()
@@ -283,12 +299,14 @@ class Picamera2Backend:
                 if self._picam2 is not None:
                     self._picam2.stop_recording()
             finally:
-                if self._pts_fh is not None:
-                    try:
-                        self._pts_fh.close()
-                    except Exception:
-                        pass
-                    self._pts_fh = None
+                for attr in ("_pts_fh", "_encpts_fh"):
+                    fh = getattr(self, attr)
+                    if fh is not None:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                        setattr(self, attr, None)
                 # Closing ffmpeg's stdin is what writes the moov atom; skip it
                 # and the segment is an unplayable file.
                 ffmpeg_output.finish_muxer(self._mux_proc)
@@ -310,6 +328,12 @@ class Picamera2Backend:
                 return
             metadata = request.get_metadata()
             timestamp = metadata.get("SensorTimestamp", 0)
+            # First captured frame's SensorTimestamp anchors the .encpts.txt
+            # sidecar (picamera2 gives outputframe a time relative to it). This
+            # runs before that frame reaches the encoder, so it is set before the
+            # first outputframe.
+            if self._first_sensor_ns is None:
+                self._first_sensor_ns = timestamp
             # TODO: Change to write relative nanoseconds (timestamp - first_frame_SensorTimestamp)
             # and add 2-line header (frame count and first_frame_SensorTimestamp) for
             # compatibility with false_positive_analysis.load_frame_offsets().
@@ -513,7 +537,11 @@ class Picamera2Backend:
             self._active = False
         files = []
         for video_path, pts_path in self._segment_paths:
-            for path in (video_path, pts_path):
+            # The .encpts.txt (per-encoded-frame SensorTimestamps) rides along
+            # with the capture .txt so the desktop can time frames past encoder
+            # drops; derived from pts_path, listed only when it exists.
+            encpts_path = pts_path.with_name(pts_path.stem + ".encpts.txt")
+            for path in (video_path, pts_path, encpts_path):
                 if path.exists():
                     files.append({"name": path.name, "size": path.stat().st_size})
             # The ffmpeg log is listed only when it has something in it, so a
@@ -556,6 +584,7 @@ class Picamera2Backend:
                 try:
                     mp4.unlink()
                     mp4.with_suffix(".txt").unlink(missing_ok=True)
+                    mp4.with_name(mp4.stem + ".encpts.txt").unlink(missing_ok=True)
                     ffmpeg_output.log_path_for(mp4).unlink(missing_ok=True)
                 except OSError:
                     continue  # skip undeletable files; keep reclaiming
