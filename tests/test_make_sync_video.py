@@ -4,6 +4,23 @@ import pytest
 import make_sync_video as msv
 
 
+def test_load_container_pts_prefers_encoded_sidecar(tmp_path):
+    capture = (np.arange(0, 5) * 100_000_000).astype(np.int64)
+    enc = tmp_path / "rec.encpts.txt"
+    # encoder emitted only frames 0,1,3 (2 and 4 dropped) -> exact container times
+    encoded = capture[[0, 1, 3]]
+    np.savetxt(str(enc), encoded, fmt="%d")
+    got = msv.load_container_pts(str(tmp_path / "rec.txt"), capture)
+    assert np.array_equal(got, encoded)
+
+
+def test_load_container_pts_falls_back_to_capture(tmp_path):
+    capture = (np.arange(0, 5) * 100_000_000).astype(np.int64)
+    # no .encpts.txt written -> fall back to the capture sidecar unchanged
+    got = msv.load_container_pts(str(tmp_path / "rec.txt"), capture)
+    assert got is capture
+
+
 def test_compute_video_base():
     pts_ns = np.array([1_000_000_000, 1_100_000_000, 1_250_000_000], dtype=np.int64)
     # (1_250_000_000 - 1_000_000_000) / 1e9 = 0.25
@@ -130,7 +147,8 @@ def test_trim_and_crop_and_frame_source(tmp_path):
     r.close()
     assert size == (360, 360)  # (width, height)
 
-    frame_sess = msv.probe_frame_session_times(out, rec.clock)
+    frame_sess = msv.probe_frame_session_times(
+        out, rec.clock, rec.pts_ns, msv.probe_frame_rate(out))
     assert frame_sess[0] <= 120.0 and frame_sess[-1] >= 123.0
     assert np.all(np.diff(frame_sess) >= 0)  # monotonic
 
@@ -159,7 +177,8 @@ def test_subclip_copy_lands_on_a_cropped_file(tmp_path):
 
     sub = str(tmp_path / "sub.mp4")
     msv.subclip_copy(cropped, start_sec + 2.0, start_sec + 5.0, sub)
-    sess = msv.probe_frame_session_times(sub, rec.clock)
+    sess = msv.probe_frame_session_times(
+        sub, rec.clock, rec.pts_ns, msv.probe_frame_rate(sub))
     assert sess.size > 0
     assert sess[0] <= 122.0 and sess[-1] >= 124.0
 
@@ -187,7 +206,8 @@ def test_trimmed_frame_source_decode_matches_pts(tmp_path):
     out = str(tmp_path / "long.mp4")
     msv.trim_and_crop(VIDEO, start_sec, end_sec, out, 452, 180, 360)
 
-    frame_sess = msv.probe_frame_session_times(out, clock)
+    frame_sess = msv.probe_frame_session_times(
+        out, clock, pts_ns, msv.probe_frame_rate(out))
     src = msv.TrimmedFrameSource(out, frame_sess)
     decoded = 0
     try:
@@ -288,7 +308,7 @@ def _synthetic_rec(pts_ns, video_base, latency, n=3, slope=1.0):
         animal="X", sensor=1, cap=cap, time=time,
         lick_times=np.array([]), lick_indices=np.array([], dtype=int),
         lick_vals=np.array([]), clock=clock, video_path="v.mp4",
-        session_duration=10.0, pts_ns=pts_ns,
+        session_duration=10.0, pts_ns=pts_ns, container_pts_ns=pts_ns,
     )
 
 
@@ -353,7 +373,7 @@ def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path
     def fake_subclip_copy(video_path, start_sec, end_sec, out_path, *a, **kw):
         return out_path
 
-    def fake_probe(path, clock):
+    def fake_probe(path, clock, pts_ns, framerate):
         recorded["clock"] = clock
         return np.linspace(0.0, 0.3, 5)
 
@@ -368,6 +388,7 @@ def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path
             pass
 
     monkeypatch.setattr(msv, "subclip_copy", fake_subclip_copy)
+    monkeypatch.setattr(msv, "probe_frame_rate", lambda path: 10.0)
     monkeypatch.setattr(msv, "probe_frame_session_times", fake_probe)
     monkeypatch.setattr(msv, "TrimmedFrameSource", FakeSource)
 

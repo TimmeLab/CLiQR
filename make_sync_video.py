@@ -30,8 +30,10 @@ from video.trimcrop import (  # noqa: F401
     bookmark_latency,
     compute_trim_frames,
     compute_video_base,
+    encoded_sidecar_path,
     find_video_sensor,
     frame_session_times,
+    probe_frame_rate,
     probe_frame_session_times,
     probe_start_pts,
     read_session_window,
@@ -57,6 +59,24 @@ class Recording:
     video_path: str
     session_duration: float
     pts_ns: np.ndarray
+    # Per-CONTAINER-frame SensorTimestamps used to time trimmed frames: the Pi's
+    # encoded sidecar (drops excluded) when present, else pts_ns (the capture
+    # sidecar, which drifts by dropped frames). See load_container_pts.
+    container_pts_ns: np.ndarray
+
+
+def load_container_pts(pts_txt_path, capture_pts_ns):
+    """Per-container-frame SensorTimestamps for timing trimmed frames.
+
+    The Pi's ``<stem>.encpts.txt`` (one line per ENCODED frame, so encoder drops
+    are already excluded) times container frames exactly; when it's absent -- every
+    recording made before drop-marking -- fall back to the capture sidecar, which
+    drifts by any dropped frames. Kept tiny and separate so the fallback is
+    testable without a real recording."""
+    enc = encoded_sidecar_path(pts_txt_path)
+    if os.path.exists(enc):
+        return np.loadtxt(enc, dtype=np.int64)
+    return capture_pts_ns
 
 
 def read_session_duration(h5_path):
@@ -96,6 +116,7 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
 
     pts_ns = np.loadtxt(pts_txt_path, dtype=np.int64)
     clock = session_clock(anchor, pts_ns)
+    container_pts_ns = load_container_pts(pts_txt_path, pts_ns)
 
     return Recording(
         animal=animal, sensor=anchor.sensor_number, cap=cap, time=time,
@@ -103,6 +124,7 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
         lick_vals=lick_vals,
         clock=clock, video_path=video_path,
         session_duration=session_duration, pts_ns=pts_ns,
+        container_pts_ns=container_pts_ns,
     )
 
 
@@ -215,8 +237,13 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5, sync_offset=0.0
         intermediate_path = os.path.splitext(out_path)[0] + "_trimcrop.mp4"
     subclip_copy(rec.video_path, start_sec, end_sec, intermediate_path)
 
-    # Time each trimmed frame by its real (preserved) PTS, not by seek position.
-    frame_sess = probe_frame_session_times(intermediate_path, rec.clock)
+    # Time each trimmed frame by its real capture time: the container is CFR, so
+    # its frame index (from the preserved PTS + the mux framerate) selects the
+    # matching SensorTimestamp from the per-container-frame array. Not the
+    # container PTS, which drift.
+    framerate = probe_frame_rate(intermediate_path)
+    frame_sess = probe_frame_session_times(intermediate_path, rec.clock,
+                                           rec.container_pts_ns, framerate)
 
     if fps is None:
         fps = source_fps(frame_sess)
