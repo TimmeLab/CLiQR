@@ -21,7 +21,12 @@ def find_video_sensor(raw_h5):
         if not isinstance(board, h5py.Group):
             continue
         for sensor_name, group in board.items():
-            if isinstance(group, h5py.Group) and "video_filename" in group:
+            if not isinstance(group, h5py.Group):
+                continue
+            # A multi-cycle recording (Start/Stop restart) writes the bookmark
+            # datasets suffixed with the cycle number, so match video_filename
+            # OR video_filename{N} -- mirroring _resolve_cycle's suffix handling.
+            if any(re.match(r"video_filename\d*$", k) for k in group.keys()):
                 m = re.match(r"sensor_(\d+)$", sensor_name)
                 if not m:
                     continue
