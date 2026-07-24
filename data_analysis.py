@@ -184,10 +184,25 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
     For a candidate threshold, a "peak" (dip) is a run of consecutive samples
     below the threshold. A run is accepted as a real lick only if it is:
       1. short enough in time  (< max_lick_time; a real lick is brief), and
-      2. deep enough           (it must also cross a threshold two levels lower,
-                                the "2-threshold-deep" rule, so shallow noise
+      2. deep enough           (it must also cross a threshold `depth_back`
+                                levels lower, the "depth" rule, so shallow noise
                                 wiggles are rejected).
     The lick time is taken at the minimum (deepest) sample of the accepted dip.
+
+    The depth rule (2) is why the candidate-threshold loop below starts at index
+    `depth_back` rather than 0: for candidate index i_thr the depth comparison
+    uses thresholds[i_thr - depth_back], and starting any earlier would make that
+    a NEGATIVE index. In numpy a negative index does not error, it silently wraps
+    to the HIGH end of the sorted threshold array, which disables the depth rule
+    and lets noise wiggles through -- historically this produced tens of
+    thousands of false "licks" on quiet/control channels and, downstream, an
+    O(N^2) memory blow-up. Keep the loop start tied to `depth_back`.
+
+    Scientific caveat: `depth_back` is an ABSOLUTE count of discrete capacitance
+    levels, not a fixed voltage/amplitude. Because different animals/sensors span
+    different numbers of unique capacitance values, the same `depth_back` imposes
+    a slightly different physical depth requirement per channel. If the sensor
+    charge/discharge time (CDT) or gain changes, revisit this value.
 
     This mirrors the original MATLAB lickDetector logic, reimplemented in numpy.
 
@@ -221,8 +236,15 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
 
             n_peaks = np.full((len(thresholds),), np.nan)
             peak_bins = [None] * len(thresholds)
-            
-            for i_thr in range(2, len(thresholds)):
+
+            # A peak must cross a threshold this many levels lower to count as a
+            # real lick (see depth check below). The loop MUST start at depth_back
+            # so that i_thr - depth_back is never negative; a negative index would
+            # silently wrap to a HIGH threshold, disabling the depth filter and
+            # inflating counts (and IndexError on channels with < depth_back levels).
+            depth_back = 20
+
+            for i_thr in range(depth_back, len(thresholds)):
                 thr = thresholds[i_thr]
                 # Identify peaks below threshold. 1 marks the time bin just before a
                 # peak starts (the last bin that isn't in the peak), -1 marks the time
@@ -259,9 +281,9 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
                     n_peaks[i_thr] = 0
                     continue
 
-                # Only look at peaks that are at least two thresholds deep
-                # MATLAB checks cap(start:end) < thresholds(iThresh-2) (inclusive end)
-                depth_thr = thresholds[i_thr - 2]
+                # Only look at peaks that are at least depth_back thresholds deep
+                # MATLAB checks cap(start:end) < thresholds(iThresh-N) (inclusive end)
+                depth_thr = thresholds[i_thr - depth_back]
                 i_peak = 0
                 good_peaks = good_peaks.astype(int, copy=False)
                 while i_peak < good_peaks.size:
@@ -312,15 +334,23 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
 
             # Isolated single dips are usually noise, not licking (mice lick in
             # rhythmic bouts). So keep a lick only if it has at least one OTHER
-            # detected lick within 1.0 s. Implementation: build the full matrix
-            # of pairwise time differences, blank the diagonal (a lick's distance
-            # to itself) with infinity, then keep a lick when its nearest
-            # neighbor is <= 1.0 s away. (The 1.0 s window is intentional here and
-            # differs from the hilbert algorithm's 0.5 s window below.)
+            # detected lick within 1.0 s. A lick's nearest neighbor is always one
+            # of its two adjacent licks in time, so we sort the times and compare
+            # each to its previous/next neighbor -- O(N log N) and O(N) memory.
+            # (The earlier full N x N pairwise-difference matrix was O(N^2) memory
+            # and would exhaust RAM/swap when detection over-counted noise.)
+            # The 1.0 s window is intentional here and differs from the hilbert
+            # algorithm's 0.5 s window below.
             if len(lick_times_arr) >= 2:
-                diffs = np.abs(lick_times_arr[:, None] - lick_times_arr[None, :])
-                np.fill_diagonal(diffs, np.inf)
-                keep = diffs.min(axis=1) <= 1.0
+                order = np.argsort(lick_times_arr)
+                st = lick_times_arr[order]
+                gaps = np.diff(st)  # gap between each pair of adjacent sorted licks
+                nn = np.full(st.shape, np.inf)  # distance to nearest neighbor
+                nn[:-1] = np.minimum(nn[:-1], gaps)   # gap to next
+                nn[1:] = np.minimum(nn[1:], gaps)     # gap to previous
+                keep_sorted = nn <= 1.0
+                keep = np.zeros(len(lick_times_arr), dtype=bool)
+                keep[order[keep_sorted]] = True
                 data['lick_times'] = lick_times_arr[keep]
                 data['lick_indices'] = pb_[keep]
             else:
@@ -460,9 +490,16 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
 def _optimize_simple_threshold(data_by_animal, n_steps=200):
     """Grid-search threshold fraction f ∈ [0, 1] of each animal's dynamic range
     that maximizes R² between per-animal lick count and volume consumed."""
+    # Control cages have a sipper (so consumed_vol IS recorded) but no animal.
+    # Their "consumed" volume is evaporation/leak, not licking, and their trace
+    # is noise. Including them in this lick-count-vs-volume fit would let a
+    # noise-inflated count paired with a near-zero real intake bias the chosen
+    # threshold fraction. Every other stage of the pipeline holds controls out
+    # (see all_animal_ids in the notebook), so exclude them here too.
     animals = [a for a in data_by_animal
                if 'consumed_vol' in data_by_animal[a]
-               and len(data_by_animal[a].get('cap_data', [])) > 0]
+               and len(data_by_animal[a].get('cap_data', [])) > 0
+               and not is_control(a)]
     if len(animals) < 3:
         return 0.5  # not enough data; fall back to midpoint
 
