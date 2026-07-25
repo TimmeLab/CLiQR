@@ -6,6 +6,8 @@ wired 192.168.50.2, so a fresh resolve+connect per call wasted ~2-5s. See
 docs/superpowers/specs/2026-07-25-bookmark-connect-latency-design.md.
 """
 import socket
+import socketserver
+import threading
 
 import pytest
 
@@ -153,3 +155,31 @@ def test_fetch_files_uses_shared_connect(monkeypatch, tmp_path):
 
     assert used["connect"] is True
     assert result == []
+
+
+class _PingHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        for raw in self.rfile:
+            if not raw.strip():
+                continue
+            protocol.decode_message(raw)  # ignore contents; always pong
+            self.wfile.write(protocol.encode_message(
+                protocol.make_ok(pong=True)))
+            self.wfile.flush()
+
+
+def test_request_round_trips_over_real_loopback_and_caches_addr():
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _PingHandler)
+    host, port = server.server_address
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        client = PiCameraClient(host, port, timeout=2.0)
+        resp = client.ping()
+        assert resp is True
+        assert client._addr is not None  # a working address was cached
+        # Second call reuses the cache and still works.
+        assert client.ping() is True
+    finally:
+        server.shutdown()
+        server.server_close()
