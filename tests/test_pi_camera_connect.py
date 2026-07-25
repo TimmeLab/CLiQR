@@ -133,3 +133,23 @@ def test_request_returns_error_dict_when_all_addresses_fail(monkeypatch):
 
     assert resp.get("ok") is not True
     assert "picamera0.local:8770" in resp.get("error", "")
+
+
+def test_fetch_files_uses_shared_connect(monkeypatch, tmp_path):
+    """fetch_files must go through _connect() so it benefits from the cache and
+    the IPv4-first path, not a second bare create_connection."""
+    client = PiCameraClient("picamera0.local", 8770)
+    used = {"connect": False}
+    def boom_create_connection(*a, **k):
+        raise AssertionError("fetch_files must not call create_connection")
+    monkeypatch.setattr(pi_camera.socket, "create_connection",
+                        boom_create_connection)
+    def fake_connect():
+        used["connect"] = True
+        raise OSError("pi offline")  # exercised path: returns [] gracefully
+    monkeypatch.setattr(client, "_connect", fake_connect)
+
+    result = client.fetch_files(["clip.mp4"], str(tmp_path))
+
+    assert used["connect"] is True
+    assert result == []

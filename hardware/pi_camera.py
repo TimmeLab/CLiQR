@@ -113,8 +113,7 @@ class PiCameraClient:
         dest.mkdir(parents=True, exist_ok=True)
         saved = []
         try:
-            with socket.create_connection((self.host, self.port), self.timeout) as sock:
-                sock.settimeout(self.timeout)
+            with self._connect() as sock:
                 reader = sock.makefile("rb")
                 for name in names:
                     sock.sendall(protocol.encode_message(
