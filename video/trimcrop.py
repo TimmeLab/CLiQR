@@ -207,18 +207,50 @@ def encoded_sidecar_path(pts_txt_path):
     return stem + ".encpts.txt"
 
 
+def _parse_rate(tok):
+    """Parse an ffprobe rate field ("120/1", "1000000/8333") to fps, or None when
+    it is unusable ("0/0", "N/A", empty)."""
+    num, _, den = tok.strip().partition("/")
+    try:
+        n = float(num)
+        d = float(den) if den else 1.0
+    except ValueError:
+        return None
+    if n == 0 or d == 0:
+        return None
+    return n / d
+
+
 def probe_frame_rate(path):
-    """The container's constant frame rate (the ``-framerate`` the mp4 was muxed
-    at, see ``pi/ffmpeg_output.py``), from ffprobe's ``r_frame_rate`` ("120/1")."""
+    """The container's true constant frame rate.
+
+    Reads ``avg_frame_rate`` (frames / duration), NOT ``r_frame_rate``:
+    ``r_frame_rate`` is ffmpeg's rationalized *base* rate and rounds the Pi's
+    slightly-off-nominal capture clock to the nearest simple fraction -- it reports
+    ``120/1`` for footage whose frames are really spaced at ~120.0048 fps.
+    ``probe_frame_session_times`` recovers each frame's container ordinal with
+    ``round(pts_time * rate)``, so a rate rounded even 0.005 fps low slides the
+    ordinal ~1 frame per 25k frames: tens of frames -- hundreds of ms -- by the end
+    of a long recording, dragging the video ahead of the trace (worse the later the
+    clip). ``avg_frame_rate`` is frames/duration, exact for a CFR container. Falls
+    back to ``r_frame_rate`` only when avg is unavailable ("0/0")."""
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", path],
+         "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+         "-of", "default=noprint_wrappers=1", path],
         capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"ffprobe failed on {path}:\n{r.stderr[-800:]}")
-    tok = r.stdout.strip()
-    num, _, den = tok.partition("/")
-    return float(num) / float(den) if den else float(num)
+    fields = {}
+    for line in r.stdout.splitlines():
+        key, _, val = line.partition("=")
+        fields[key.strip()] = val.strip()
+    rate = _parse_rate(fields.get("avg_frame_rate", ""))
+    if rate is None:
+        rate = _parse_rate(fields.get("r_frame_rate", ""))
+    if rate is None:
+        raise RuntimeError(f"ffprobe reported no usable frame rate for {path}")
+    return rate
 
 
 def probe_frame_session_times(path, clock, container_pts_ns, framerate):
