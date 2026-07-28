@@ -65,6 +65,16 @@ class Recording:
     container_pts_ns: np.ndarray
 
 
+# Residual, constant lead of the video over the trace that survives the bookmark
+# latency + drift corrections: ~2 frames (2/120 s = 16.667 ms), video ahead. Seen
+# to be the SAME across recordings with wildly different bookmark latencies
+# (2026-07-24, latency 4.9 s; 2026-07-27, latency 0.18 s) and constant across a
+# session, so it is a fixed capture->timestamp systematic, not part of the
+# latency/drift model. Applied as the default render sync_offset (positive =
+# delay the video), which zeroes it; override with --sync-offset per clip.
+DEFAULT_SYNC_OFFSET = 2.0 / 120.0
+
+
 def load_container_pts(pts_txt_path, capture_pts_ns):
     """Per-container-frame SensorTimestamps for timing trimmed frames.
 
@@ -211,8 +221,8 @@ def clip_trim_window(rec, start, end):
     return trim_window_seconds(rec.clock, rec.pts_ns, start, end)
 
 
-def render_clip(rec, start, end, out_path, fps=None, window=2.5, sync_offset=0.0,
-                intermediate_path=None):
+def render_clip(rec, start, end, out_path, fps=None, window=2.5,
+                sync_offset=DEFAULT_SYNC_OFFSET, intermediate_path=None):
     """Render the side-by-side clip. First stream-copies the mouse video down to
     the clip window (intermediate file, kept) so we don't decode the whole
     recording, then composites from it: the left panel is the video frame, the
@@ -337,9 +347,11 @@ def build_arg_parser():
                         "so no source frames are dropped)")
     p.add_argument("--window", type=float, default=2.5,
                    help="trace half-window seconds (default 2.5)")
-    p.add_argument("--sync-offset", dest="sync_offset", type=float, default=0.0,
-                   help="manual nudge, seconds; increase if video runs ahead of "
-                        "the trace (default 0)")
+    p.add_argument("--sync-offset", dest="sync_offset", type=float,
+                   default=DEFAULT_SYNC_OFFSET,
+                   help="seconds to delay the video; increase if it runs ahead of "
+                        "the trace (default %(default).4f s = 2 frames, the "
+                        "measured constant residual lead)")
     p.add_argument("--intermediate", default=None,
                    help="path for the trimmed subclip (kept); "
                         "default: <out>_trimcrop.mp4")

@@ -275,11 +275,34 @@ def test_build_arg_parser_parses_required():
         "--start", "5", "--end", "9", "--out", "o.mp4",
     ])
     assert args.h5 == "r.h5" and args.start == 5.0 and args.end == 9.0
-    assert args.fps is None and args.window == 2.5 and args.sync_offset == 0.0
+    assert args.fps is None and args.window == 2.5
+    # default sync-offset is the measured constant 2-frame residual lead, not 0
+    assert args.sync_offset == pytest.approx(msv.DEFAULT_SYNC_OFFSET)
+    assert args.sync_offset == pytest.approx(2.0 / 120.0)
     assert args.intermediate is None
     # cropping is crop_video.py's job now
     assert not hasattr(args, "crop_w")
     assert not hasattr(args, "crop_h")
+
+
+REC27 = os.path.join(REC_DIR, "raw_data_2026-07-27_11-56-15.mp4")
+needs_ref27 = pytest.mark.skipif(
+    not os.path.exists(REC27), reason="07-27 reference video not present"
+)
+
+
+@needs_ref27
+def test_probe_frame_rate_uses_true_cfr_rate():
+    """r_frame_rate rounds the Pi's real capture rate to 120/1, but the container
+    is CFR at ~120.0048 fps (avg_frame_rate == frames/duration).
+    probe_frame_session_times recovers each frame's ordinal with
+    round(pts_time * rate); a rate rounded even 0.005 fps low slips the ordinal ~1
+    frame per 25k frames, dragging the video ~33 frames (0.27 s) ahead of the trace
+    by the end of a 2-hour recording. probe_frame_rate must return the true rate.
+    """
+    rate = msv.probe_frame_rate(REC27)
+    assert rate == pytest.approx(120.0048, abs=1e-3)
+    assert abs(rate - 120.0) > 1e-3  # the rounded r_frame_rate (120/1) would fail
 
 
 @needs_reference
@@ -352,6 +375,42 @@ def test_clip_trim_window_matches_crop_window():
 
     assert (msv.clip_trim_window(rec, 0.0, anchor.session_duration)[:4]
             == cv.compute_crop_window(anchor, pts_ns))
+
+
+def test_render_clip_default_sync_offset_delays_video(tmp_path, monkeypatch):
+    """render_clip must apply DEFAULT_SYNC_OFFSET so each output time tau fetches
+    the source frame at tau - offset (an earlier frame shown later => video
+    delayed), cancelling the measured constant ~2-frame lead. A regression to
+    sync_offset=0 would show the frame AT tau, leaving the video ahead."""
+    pts_ns = (np.arange(0, 41) * 100_000_000).astype(np.int64)
+    vb = msv.compute_video_base(pts_ns, 2)
+    rec = _synthetic_rec(pts_ns, vb, 0.0, n=50)
+
+    targets = []
+
+    class RecordingSource:
+        def __init__(self, path, frame_sess):
+            pass
+
+        def get(self, target_session):
+            targets.append(target_session)
+            return np.zeros((4, 4, 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(msv, "subclip_copy",
+                        lambda *a, **kw: a[-1] if a else kw["out_path"])
+    monkeypatch.setattr(msv, "probe_frame_rate", lambda path: 10.0)
+    monkeypatch.setattr(msv, "probe_frame_session_times",
+                        lambda *a, **kw: np.linspace(0.0, 0.3, 5))
+    monkeypatch.setattr(msv, "TrimmedFrameSource", RecordingSource)
+
+    msv.render_clip(rec, 0.0, 0.2, str(tmp_path / "clip.mp4"), fps=5.0)
+
+    # first fetch is at start - offset; every fetch is shifted by the same offset
+    assert targets[0] == pytest.approx(0.0 - msv.DEFAULT_SYNC_OFFSET)
+    assert msv.DEFAULT_SYNC_OFFSET > 0  # positive => delays the video
 
 
 def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path, monkeypatch):
