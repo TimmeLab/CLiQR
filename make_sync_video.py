@@ -72,6 +72,11 @@ class Recording:
 # session, so it is a fixed capture->timestamp systematic, not part of the
 # latency/drift model. Applied as the default render sync_offset (positive =
 # delay the video), which zeroes it; override with --sync-offset per clip.
+#
+# The 120 here is the NOMINAL frame rate, used only to turn "2 frames" into a
+# fixed time nudge (16.667 ms). It is deliberately NOT the true 120.0048 fps CFR
+# rate that probe_frame_rate recovers: this is a constant time offset, and the
+# 0.004% difference is 0.4 microseconds, far below any frame it could shift.
 DEFAULT_SYNC_OFFSET = 2.0 / 120.0
 
 
@@ -235,8 +240,11 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
     crop it once with crop_video.py, or pass the uncropped recording for a
     full-frame panel.
 
-    ``sync_offset`` is a residual manual nudge in seconds: increase it if the
-    video still runs ahead of the trace.
+    ``sync_offset`` shifts the video in seconds (positive = delay it): each output
+    time tau fetches the source frame at ``tau - sync_offset``. It defaults to
+    ``DEFAULT_SYNC_OFFSET``, the measured constant ~2-frame (16.667 ms) residual
+    lead the video keeps after the latency/drift corrections; that default zeroes
+    the lead. Increase it further only if a given clip still runs ahead.
 
     ``fps`` None (default) renders at the footage's real capture rate, so no
     source frames are dropped; pass a number to force a different output rate.
