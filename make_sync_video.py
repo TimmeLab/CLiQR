@@ -26,16 +26,20 @@ from data_analysis import filter_data
 # make_sync_video namespace (CLI + test convenience); this module is the public
 # surface the sync-video tests poke at.
 from video.trimcrop import (  # noqa: F401
+    CropBox,
     SessionClock,
     bookmark_latency,
     compute_trim_frames,
     compute_video_base,
+    crop_frame,
+    crop_params_path,
     encoded_sidecar_path,
     find_video_sensor,
     frame_session_times,
     probe_frame_rate,
     probe_frame_session_times,
     probe_start_pts,
+    read_crop_params,
     read_session_window,
     read_video_anchor,
     resolve_paths,
@@ -187,7 +191,7 @@ class TrimmedFrameSource:
     its true session time (from the PTS sidecar); ``get(target)`` returns the
     frame nearest ``target`` session-seconds. Targets must be non-decreasing."""
 
-    def __init__(self, path, frame_sess):
+    def __init__(self, path, frame_sess, crop=None):
         # Decode PASSTHROUGH ("-vsync 0"): this footage is VFR (coded 240 fps,
         # real ~120), and imageio's default reader forces CFR, duplicating frames
         # so its decode count exceeds the ffprobe pts list. Since frames are timed
@@ -197,6 +201,12 @@ class TrimmedFrameSource:
         self._reader = imageio.get_reader(path, "ffmpeg",
                                           output_params=["-vsync", "0"])
         self._sess = np.asarray(frame_sess, dtype=float)
+        # ``crop`` is a display-only spatial slice (CropBox or None). The FILE we
+        # decode and time is the untouched original recording; cropping here, not
+        # by re-encoding a _cropped.mp4, keeps the frame<->session mapping exactly
+        # the working uncropped path's (a crop re-encode regenerates the PTS onto
+        # a fresh CFR grid, which slides that mapping and drifts the render).
+        self._crop = crop
         self._j = -1
         self._frame = None
 
@@ -204,7 +214,7 @@ class TrimmedFrameSource:
         target_k = nearest_index(self._sess, target_session)
         while self._j < target_k:
             try:
-                self._frame = self._reader.get_next_data()
+                self._frame = crop_frame(self._reader.get_next_data(), self._crop)
                 self._j += 1
             except (IndexError, StopIteration):
                 break
@@ -226,8 +236,20 @@ def clip_trim_window(rec, start, end):
     return trim_window_seconds(rec.clock, rec.pts_ns, start, end)
 
 
+def load_crop(video_path, params_path=None, no_crop=False):
+    """Resolve the display crop for a render, or None for a full frame.
+
+    ``no_crop`` forces the full frame. Otherwise reads ``params_path`` when given,
+    else the recording's conventional ``<base>_crop.json`` sidecar (written by
+    crop_video.py); a missing sidecar means no crop was configured."""
+    if no_crop:
+        return None
+    return read_crop_params(params_path or crop_params_path(video_path))
+
+
 def render_clip(rec, start, end, out_path, fps=None, window=2.5,
-                sync_offset=DEFAULT_SYNC_OFFSET, intermediate_path=None):
+                sync_offset=DEFAULT_SYNC_OFFSET, intermediate_path=None,
+                crop=None):
     """Render the side-by-side clip. First stream-copies the mouse video down to
     the clip window (intermediate file, kept) so we don't decode the whole
     recording, then composites from it: the left panel is the video frame, the
@@ -236,9 +258,11 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
     preserved PTS) — no seeking assumptions, no fps assumption — so video and
     trace stay aligned.
 
-    The video panel shows whatever region ``rec.video_path`` already carries:
-    crop it once with crop_video.py, or pass the uncropped recording for a
-    full-frame panel.
+    The video panel shows the ``crop`` region (a CropBox, sliced from each frame
+    at display time) of the untouched original recording, or the full frame when
+    ``crop`` is None. Pick the box once with crop_video.py (it writes the sidecar
+    load_crop reads). The crop is a pure spatial slice — it never re-encodes, so
+    it cannot perturb the frame<->session timing.
 
     ``sync_offset`` shifts the video in seconds (positive = delay it): each output
     time tau fetches the source frame at ``tau - sync_offset``. It defaults to
@@ -270,7 +294,7 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
     if taus.size == 0:
         raise ValueError("empty clip: check --start/--end/--fps")
 
-    src = TrimmedFrameSource(intermediate_path, frame_sess)
+    src = TrimmedFrameSource(intermediate_path, frame_sess, crop=crop)
 
     cap_min, cap_max = float(rec.cap.min()), float(rec.cap.max())
     pad = 0.05 * (cap_max - cap_min + 1.0)
@@ -345,8 +369,14 @@ def build_arg_parser():
                    help="clip end, seconds since the Start bookmark")
     p.add_argument("--out", required=True, help="output .mp4 path")
     p.add_argument("--video", default=None,
-                   help="mouse video (default: <base>_cropped.mp4 from "
-                        "crop_video.py, else the uncropped recording)")
+                   help="mouse video (default: the recording from the h5). The "
+                        "crop is applied at display time, so pass the ORIGINAL "
+                        "recording here, never a pre-cropped file")
+    p.add_argument("--crop-params", dest="crop_params", default=None,
+                   help="crop-box JSON from crop_video.py (default: the "
+                        "recording's <base>_crop.json sidecar, if present)")
+    p.add_argument("--no-crop", dest="no_crop", action="store_true",
+                   help="render the full frame, ignoring any crop sidecar")
     p.add_argument("--pts-txt", dest="pts_txt", default=None,
                    help="per-frame PTS sidecar (default: from the h5's "
                         "video_filename, with .txt)")
@@ -374,18 +404,21 @@ def main(argv=None):
         return 1
     try:
         anchor = read_video_anchor(args.h5)
-        video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt,
-                                       prefer_cropped=True)
+        video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt)
         validate_window(args.start, args.end, anchor.session_duration)
         rec = load_recording(args.h5, args.layout, pts_txt, video, anchor)
+        crop = load_crop(video, args.crop_params, args.no_crop)
         intermediate = args.intermediate or (os.path.splitext(args.out)[0] + "_trimcrop.mp4")
         print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
               f"[{args.start:.1f}, {args.end:.1f}] s")
+        crop_note = (f"{crop.size}x{crop.size} @ ({crop.x}, {crop.y})"
+                     if crop else "full frame")
+        print(f"  crop -> {crop_note}")
         print(f"  trimmed video -> {intermediate}")
         print(f"  composite -> {args.out}")
         render_clip(rec, args.start, args.end, args.out,
                     fps=args.fps, window=args.window, sync_offset=args.sync_offset,
-                    intermediate_path=intermediate)
+                    intermediate_path=intermediate, crop=crop)
         print("done")
     except (ValueError, FileNotFoundError, KeyError, OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)

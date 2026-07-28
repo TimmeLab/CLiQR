@@ -1,11 +1,12 @@
-"""Interactively crop a Pi video recording to a square region and trim it to
-approximately the capacitance-recording window.
+"""Interactively pick the square crop region for a Pi video recording.
 
 Shows the frame at the middle of the recording window, lets you drag a fixed-size
-square over the region of interest, then writes <video>_cropped.mp4 — trimmed to
-approximately the session (keeping a few seconds of lead-in; frames are timed by
-PTS downstream, not by the trim) and cropped to the square. make_sync_video.py
-picks that file up automatically. See
+square over the region of interest, then writes the chosen box to
+<video>_crop.json. make_sync_video.py reads that sidecar and slices each frame to
+the box AT RENDER TIME — the crop is a pure spatial slice, never a re-encode, so
+it cannot perturb the frame<->session timing (a crop re-encode regenerates the
+video's PTS onto a fresh CFR grid, which slid every crop-first render against the
+trace). This tool no longer produces a cropped video. See
 docs/superpowers/specs/2026-07-15-video-crop-tool-design.md.
 """
 import argparse
@@ -21,12 +22,12 @@ from matplotlib.widgets import Button
 
 from video.trimcrop import (
     clamp_origin,
-    cropped_path_for,
+    crop_params_path,
     read_video_anchor,
     resolve_paths,
     session_clock,
-    trim_and_crop,
     trim_window_seconds,
+    write_crop_params,
 )
 
 
@@ -41,20 +42,20 @@ def compute_crop_window(anchor, pts_ns):
     return trim_window_seconds(clock, pts_ns, 0.0, anchor.session_duration)
 
 
-def reject_cropped_input(video):
-    """Refuse to crop a file that is already a crop."""
-    if os.path.splitext(video)[0].endswith("_cropped"):
-        raise ValueError(f"refusing to crop an already-cropped video: {video}")
-
-
 def resolve_out_path(video, out, force):
+    """Resolve where the crop-box JSON is written (default <base>_crop.json)."""
     if out is None:
-        out = cropped_path_for(video)
+        out = crop_params_path(video)
     if os.path.abspath(out) == os.path.abspath(video):
         raise ValueError(f"refusing to overwrite the source recording: {out}")
     if os.path.exists(out) and not force:
         raise ValueError(f"{out} exists; pass --force to overwrite")
     return out
+
+
+def save_crop_params(out, x, y, size):
+    """Persist the hand-positioned crop box to ``out`` (JSON)."""
+    return write_crop_params(out, x, y, size)
 
 
 def load_preview_frame(video, frame_index):
@@ -133,8 +134,8 @@ class CropSelector:
 
 def build_arg_parser():
     p = argparse.ArgumentParser(
-        description="Trim a recording to its capacitance window and crop it to a "
-                    "hand-positioned square.")
+        description="Pick the square crop region for a recording and save it to "
+                    "<video>_crop.json (make_sync_video applies it at render time).")
     p.add_argument("--h5", required=True, help="raw recording .h5")
     p.add_argument("--video", default=None,
                    help="source video (default: from h5 video_filename)")
@@ -144,7 +145,7 @@ def build_arg_parser():
     p.add_argument("--size", type=int, default=360,
                    help="side length of the square crop (default 360)")
     p.add_argument("--out", default=None,
-                   help="output path (default: <video>_cropped.mp4)")
+                   help="crop-box JSON path (default: <video>_crop.json)")
     p.add_argument("--force", action="store_true",
                    help="overwrite the output if it exists")
     return p
@@ -153,14 +154,12 @@ def build_arg_parser():
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     if shutil.which("ffmpeg") is None:
-        print("error: ffmpeg not found on PATH (needed to write the video)",
+        print("error: ffmpeg not found on PATH (needed to read the video)",
               file=sys.stderr)
         return 1
     try:
         anchor = read_video_anchor(args.h5)
-        video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt,
-                                       prefer_cropped=False)
-        reject_cropped_input(video)
+        video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt)
         out = resolve_out_path(video, args.out, args.force)
         pts_ns = np.loadtxt(pts_txt, dtype=np.int64)
         sf, ef, start_sec, end_sec = compute_crop_window(anchor, pts_ns)
@@ -174,8 +173,8 @@ def main(argv=None):
             print("cancelled")
             return 0
         x, y = origin
-        print(f"cropping {args.size}x{args.size} @ ({x}, {y}) -> {out}")
-        trim_and_crop(video, start_sec, end_sec, out, x, y, args.size)
+        print(f"crop {args.size}x{args.size} @ ({x}, {y}) -> {out}")
+        save_crop_params(out, x, y, args.size)
         print("done")
     except (ValueError, FileNotFoundError, KeyError, OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)

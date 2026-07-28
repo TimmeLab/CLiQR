@@ -280,9 +280,91 @@ def test_build_arg_parser_parses_required():
     assert args.sync_offset == pytest.approx(msv.DEFAULT_SYNC_OFFSET)
     assert args.sync_offset == pytest.approx(2.0 / 120.0)
     assert args.intermediate is None
-    # cropping is crop_video.py's job now
-    assert not hasattr(args, "crop_w")
-    assert not hasattr(args, "crop_h")
+    # crop is a display-time slice: no re-encode. crop_video.py writes the box to
+    # a sidecar auto-picked by default; --no-crop forces the full frame.
+    assert args.crop_params is None
+    assert args.no_crop is False
+
+
+def test_load_crop_reads_sidecar(tmp_path):
+    from video.trimcrop import crop_params_path, write_crop_params
+    video = str(tmp_path / "v.mp4")
+    write_crop_params(crop_params_path(video), 452, 180, 360)
+    box = msv.load_crop(video)
+    assert (box.x, box.y, box.size) == (452, 180, 360)
+
+
+def test_load_crop_missing_sidecar_returns_none(tmp_path):
+    assert msv.load_crop(str(tmp_path / "v.mp4")) is None
+
+
+def test_load_crop_no_crop_flag_skips_sidecar(tmp_path):
+    from video.trimcrop import crop_params_path, write_crop_params
+    video = str(tmp_path / "v.mp4")
+    write_crop_params(crop_params_path(video), 1, 2, 3)
+    assert msv.load_crop(video, no_crop=True) is None
+
+
+def test_load_crop_explicit_params_path(tmp_path):
+    from video.trimcrop import write_crop_params
+    p = str(tmp_path / "elsewhere.json")
+    write_crop_params(p, 5, 6, 7)
+    box = msv.load_crop(str(tmp_path / "v.mp4"), params_path=p)
+    assert (box.x, box.y, box.size) == (5, 6, 7)
+
+
+def test_trimmed_frame_source_applies_crop(monkeypatch):
+    """TrimmedFrameSource must slice each decoded frame to its crop box, so the
+    left panel shows only the sipper region while the video it TIMES stays the
+    untouched original (crop never re-encodes)."""
+    from video.trimcrop import CropBox
+
+    full = np.arange(8 * 8 * 3).reshape(8, 8, 3).astype(np.uint8)
+
+    class FakeReader:
+        def get_next_data(self):
+            return full
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(msv.imageio, "get_reader", lambda *a, **k: FakeReader())
+    src = msv.TrimmedFrameSource("x.mp4", np.array([0.0, 0.1]),
+                                 crop=CropBox(x=2, y=3, size=4))
+    out = src.get(0.0)
+    assert out.shape == (4, 4, 3)
+    assert np.array_equal(out, full[3:7, 2:6])
+
+
+def test_render_clip_passes_crop_to_source(tmp_path, monkeypatch):
+    """render_clip must forward its crop box to TrimmedFrameSource; a regression
+    that dropped it would render the full frame instead of the sipper crop."""
+    from video.trimcrop import CropBox
+    pts_ns = (np.arange(0, 41) * 100_000_000).astype(np.int64)
+    vb = msv.compute_video_base(pts_ns, 2)
+    rec = _synthetic_rec(pts_ns, vb, 0.0, n=50)
+
+    seen = {}
+
+    class RecordingSource:
+        def __init__(self, path, frame_sess, crop=None):
+            seen["crop"] = crop
+
+        def get(self, target_session):
+            return np.zeros((4, 4, 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(msv, "subclip_copy", lambda *a, **kw: a[3] if len(a) > 3 else kw["out_path"])
+    monkeypatch.setattr(msv, "probe_frame_rate", lambda path: 10.0)
+    monkeypatch.setattr(msv, "probe_frame_session_times",
+                        lambda *a, **kw: np.linspace(0.0, 0.3, 5))
+    monkeypatch.setattr(msv, "TrimmedFrameSource", RecordingSource)
+
+    box = CropBox(x=1, y=2, size=3)
+    msv.render_clip(rec, 0.0, 0.2, str(tmp_path / "clip.mp4"), fps=5.0, crop=box)
+    assert seen["crop"] is box
 
 
 REC27 = os.path.join(REC_DIR, "raw_data_2026-07-27_11-56-15.mp4")
@@ -389,7 +471,7 @@ def test_render_clip_default_sync_offset_delays_video(tmp_path, monkeypatch):
     targets = []
 
     class RecordingSource:
-        def __init__(self, path, frame_sess):
+        def __init__(self, path, frame_sess, crop=None):
             pass
 
         def get(self, target_session):
@@ -437,7 +519,7 @@ def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path
         return np.linspace(0.0, 0.3, 5)
 
     class FakeSource:
-        def __init__(self, path, frame_sess):
+        def __init__(self, path, frame_sess, crop=None):
             pass
 
         def get(self, target_session):

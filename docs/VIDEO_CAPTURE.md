@@ -184,18 +184,18 @@ lick times for the camera sensor.
 
 ## Cropping and rendering a sync video
 
-Two steps. Crop once per recording, then render as many clips as you like.
+Two steps. Pick the crop box once per recording, then render as many clips as
+you like.
 
-1. **Crop** — trims the video to approximately the capacitance-recording window
-   (keeping a few seconds of lead-in; frames are timed by PTS downstream, not by
-   the trim) and crops it to a square you position by hand:
+1. **Pick the crop box** — choose the square region of interest by hand:
 
        python crop_video.py --h5 "Lickometry Data/<animal>/raw_data_<stamp>.h5"
 
    A window opens on a frame from the middle of the recording. Drag the green
-   box over the sipper and press **Crop**. Writes `raw_data_<stamp>_cropped.mp4`
-   next to the recording. `--size` changes the box (default 360x360); `--force`
-   overwrites an existing crop.
+   box over the sipper and press **Crop**. Writes the box to
+   `raw_data_<stamp>_crop.json` next to the recording — a tiny `{x, y, size}`
+   sidecar, NOT a video. `--size` changes the box (default 360x360); `--force`
+   overwrites an existing box.
 
 2. **Render** — builds the side-by-side video + trace clip:
 
@@ -203,12 +203,19 @@ Two steps. Crop once per recording, then render as many clips as you like.
          --layout "Lickometry Data/<animal>/layout.csv" \
          --start 120 --end 130 --out clip.mp4
 
-   It picks up `_cropped.mp4` automatically. If you skip step 1 it falls back to
-   the uncropped recording, prints a note, and renders a full-frame video panel.
+   It reads `_crop.json` automatically and slices each frame to the box as it
+   renders. Skip step 1 (or pass `--no-crop`) for a full-frame panel; point at a
+   different box with `--crop-params <file.json>`.
 
-The cropped file keeps the original video's presentation timestamps, so the
-sync anchor is identical either way — cropping changes framing only, never
-alignment.
+The crop is a pure spatial slice applied at render time — `make_sync_video`
+always times the ORIGINAL recording, never a cropped copy. That is deliberate:
+re-encoding a crop regenerates the video's presentation timestamps onto a fresh
+constant-frame-rate grid (wrong phase and a rate rounded from ~120.0048 to a flat
+120.0), which slides every frame against the trace — a crop-first render drifted
+~1.6 s late on a late clip. Slicing pixels downstream leaves the frame↔session
+timing byte-for-byte identical to a full-frame render, so cropping changes
+framing only, never alignment. Old `raw_data_<stamp>_cropped.mp4` files from the
+retired crop-first flow are now ignored — delete them.
 
 ## Known limitations / pending work
 

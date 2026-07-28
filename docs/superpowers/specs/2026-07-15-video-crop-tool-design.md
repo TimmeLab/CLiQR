@@ -1,6 +1,42 @@
 # Standalone Video Crop Tool — Design
 
 **Date:** 2026-07-15
+**Status:** SUPERSEDED (2026-07-28) — see note below. Historical record.
+
+> ## Superseded: crop is now a display-time slice
+>
+> This spec's crop-first design (crop_video writes a re-encoded
+> `<video>_cropped.mp4`; make_sync_video times that file) shipped a sync bug and
+> has been replaced.
+>
+> **Why it failed:** re-encoding to apply the crop REGENERATES the video's PTS
+> onto a fresh CFR grid — wrong phase (off the original frame grid by a
+> non-integer number of frames) and a rate rounded from the true ~120.0048 fps to
+> a flat 120.0. `probe_frame_session_times` recovers each frame's original
+> container ordinal via `round(pts_time * rate)` to index `container_pts_ns`; on a
+> re-encoded file both inputs are wrong, so a crop-first render drifted ~1.6 s late
+> on a late clip. The uncropped path never re-encodes (`subclip_copy` is a stream
+> copy), so it stayed aligned. `-fps_mode passthrough` fixes only the rate part
+> (~0.27 s), not the phase — a dead end.
+>
+> **New design:** the crop is a pure spatial numpy slice applied at RENDER time.
+> - `crop_video.py` is now a box picker only: it writes `<base>_crop.json`
+>   (`{x, y, size}`) via `write_crop_params`. No ffmpeg encode, no cropped video.
+> - `make_sync_video.py` always times the ORIGINAL recording (`resolve_paths` no
+>   longer prefers a cropped file). `load_crop` reads the sidecar (`--no-crop` to
+>   skip, `--crop-params` to override); `render_clip(..., crop=box)` hands it to
+>   `TrimmedFrameSource`, which slices each decoded frame with `crop_frame` before
+>   display. The timing path is byte-for-byte the working uncropped path.
+> - New primitives in `video/trimcrop.py`: `CropBox`, `crop_params_path`,
+>   `write_crop_params`, `read_crop_params`, `crop_frame`.
+> - `trim_and_crop` / `cropped_path_for` / `resolve_paths(prefer_cropped=)` remain
+>   but are unused by production. Stale `*_cropped.mp4` files are ignored — delete.
+>
+> Everything below is the original 2026-07-15 crop-first design, kept for history.
+
+---
+
+**Date:** 2026-07-15
 **Status:** Approved (design), pending implementation plan
 
 ## Goal
