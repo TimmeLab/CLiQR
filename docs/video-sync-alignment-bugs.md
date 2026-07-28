@@ -160,6 +160,50 @@ with the midpoint latency (2.50 s), **+0.05 s** with `host_after − start_time`
 **Residual.** The only unmodelled term is the Pi→host response one-way latency
 (~ms). No manual `--sync-offset` is needed for recordings that carry the bracket.
 
+## Bug 5 — cropping by re-encode regenerated the PTS (2026-07-28)
+
+**Symptom.** Rendering with a crop drifted the video later and later against the
+trace (~1.6 s late on a ~6300 s clip), exactly the pre-framerate-fix behavior —
+but only when `crop_video.py` was run first. The same clip rendered uncropped
+stayed within 1 frame.
+
+**Root cause.** The old flow re-encoded the crop into `<base>_cropped.mp4`
+(`trim_and_crop`), and `make_sync_video` timed that file. Re-encoding to apply the
+crop filter REGENERATES the presentation timestamps onto a fresh CFR grid: wrong
+phase (a crop frame's `pts_time` no longer lands on the original frame grid — off
+by a non-integer number of frames) and wrong rate (the muxer resets
+`avg_frame_rate` from the true ~120.0048 fps to a flat `120/1`, and default
+`-fps_mode cfr` even drops ~1 frame per 25k to hit it). `probe_frame_session_times`
+recovers each frame's original container ordinal with `round(pts_time * rate)` to
+index `container_pts_ns` (the original per-frame `SensorTimestamp` sidecar); on a
+re-encoded file both `pts_time` and `rate` are wrong, so the lookup returns the
+wrong capture time. The uncropped path never re-encodes (`subclip_copy` is a
+stream copy that preserves the original PTS and rate), which is why it aligned.
+
+**Evidence.** On `raw_data_2026-07-27`, a re-encoded crop reports
+`avg_frame_rate = 120/1` and its clip frames' `pts_time` sit off the original grid
+by a non-integer frame count; `-fps_mode passthrough` recovers the true
+`120.0045` rate and preserves the frame count but NOT the PTS phase, so it removes
+only ~0.27 s of the ~1.6 s drift — confirming the phase shift is the dominant term
+and a re-encode cannot be made safe.
+
+**Fix — crop is now a display-time slice, never a re-encode.**
+- `crop_video.py` writes only the box: `<base>_crop.json` (`{x, y, size}`). No
+  ffmpeg encode, no cropped video.
+- `make_sync_video.py` always times the ORIGINAL recording (`resolve_paths` no
+  longer prefers a cropped file). `load_crop` reads the sidecar (`--no-crop`,
+  `--crop-params` overrides); `render_clip(..., crop=box)` passes it to
+  `TrimmedFrameSource`, which slices each decoded frame with `crop_frame` before
+  display. The timing path is byte-for-byte the uncropped path.
+- New in `video/trimcrop.py`: `CropBox`, `crop_params_path`, `write_crop_params`,
+  `read_crop_params`, `crop_frame`.
+- Verified on 07-27: the cropped render's `probe_rate` is the true 120.0048 and
+  its `frame_sess` is identical to the no-crop render; the cropped frame equals
+  the numpy slice of the full frame. Tests in `tests/test_trimcrop.py`,
+  `test_make_sync_video.py`, `test_crop_video.py`.
+- Supersedes `docs/superpowers/specs/2026-07-15-video-crop-tool-design.md`
+  (crop-first). Stale `*_cropped.mp4` files are ignored — delete them.
+
 ## Still open (follow-ups)
 
 - **This reference file (`ACG-26-3`, 2026-07-13) has no recorded L** and a real

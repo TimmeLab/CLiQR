@@ -348,11 +348,6 @@ def test_trim_and_crop_builds_argv(monkeypatch):
     assert cmd[cmd.index("-ss") + 1] == "95.000000"
     assert cmd[cmd.index("-to") + 1] == "110.000000"
     assert "libx264" in cmd  # re-encode: a filter is applied
-    # passthrough is load-bearing: default cfr resamples the ~120.0048 fps footage
-    # to a flat 120.0, dropping frames and resetting avg_frame_rate, which slides
-    # probe_frame_session_times' round(pts*rate) ordinal off container_pts_ns and
-    # drifts every crop-first render against the trace.
-    assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
 
 
 def test_trim_and_crop_seek_floors_at_zero(monkeypatch):
@@ -486,6 +481,43 @@ def test_trim_window_seconds_empty_raises():
     pts_ns = (np.arange(0, 3) * 100_000_000).astype(np.int64)
     with pytest.raises(ValueError):
         tc.trim_window_seconds(_clock(0.0), pts_ns, 0.0, -400.0)
+
+
+# --- display-time crop (params sidecar + per-frame slice) ------------------
+# The crop is a pure spatial slice applied to decoded frames at render time, so
+# the timing path (stream-copy intermediate + PTS) is byte-for-byte the working
+# uncropped path. crop_video writes only the box; make_sync_video slices frames.
+
+def test_crop_params_path():
+    assert tc.crop_params_path("/d/v.mp4") == "/d/v_crop.json"
+
+
+def test_write_then_read_crop_params_roundtrip(tmp_path):
+    p = str(tmp_path / "v_crop.json")
+    tc.write_crop_params(p, 452, 180, 360)
+    box = tc.read_crop_params(p)
+    assert (box.x, box.y, box.size) == (452, 180, 360)
+
+
+def test_read_crop_params_missing_returns_none(tmp_path):
+    assert tc.read_crop_params(str(tmp_path / "nope.json")) is None
+
+
+def test_crop_frame_slices_box():
+    frame = np.arange(10 * 10 * 3).reshape(10, 10, 3).astype(np.uint8)
+    out = tc.crop_frame(frame, tc.CropBox(x=2, y=4, size=3))
+    assert out.shape == (3, 3, 3)
+    assert np.array_equal(out, frame[4:7, 2:5])
+
+
+def test_crop_frame_none_box_returns_frame_unchanged():
+    frame = np.zeros((5, 5, 3), dtype=np.uint8)
+    assert tc.crop_frame(frame, None) is frame
+
+
+def test_crop_frame_none_frame_stays_none():
+    # TrimmedFrameSource can hand a None frame before the first decode lands.
+    assert tc.crop_frame(None, tc.CropBox(0, 0, 3)) is None
 
 
 def test_frame_session_times_scales_with_slope():

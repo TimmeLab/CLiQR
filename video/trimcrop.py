@@ -4,6 +4,7 @@ Anchor math, PTS/session-time conversion, and the ffmpeg wrappers used by both
 crop_video.py (one-time interactive trim+crop) and make_sync_video.py (per-clip
 stream-copy subclip). See docs/superpowers/specs/2026-07-15-video-crop-tool-design.md.
 """
+import json
 import os
 import re
 import subprocess
@@ -428,32 +429,13 @@ def trim_and_crop(video_path, start_sec, end_sec, out_path,
     seek a little early and rely on the preserved PTS (read back with
     ``probe_frame_session_times``) to time each frame — never on where the seek
     landed. This reads the original recording, whose PTS start at 0, so the seek
-    needs no start-PTS correction.
-
-    ``-fps_mode passthrough`` is REQUIRED and load-bearing for sync. This filter
-    graph re-encodes (a crop is applied), and ffmpeg's default encode fps mode is
-    ``cfr``, which conforms the output to a single constant rate GUESSED from the
-    input's ``r_frame_rate`` -- and r_frame_rate rounds this footage's real
-    ~120.0048 fps capture clock to a flat ``120/1``. Default cfr therefore
-    resamples the crop to exactly 120.0 fps, DROPPING ~1 frame per ~25k to shed
-    the 0.0048 fps, and the muxer then reports the cropped file's avg_frame_rate
-    as a flat 120/1. ``probe_frame_rate`` reads that back as 120.0, and
-    ``probe_frame_session_times`` does ``round(pts_time * 120.0)`` -- which no
-    longer recovers the ORIGINAL container ordinal it needs to index
-    ``container_pts_ns`` (that ordinal followed the 120.0048 grid). The index
-    error grows ~``pts * 0.0048`` frames, so a crop-first render drifts the video
-    later and later against the trace (a quarter-second by ~6300 s). The uncropped
-    path never re-encodes (subclip_copy is a stream copy), so it keeps the true
-    120.0048 and stays aligned. passthrough keeps every input frame with its
-    original PTS, so the cropped file's avg_frame_rate stays ~120.0048 and the
-    ordinal math matches the uncropped path.
-
-    Returns out_path. Raises RuntimeError if ffmpeg fails."""
+    needs no start-PTS correction. Returns out_path. Raises RuntimeError if
+    ffmpeg fails."""
     coarse = max(0.0, start_sec - seek_margin)
     vf = f"crop={size}:{size}:{crop_x}:{crop_y}"
     cmd = [
         "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
-        "-to", f"{end_sec:.6f}", "-vf", vf, "-an", "-fps_mode", "passthrough",
+        "-to", f"{end_sec:.6f}", "-vf", vf, "-an",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-pix_fmt", "yuv420p", out_path,
     ]
@@ -492,6 +474,51 @@ def subclip_copy(video_path, start_sec, end_sec, out_path, seek_margin=5.0):
 def cropped_path_for(video_path):
     """The conventional cropped sibling of a recording: <base>_cropped.mp4."""
     return os.path.splitext(video_path)[0] + "_cropped.mp4"
+
+
+@dataclass
+class CropBox:
+    """A square spatial crop: top-left (x, y), side length ``size``, in pixels of
+    the ORIGINAL frame. Applied as a numpy slice at render time (crop_frame) — the
+    crop never re-encodes the video, so it cannot touch the frame<->session timing
+    the sync depends on."""
+    x: int
+    y: int
+    size: int
+
+
+def crop_params_path(video_path):
+    """The conventional crop-box sidecar of a recording: <base>_crop.json.
+
+    crop_video.py writes the hand-positioned box here instead of producing a
+    cropped video; make_sync_video.py reads it and slices frames as it renders, so
+    the video file it times is always the untouched original recording."""
+    return os.path.splitext(video_path)[0] + "_crop.json"
+
+
+def write_crop_params(path, x, y, size):
+    """Persist a crop box as JSON. Returns path."""
+    with open(path, "w") as f:
+        json.dump({"x": int(x), "y": int(y), "size": int(size)}, f)
+    return path
+
+
+def read_crop_params(path):
+    """Load a CropBox from its JSON sidecar, or None when the file is absent (no
+    crop configured -> render the full frame)."""
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        d = json.load(f)
+    return CropBox(x=int(d["x"]), y=int(d["y"]), size=int(d["size"]))
+
+
+def crop_frame(frame, box):
+    """Spatially crop an RGB frame to ``box`` (a CropBox), or return it unchanged
+    when ``box`` is None (no crop) or ``frame`` is None (nothing decoded yet)."""
+    if box is None or frame is None:
+        return frame
+    return frame[box.y:box.y + box.size, box.x:box.x + box.size]
 
 
 def resolve_paths(h5_path, anchor, video=None, pts_txt=None, prefer_cropped=False):

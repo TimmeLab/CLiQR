@@ -65,26 +65,27 @@ def test_compute_crop_window_empty_raises():
 
 
 def test_resolve_out_path_default(tmp_path):
+    # crop_video now writes only the crop-box sidecar, not a cropped video
     v = str(tmp_path / "v.mp4")
-    assert cv.resolve_out_path(v, None, False) == str(tmp_path / "v_cropped.mp4")
+    assert cv.resolve_out_path(v, None, False) == str(tmp_path / "v_crop.json")
 
 
 def test_resolve_out_path_explicit(tmp_path):
     v = str(tmp_path / "v.mp4")
-    assert cv.resolve_out_path(v, "/o/x.mp4", False) == "/o/x.mp4"
+    assert cv.resolve_out_path(v, "/o/x.json", False) == "/o/x.json"
 
 
 def test_resolve_out_path_existing_raises(tmp_path):
     v = str(tmp_path / "v.mp4")
-    (tmp_path / "v_cropped.mp4").write_bytes(b"")
+    (tmp_path / "v_crop.json").write_bytes(b"")
     with pytest.raises(ValueError, match="--force"):
         cv.resolve_out_path(v, None, False)
 
 
 def test_resolve_out_path_existing_with_force(tmp_path):
     v = str(tmp_path / "v.mp4")
-    (tmp_path / "v_cropped.mp4").write_bytes(b"")
-    assert cv.resolve_out_path(v, None, True) == str(tmp_path / "v_cropped.mp4")
+    (tmp_path / "v_crop.json").write_bytes(b"")
+    assert cv.resolve_out_path(v, None, True) == str(tmp_path / "v_crop.json")
 
 
 def test_resolve_out_path_refuses_to_overwrite_source(tmp_path):
@@ -111,10 +112,14 @@ def test_resolve_out_path_refuses_dotted_path_equivalent_to_source(tmp_path):
         cv.resolve_out_path(v, dotted, True)
 
 
-def test_reject_cropped_input():
-    with pytest.raises(ValueError, match="already-cropped"):
-        cv.reject_cropped_input("/d/v_cropped.mp4")
-    cv.reject_cropped_input("/d/v.mp4")  # no raise
+def test_save_crop_params_writes_box(tmp_path):
+    """crop_video's job is now to persist the hand-positioned box; make_sync_video
+    slices frames with it at render time."""
+    from video.trimcrop import read_crop_params
+    out = str(tmp_path / "v_crop.json")
+    cv.save_crop_params(out, x=452, y=180, size=360)
+    box = read_crop_params(out)
+    assert (box.x, box.y, box.size) == (452, 180, 360)
 
 
 def test_build_arg_parser_defaults():
