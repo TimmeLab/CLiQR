@@ -348,6 +348,11 @@ def test_trim_and_crop_builds_argv(monkeypatch):
     assert cmd[cmd.index("-ss") + 1] == "95.000000"
     assert cmd[cmd.index("-to") + 1] == "110.000000"
     assert "libx264" in cmd  # re-encode: a filter is applied
+    # passthrough is load-bearing: default cfr resamples the ~120.0048 fps footage
+    # to a flat 120.0, dropping frames and resetting avg_frame_rate, which slides
+    # probe_frame_session_times' round(pts*rate) ordinal off container_pts_ns and
+    # drifts every crop-first render against the trace.
+    assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
 
 
 def test_trim_and_crop_seek_floors_at_zero(monkeypatch):

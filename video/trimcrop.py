@@ -428,13 +428,32 @@ def trim_and_crop(video_path, start_sec, end_sec, out_path,
     seek a little early and rely on the preserved PTS (read back with
     ``probe_frame_session_times``) to time each frame — never on where the seek
     landed. This reads the original recording, whose PTS start at 0, so the seek
-    needs no start-PTS correction. Returns out_path. Raises RuntimeError if
-    ffmpeg fails."""
+    needs no start-PTS correction.
+
+    ``-fps_mode passthrough`` is REQUIRED and load-bearing for sync. This filter
+    graph re-encodes (a crop is applied), and ffmpeg's default encode fps mode is
+    ``cfr``, which conforms the output to a single constant rate GUESSED from the
+    input's ``r_frame_rate`` -- and r_frame_rate rounds this footage's real
+    ~120.0048 fps capture clock to a flat ``120/1``. Default cfr therefore
+    resamples the crop to exactly 120.0 fps, DROPPING ~1 frame per ~25k to shed
+    the 0.0048 fps, and the muxer then reports the cropped file's avg_frame_rate
+    as a flat 120/1. ``probe_frame_rate`` reads that back as 120.0, and
+    ``probe_frame_session_times`` does ``round(pts_time * 120.0)`` -- which no
+    longer recovers the ORIGINAL container ordinal it needs to index
+    ``container_pts_ns`` (that ordinal followed the 120.0048 grid). The index
+    error grows ~``pts * 0.0048`` frames, so a crop-first render drifts the video
+    later and later against the trace (a quarter-second by ~6300 s). The uncropped
+    path never re-encodes (subclip_copy is a stream copy), so it keeps the true
+    120.0048 and stays aligned. passthrough keeps every input frame with its
+    original PTS, so the cropped file's avg_frame_rate stays ~120.0048 and the
+    ordinal math matches the uncropped path.
+
+    Returns out_path. Raises RuntimeError if ffmpeg fails."""
     coarse = max(0.0, start_sec - seek_margin)
     vf = f"crop={size}:{size}:{crop_x}:{crop_y}"
     cmd = [
         "ffmpeg", "-y", "-ss", f"{coarse:.6f}", "-copyts", "-i", video_path,
-        "-to", f"{end_sec:.6f}", "-vf", vf, "-an",
+        "-to", f"{end_sec:.6f}", "-vf", vf, "-an", "-fps_mode", "passthrough",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-pix_fmt", "yuv420p", out_path,
     ]
