@@ -14,8 +14,10 @@ The saved MATLAB networks (`lickNets.mat`) were trained on capacitance data coll
 **before** the MPR121 charge/discharge time (CDT) was increased. Raising CDT greatly
 increased the magnitude (deflection depth) of the capacitance signal. The *shape* of a lick
 deflection is essentially unchanged, but the amplitude scale is not — and the networks bake in
-a **single global zscore normalization scalar** (netBout mean −6.87 / std 8.22; netPoint mean
-−5.00 / std 8.97) fit to the old scale. Those constants are now wrong for new recordings.
+a **single global zscore normalization scalar** (netBout mean −5.00 / std 8.97; netPoint mean
+−6.87 / std 8.22 — verified against `net.Layers(1).Mean` in MATLAB during the Task 3 parity gate;
+note the MATLAB `#refs#` group letters C/c do NOT follow the naive uppercase=bout convention) fit
+to the old scale. Those constants are now wrong for new recordings.
 
 Because the deflection shape is preserved, **transfer learning** (reuse the trained
 convolutional/FC weights, refit normalization, fine-tune) should adapt the networks to the new
