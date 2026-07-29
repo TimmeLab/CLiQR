@@ -25,15 +25,28 @@ def resample_to_100hz(time_s, cap):
     Resample irregular (time, capacitance) onto a uniform 100 Hz grid.
 
     Uses linear interpolation via np.interp. The grid is constructed strictly within the source
-    range [t0, t_end) using np.arange, so all query points fall inside [t0, t_end] and no
-    extrapolation is needed — behavior matches MATLAB's linear interp1 over the covered range.
+    range [t0, t_end) so all query points fall inside [t0, t_end] and no extrapolation is needed
+    — behavior matches MATLAB's linear interp1 over the covered range.
 
-    Returns (t_uniform, y_uniform) as float64 arrays.
+    Numerical note (important): recording timestamps can be ABSOLUTE Unix epoch seconds (~1.7e9).
+    Building the grid directly with `np.arange(t0, t_end, 0.01)` at that magnitude suffers
+    catastrophic floating-point cancellation — successive 0.01 s steps lose precision and the grid
+    drifts by up to ~1 sample relative to a grid built near zero. Near a sharp lick dip that
+    sub-sample drift changes the interpolated value enough to flip a borderline network
+    classification. To avoid this we build the grid RELATIVE to t0 (small magnitudes, so the step
+    is represented accurately), interpolate on the relative axis, then shift the returned times
+    back to the original base. In production `filter_data` already zero-bases time_data, so this
+    mainly hardens the function against callers that pass absolute-epoch time (e.g. validation).
+
+    Returns (t_uniform, y_uniform) as float64 arrays, with t_uniform in the ORIGINAL time base.
     """
     time_s = np.asarray(time_s, dtype=float)
     cap = np.asarray(cap, dtype=float)
-    t_uniform = np.arange(time_s[0], time_s[-1], 1.0 / FS)
-    y_uniform = np.interp(t_uniform, time_s, cap)
+    t0 = time_s[0]
+    time_rel = time_s - t0                       # small magnitudes -> accurate 0.01 s steps
+    grid_rel = np.arange(0.0, time_rel[-1], 1.0 / FS)
+    y_uniform = np.interp(grid_rel, time_rel, cap)
+    t_uniform = grid_rel + t0                     # shift back to the caller's original time base
     return t_uniform, y_uniform
 
 

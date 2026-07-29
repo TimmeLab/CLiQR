@@ -256,8 +256,16 @@ def validate_recording(h5_path, board, sensor, net_file=DEFAULT_NET_FILE,
     This is the convenience entry point for validation gate #2. Point it at an OLD-scale recording
     (pre-2026-07-22) so the ported old-scale weights are the right comparison. A faithful port
     should yield precision and recall at or very near 1.0 with sub-tolerance timing offsets.
+
+    We zero-base the trace (subtract the first timestamp) before running EITHER cascade. This
+    mirrors production exactly — `data_analysis.filter_data` subtracts the recorded start time, so
+    the ML path always sees time relative to ~0. It also removes an absolute-epoch floating-point
+    artifact from the comparison: raw recording timestamps are Unix epoch seconds (~1.7e9), and
+    resampling at that magnitude drifts the grid by up to ~1 sample, which would otherwise flip a
+    handful of borderline detections and understate the two cascades' true agreement.
     """
     time_s, cap = load_sensor_trace(h5_path, board, sensor)
+    time_s = time_s - time_s[0]                 # zero-base, mirroring filter_data (see docstring)
     python_times = run_python_cascade(time_s, cap, net_file=net_file)
     matlab_times = run_matlab_cascade(time_s, cap, net_file=net_file, matlab_bin=matlab_bin)
     report = compare_lick_times(python_times, matlab_times, tol_s=tol_s)
