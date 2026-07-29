@@ -6,6 +6,7 @@ detected licks. See docs/superpowers/specs/2026-07-14-sync-video-composite-desig
 """
 import argparse
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -53,6 +54,7 @@ from video.trimcrop import (  # noqa: F401
 @dataclass
 class Recording:
     animal: str
+    date: str  # recording date (YYYY-MM-DD) parsed from the h5 filename
     sensor: int
     cap: np.ndarray
     time: np.ndarray
@@ -109,6 +111,8 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
     layout = pd.read_csv(layout_path, header=None, index_col=0)
     session_duration = anchor.session_duration
     animal = str(layout.loc[anchor.sensor_number].iloc[0])
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(h5_path))
+    date = m.group(1) if m else ""
 
     with tempfile.TemporaryDirectory() as td:
         filt_path = os.path.join(td, "filtered.h5")
@@ -138,7 +142,7 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
     container_pts_ns = load_container_pts(pts_txt_path, pts_ns)
 
     return Recording(
-        animal=animal, sensor=anchor.sensor_number, cap=cap, time=time,
+        animal=animal, date=date, sensor=anchor.sensor_number, cap=cap, time=time,
         lick_times=np.asarray(lick_times), lick_indices=lick_indices,
         lick_vals=lick_vals,
         clock=clock, video_path=video_path,
@@ -224,16 +228,17 @@ class TrimmedFrameSource:
         self._reader.close()
 
 
-def clip_trim_window(rec, start, end):
+def clip_trim_window(rec, start, end, framerate):
     """Video-file window (start_frame, stop_frame, start_sec, end_sec) for the
-    clip's session window [start, end].
+    clip's session window [start, end]. ``framerate`` is the original recording's
+    true CFR rate (probe_frame_rate); the seconds are CONTAINER seconds on it.
 
     Latency and clock drift both live in rec.clock (the bookmark frame sits at
     τ=latency; frame times are scaled by the two-bookmark slope), shared with
     crop_video's compute_crop_window through trim_window_seconds so the crop and
     render windows cannot drift apart.
     """
-    return trim_window_seconds(rec.clock, rec.pts_ns, start, end)
+    return trim_window_seconds(rec.clock, rec.pts_ns, start, end, framerate)
 
 
 def load_crop(video_path, params_path=None, no_crop=False):
@@ -251,7 +256,7 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
                 sync_offset=DEFAULT_SYNC_OFFSET, intermediate_path=None,
                 crop=None):
     """Render the side-by-side clip. First stream-copies the mouse video down to
-    the clip window (intermediate file, kept) so we don't decode the whole
+    the clip window (intermediate file) so we don't decode the whole
     recording, then composites from it: the left panel is the video frame, the
     right panel the sliding capacitance trace with a centered dot and lick
     markers. Each video frame is placed by its true session time (from its
@@ -273,7 +278,11 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
     ``fps`` None (default) renders at the footage's real capture rate, so no
     source frames are dropped; pass a number to force a different output rate.
     """
-    _, _, start_sec, end_sec = clip_trim_window(rec, start, end)
+    # The clip window's seconds are CONTAINER seconds on the ORIGINAL recording's
+    # CFR rate, which is what subclip_copy seeks by -- probe that rate here, not
+    # the trimmed clip's (identical, but the trim doesn't exist yet).
+    src_framerate = probe_frame_rate(rec.video_path)
+    _, _, start_sec, end_sec = clip_trim_window(rec, start, end, src_framerate)
 
     if intermediate_path is None:
         intermediate_path = os.path.splitext(out_path)[0] + "_trimcrop.mp4"
@@ -299,13 +308,23 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
     cap_min, cap_max = float(rec.cap.min()), float(rec.cap.max())
     pad = 0.05 * (cap_max - cap_min + 1.0)
 
+    # imshow forces equal aspect, so the video axes keeps side/top gaps that
+    # tight_layout can't remove; paint the figure + video axes dark grey so any
+    # leftover whitespace reads as intentional background rather than white.
+    dark_grey = "#2b2b2b"
     fig, (axv, axt) = plt.subplots(1, 2, figsize=(12, 4.5))
-    fig.subplots_adjust(left=0.02, right=0.97, wspace=0.08)
+    fig.set_facecolor(dark_grey)
+    axv.set_facecolor(dark_grey)
 
     first_frame = src.get(start - sync_offset)
     im = axv.imshow(first_frame if first_frame is not None
                     else np.zeros((2, 2, 3), dtype=np.uint8))
     axv.axis("off")
+    # Shape the video axes box to the frame's aspect so imshow (equal aspect)
+    # fills it exactly -- no left/right/top gaps to center against.
+    if first_frame is not None:
+        fh, fw = first_frame.shape[:2]
+        axv.set_box_aspect(fh / fw)
     im_sized = first_frame is not None
 
     (line,) = axt.plot([], [], lw=0.8, color="tab:blue")
@@ -315,6 +334,15 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
     axt.set_ylim(cap_min - pad, cap_max + pad)
     axt.set_xlabel("Time (s, session)")
     axt.set_ylabel("Capacitance")
+    # trace labels/ticks/spines sit on the dark-grey figure margin -> make white
+    axt.tick_params(colors="white")
+    axt.xaxis.label.set_color("white")
+    axt.yaxis.label.set_color("white")
+    for spine in axt.spines.values():
+        spine.set_color("white")
+    title = " — ".join(p for p in (rec.animal, rec.date) if p)
+    fig.suptitle(title, color="white", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
 
     def update(i):
         nonlocal im_sized
@@ -342,7 +370,8 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
 
     anim = FuncAnimation(fig, update, frames=len(taus), blit=False)
     try:
-        anim.save(out_path, writer=FFMpegWriter(fps=fps))
+        anim.save(out_path, writer=FFMpegWriter(fps=fps),
+                  savefig_kwargs={"facecolor": dark_grey})
     finally:
         plt.close(fig)
         src.close()
@@ -391,8 +420,14 @@ def build_arg_parser():
                         "the trace (default %(default).4f s = 2 frames, the "
                         "measured constant residual lead)")
     p.add_argument("--intermediate", default=None,
-                   help="path for the trimmed subclip (kept); "
-                        "default: <out>_trimcrop.mp4")
+                   help="path for the trimmed subclip (implies "
+                        "--keep-intermediate); default: a temp file, deleted "
+                        "after rendering")
+    p.add_argument("--keep-intermediate", dest="keep_intermediate",
+                   action="store_true",
+                   help="keep the trimmed subclip after rendering (default: "
+                        "delete it); saved to <out>_trimcrop.mp4 unless "
+                        "--intermediate gives a path")
     return p
 
 
@@ -408,17 +443,31 @@ def main(argv=None):
         validate_window(args.start, args.end, anchor.session_duration)
         rec = load_recording(args.h5, args.layout, pts_txt, video, anchor)
         crop = load_crop(video, args.crop_params, args.no_crop)
-        intermediate = args.intermediate or (os.path.splitext(args.out)[0] + "_trimcrop.mp4")
+        keep = args.keep_intermediate or args.intermediate is not None
+        if keep:
+            intermediate = (args.intermediate
+                            or os.path.splitext(args.out)[0] + "_trimcrop.mp4")
+        else:
+            fd, intermediate = tempfile.mkstemp(
+                suffix="_trimcrop.mp4",
+                dir=os.path.dirname(os.path.abspath(args.out)))
+            os.close(fd)
         print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
               f"[{args.start:.1f}, {args.end:.1f}] s")
         crop_note = (f"{crop.size}x{crop.size} @ ({crop.x}, {crop.y})"
                      if crop else "full frame")
         print(f"  crop -> {crop_note}")
-        print(f"  trimmed video -> {intermediate}")
+        print(f"  trimmed video -> {intermediate}"
+              f"{'' if keep else ' (temp, will delete)'}")
         print(f"  composite -> {args.out}")
-        render_clip(rec, args.start, args.end, args.out,
-                    fps=args.fps, window=args.window, sync_offset=args.sync_offset,
-                    intermediate_path=intermediate, crop=crop)
+        try:
+            render_clip(rec, args.start, args.end, args.out,
+                        fps=args.fps, window=args.window,
+                        sync_offset=args.sync_offset,
+                        intermediate_path=intermediate, crop=crop)
+        finally:
+            if not keep and os.path.exists(intermediate):
+                os.remove(intermediate)
         print("done")
     except (ValueError, FileNotFoundError, KeyError, OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
