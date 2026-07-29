@@ -12,6 +12,11 @@ def test_resample_produces_uniform_100hz_grid():
     assert np.allclose(dt, 0.01, atol=1e-9)
     assert tr[0] == 0.0
     assert yr.shape == tr.shape
+    # Verify linear interpolation is working correctly: test on a perfectly linear source.
+    t_linear = np.array([0.0, 1.0, 2.0])
+    y_linear = np.array([0.0, 10.0, 20.0])  # y = 10*t exactly
+    tr_linear, yr_linear = resample_to_100hz(t_linear, y_linear)
+    np.testing.assert_allclose(yr_linear, 10.0 * tr_linear, atol=1e-9)
 
 
 def test_offsets_put_max_at_zero():

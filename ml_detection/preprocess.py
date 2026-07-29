@@ -24,16 +24,15 @@ def resample_to_100hz(time_s, cap):
     """
     Resample irregular (time, capacitance) onto a uniform 100 Hz grid.
 
-    Uses linear interpolation, extrapolating at the ends (np.interp clamps by default, so we
-    extend manually) to match MATLAB's `interp1(..., 'linear', 'extrap')`.
+    Uses linear interpolation via np.interp. The grid is constructed strictly within the source
+    range [t0, t_end) using np.arange, so all query points fall inside [t0, t_end] and no
+    extrapolation is needed — behavior matches MATLAB's linear interp1 over the covered range.
 
     Returns (t_uniform, y_uniform) as float64 arrays.
     """
     time_s = np.asarray(time_s, dtype=float)
     cap = np.asarray(cap, dtype=float)
     t_uniform = np.arange(time_s[0], time_s[-1], 1.0 / FS)
-    # np.interp does not extrapolate; within-range points are all we need here because the grid
-    # is built strictly inside [t0, t_end]. Endpoint equality is handled by the half-open arange.
     y_uniform = np.interp(t_uniform, time_s, cap)
     return t_uniform, y_uniform
 
