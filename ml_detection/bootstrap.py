@@ -13,7 +13,8 @@ from ml_detection.preprocess import (
 )
 
 
-def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0):
+def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0,
+                       min_separation_samples=0):
     """
     Build initial labeled 3 s segments from one recording.
 
@@ -21,6 +22,13 @@ def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0)
     ----------
     threshold_lick_times : np.ndarray
         Lick times (seconds, original base) from the existing basic_algorithm threshold detector.
+    min_separation_samples : int
+        Minimum spacing (in 100 Hz samples) required between the START indices of any two accepted
+        windows. 0 (default) disables the constraint — windows may overlap freely. Setting this to
+        WIN_SAMPLES (300) forces fully non-overlapping windows; a smaller value caps how much two
+        accepted windows may overlap. This reduces the near-duplicate segments that arise when many
+        random windows land on the same licking bout, at the cost of fewer distinct windows being
+        available (so a session may under-fill a category — a warning is printed if so).
 
     Returns a training dict compatible with save_training_h5 / prepare_point_segments.
     """
@@ -37,9 +45,19 @@ def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0)
     per_cat = round(n_samples / 3)
     segments, times, lick_idx, labels = [], [], [], []
 
+    # Start indices of every accepted window, across all categories, so the spacing constraint
+    # prevents duplicates regardless of which category each window fell into.
+    accepted_starts = []
+
     def count_center_licks(start):
         cs = start + center_start
         return int(lick_flags[cs:cs + CENTER_SAMPLES].sum())
+
+    def too_close(start):
+        # Reject a candidate whose start is within min_separation_samples of any accepted window.
+        if min_separation_samples <= 0 or not accepted_starts:
+            return False
+        return bool(np.min(np.abs(np.asarray(accepted_starts) - start)) < min_separation_samples)
 
     max_start = len(t) - WIN_SAMPLES
     if max_start <= 0:
@@ -51,6 +69,8 @@ def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0)
             if got >= per_cat:
                 break
             s = rng.randint(0, max_start)
+            if too_close(s):
+                continue
             n_c = count_center_licks(s)
             if cat == 0 and n_c != 0: continue
             if cat == 1 and not (1 <= n_c <= 3): continue
@@ -61,6 +81,7 @@ def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0)
             times.append((t[s:s + WIN_SAMPLES] - t[s]).astype(np.float64))
             lick_idx.append(in_win.astype(np.int64))
             labels.append(1 if n_c > 0 else 0)
+            accepted_starts.append(s)
             got += 1
         if got < per_cat:
             print(f"Warning: bootstrap_segments category {cat} under-filled: got {got} of {per_cat} requested windows.")

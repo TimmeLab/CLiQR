@@ -3,7 +3,7 @@ from ml_detection.bootstrap import bootstrap_segments
 from ml_detection.dataset import (
     save_training_h5, load_training_h5, prepare_point_segments,
 )
-from ml_detection.preprocess import resample_to_100hz
+from ml_detection.preprocess import resample_to_100hz, WIN_SAMPLES
 
 
 def test_training_h5_roundtrip(tmp_path):
@@ -80,3 +80,29 @@ def test_bootstrap_segments_category_balance(tmp_path):
     assert d2["samples"].shape == d["samples"].shape
     X, y = prepare_point_segments(d2)
     assert X.shape[0] == y.shape[0]
+
+
+def test_bootstrap_segments_min_separation_limits_overlap():
+    # An 18 s recording -> 1800 samples at 100 Hz; no licks anywhere, so only the 0-lick category
+    # is fillable. max_start = 1800 - 300 = 1500. With min_separation = WIN_SAMPLES (300), accepted
+    # window starts must be >= 300 apart, so at most 6 non-overlapping 3 s windows fit
+    # (0, 300, ..., 1500). Without the constraint, windows may overlap freely and the category
+    # fills to the requested count. This exercises the anti-duplicate spacing constraint via its
+    # observable effect (the returned dict does not expose raw window start indices).
+    time_s = np.arange(0, 18, 0.01)
+    cap = np.zeros_like(time_s)
+    no_licks = np.array([])
+    per_cat = round(30 / 3)  # 10 requested per category
+
+    # Unconstrained: the 0-lick category fills completely (overlap allowed).
+    d_free = bootstrap_segments(time_s, cap, no_licks, n_samples=30, seed=0,
+                                min_separation_samples=0)
+    n0_free = int(np.sum(d_free["labels_bout"] == 0))
+    assert n0_free == per_cat
+
+    # Non-overlapping spacing: far fewer distinct windows exist, so it under-fills to the capacity.
+    d_spaced = bootstrap_segments(time_s, cap, no_licks, n_samples=30, seed=0,
+                                  min_separation_samples=WIN_SAMPLES)
+    n0_spaced = int(np.sum(d_spaced["labels_bout"] == 0))
+    assert n0_spaced <= 6           # at most 6 non-overlapping 3 s windows fit in 18 s
+    assert n0_spaced < n0_free      # the constraint genuinely reduced the count

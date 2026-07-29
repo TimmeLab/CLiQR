@@ -61,6 +61,12 @@ def main():
         "--seed", type=int, default=0,
         help="Base RNG seed for reproducible sampling. Each session offsets it so sessions differ.",
     )
+    parser.add_argument(
+        "--min-separation", type=int, default=300,
+        help="Minimum spacing (in 100 Hz samples) between accepted window starts, to cut "
+             "near-duplicate segments from overlapping windows. Default 300 = fully "
+             "non-overlapping 3 s windows. Use 0 to allow overlap.",
+    )
     args = parser.parse_args()
 
     if args.out is None:
@@ -104,6 +110,7 @@ def main():
                     training = bootstrap_segments(
                         time_s, cap, seed_lick_times,
                         n_samples=args.per_session, seed=session_seed,
+                        min_separation_samples=args.min_separation,
                     )
                 except ValueError as exc:
                     # Raised when a session is shorter than one 3 s window after resampling.
@@ -167,7 +174,7 @@ def main():
         for animal, session, reason in skipped:
             print(f"    {animal}/{session}: {reason}")
 
-    print(f"\nNext: curate in the labeler ->  solara run ml_detection/labeler/app.py  "
+    print(f"\nNext: curate in the labeler ->  panel serve ml_detection/labeler/app.py --show  "
           f"(load {args.out})")
 
 

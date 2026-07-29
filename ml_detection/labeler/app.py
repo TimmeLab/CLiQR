@@ -71,7 +71,7 @@ lick_source = ColumnDataSource(data={"x": [], "y": []})
 selected_source = ColumnDataSource(data={"x": [], "y": []})
 
 plot = figure(
-    height=400, title="Load a training file to begin",
+    height=600, sizing_mode="stretch_width", title="Load a training file to begin",
     x_axis_label="sample (within 3 s segment)", y_axis_label="capacitance (offset)",
     tools="pan,box_zoom,wheel_zoom,reset",
 )
@@ -253,7 +253,7 @@ layout = pn.Column(
     file_browser,
     load_button,
     status,
-    pn.pane.Bokeh(plot),
+    pn.pane.Bokeh(plot, sizing_mode="stretch_width"),
     controls,
 )
 
