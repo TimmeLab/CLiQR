@@ -22,6 +22,10 @@ convolutional/FC weights, refit normalization, fine-tune) should adapt the netwo
 data efficiently, rather than retraining from scratch. We assume we will label additional
 high-CDT training data.
 
+**CDT cutoff date: 2026-07-22.** Recordings on 2026-07-22 and onward are in the new (high) scale;
+earlier recordings are old-scale. This date splits the corpus into fine-tune data (new-scale) and
+old-scale validation oracles.
+
 ## Goals
 
 - Reproduce the MATLAB two-net cascade **exactly** in PyTorch (so the ported weights are
@@ -176,8 +180,12 @@ it as a deferred improvement to test (see Potential Improvements). Offset conven
 
 ### bootstrap.py + dataset.py
 
-1. Read ACG-26-3 2026-07 recordings (`Lickometry Data/results_combined_ACG-26-3_2026-07*.h5` and
-   related), per sensor: `cap_data` (int64), `time_data` (float64).
+1. Read **new-CDT** ACG-26-3 recordings, per sensor: `cap_data` (int64), `time_data` (float64).
+   **CDT cutoff: 2026-07-22.** The MPR121 charge/discharge-time change took effect for data
+   recorded **on 2026-07-22 and onward**, so only those files are in the new magnitude scale.
+   Concretely, `results_combined_ACG-26-3_2026-07-22*.h5` are new-scale (training/fine-tune data);
+   the earlier `2026-07-09` and `2026-07-21` files are **old-scale** and must NOT be mixed into
+   the new-CDT training set. Match new-scale files explicitly by date, not a broad `2026-07*` glob.
 2. Resample + offset via `preprocess.py`.
 3. Seed lick marks by running the existing `basic_algorithm` threshold detector on each recording
    (far better starting point than MATLAB's findpeaks).
@@ -244,7 +252,10 @@ Port `lickLabelerGUI` behavior to Solara (already in the env; matches cliqr-gui)
    Assert the PyTorch port matches to ~1e-4. **Must pass before any fine-tuning** — fine-tuning
    from mis-loaded weights is worthless.
 2. **Pre-fine-tune sanity.** The ported (un-fine-tuned) net on an *old-CDT* recording reproduces
-   the old MATLAB detection behavior.
+   the old MATLAB detection behavior. Use a **pre-2026-07-22** file (e.g.
+   `results_combined_ACG-26-3_2026-07-21.h5` or `_2026-07-09_...h5`) — these are still in the old
+   magnitude scale the saved weights were trained on, so they are the correct oracle for this
+   gate.
 3. **Post-fine-tune metrics.** Precision / recall / F1 on held-out sessions against curated
    labels; compare to the threshold detector on the same sessions.
 4. **Timing spot-check.** Overlay ML lick times on the trace (and sync video where available) for
