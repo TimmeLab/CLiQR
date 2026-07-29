@@ -21,6 +21,15 @@ All editing behavior lives in `logic.py` (pure, unit-tested); this module only w
 buttons to those functions and redraws the Bokeh sources.
 """
 import os
+import sys
+
+# `panel serve path/to/app.py` executes this file directly, WITHOUT the repository root on
+# sys.path, so `import ml_detection` would fail (blank page). Make the app self-locating: this file
+# is ml_detection/labeler/app.py, so the repo root is three directories up. Add it to sys.path
+# before importing the package, so `panel serve ml_detection/labeler/app.py` works from anywhere.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import panel as pn
