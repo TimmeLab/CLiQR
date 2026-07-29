@@ -6,6 +6,8 @@ Pure label logic (unit-tested) is separated from the Solara UI (run manually):
 Load a training HDF5 (from bootstrap), step through segments, click to add/select licks, nudge
 with buttons, delete, and save a curated HDF5. `labels_bout` is recomputed on every edit.
 """
+import os
+
 import numpy as np
 import solara
 
@@ -63,7 +65,7 @@ def Page():
         solara.Button("Prev", on_click=lambda: idx.set(max(0, i - 1)))
         solara.Button("Next", on_click=lambda: idx.set(min(len(d['samples']) - 1, i + 1)))
         solara.Button("Save", on_click=lambda: save_training_h5(
-            path.value.replace(".h5", "_curated.h5"),
+            os.path.splitext(path.value)[0] + "_curated.h5",
             d["samples"], d["t"], d["lick_idx"], d["labels_bout"], {"curated": "true"}))
 
 

@@ -15,6 +15,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from ml_detection.nets import LickBoutNet, LickPointNet
 from ml_detection.weights_io import load_matlab_nets
 from ml_detection.dataset import load_training_h5, prepare_point_segments
+from ml_detection.preprocess import POINT_WIN
 
 
 def refit_zscore(net, segments):
@@ -40,7 +41,7 @@ def _train_one(net, X, y, Xval, yval, epochs, lr, batch_size):
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
     loader = DataLoader(TensorDataset(torch.tensor(X), torch.tensor(y)),
-                        batch_size=batch_size, shuffle=True)
+                        batch_size=batch_size, shuffle=True, drop_last=True)
     best, best_state, patience, bad = 0.0, None, 5, 0
     for _ in range(epochs):
         net.train()
@@ -81,11 +82,18 @@ def fine_tune(training_files, out_path, epochs=100, lr=1e-4, batch_size=64,
             bout_x.append(d["samples"]); bout_y.append(d["labels_bout"])
             X, y = prepare_point_segments(d)
             if len(y):
-                pt_x.append(X[:, 0, :]); pt_y.append(y)
-        BX = np.concatenate(bout_x)[:, None, :].astype(np.float32)
-        BY = np.concatenate(bout_y).astype(np.int64)
-        PX = np.concatenate(pt_x)[:, None, :].astype(np.float32)
-        PY = np.concatenate(pt_y).astype(np.int64)
+                pt_x.append(X); pt_y.append(y)
+        BX = np.concatenate(bout_x)[:, None, :].astype(np.float32) if bout_x \
+            else np.empty((0, 1, 0), np.float32)
+        BY = np.concatenate(bout_y).astype(np.int64) if bout_y else np.empty((0,), np.int64)
+        if pt_x:
+            PX = np.concatenate(pt_x, axis=0).astype(np.float32)
+            PY = np.concatenate(pt_y).astype(np.int64)
+        else:
+            # No point-labeled segments in this split (all labels_bout==0) -- produce
+            # correctly-shaped empty arrays instead of letting np.concatenate([]) raise.
+            PX = np.empty((0, 1, POINT_WIN), np.float32)
+            PY = np.empty((0,), np.int64)
         return BX, BY, PX, PY
 
     BXt, BYt, PXt, PYt = gather(train_ids)
@@ -93,10 +101,16 @@ def fine_tune(training_files, out_path, epochs=100, lr=1e-4, batch_size=64,
 
     # Refit normalization from TRAIN segments only (no val leakage).
     refit_zscore(bout, BXt[:, 0, :])
-    refit_zscore(point, PXt[:, 0, :])
+    point_acc = 0.0
+    if len(PXt) == 0:
+        print("WARNING: no point-training samples in this split (all labels_bout==0); "
+              "skipping point-net fine-tuning.")
+    else:
+        refit_zscore(point, PXt[:, 0, :])
 
     bout_acc = _train_one(bout, BXt, BYt, BXv, BYv, epochs, lr, batch_size)
-    point_acc = _train_one(point, PXt, PYt, PXv, PYv, epochs=20, lr=lr, batch_size=128)
+    if len(PXt) > 0:
+        point_acc = _train_one(point, PXt, PYt, PXv, PYv, epochs=20, lr=lr, batch_size=128)
 
     meta = {"fs": 100, "win_sec": 3, "point_win": 21,
             "train_sessions": sorted(train_ids), "val_sessions": sorted(val_ids)}

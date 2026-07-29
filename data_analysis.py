@@ -511,16 +511,21 @@ def _load_ml_nets(checkpoint=None):
     return load_matlab_nets(os.path.join("ML Detection MATLAB Code", "lickNets.mat"))
 
 
-# Module-level indirection so tests can monkeypatch `data_analysis.detect_licks`.
-try:
-    from ml_detection.infer import detect_licks
-except Exception:      # torch/ml_detection not importable in some minimal contexts
-    detect_licks = None
+# Module-level indirection so tests can monkeypatch `data_analysis.detect_licks`. Left as None
+# here (rather than imported eagerly) so `import data_analysis` never pulls in torch via
+# ml_detection.infer -- the default basic_threshold path shouldn't pay that cost. The real
+# function is imported lazily on first use inside ml_algorithm (see below).
+detect_licks = None
 
 
 def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None):
     """Detect licks with the ML cascade. Mirrors basic_algorithm's I/O contract exactly:
-    writes lick_times, lick_indices, num_licks per animal via save_filtered_data."""
+    writes lick_times, lick_indices, num_licks per animal (num_licks is in-memory only, same
+    as basic_algorithm -- neither is persisted via save_filtered_data)."""
+    global detect_licks
+    if detect_licks is None:
+        from ml_detection.infer import detect_licks as _dl
+        detect_licks = _dl
     bout_net, point_net = _load_ml_nets(checkpoint)
     for animal, data in data_by_animal.items():
         cap = np.asarray(data["cap_data"])
@@ -532,7 +537,8 @@ def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None):
             if missing_data: return missing_data
             continue
         lick_times = np.asarray(detect_licks(t, cap, bout_net, point_net))
-        # Map lick TIMES back to indices in the (trimmed) original trace via nearest time sample.
+        # Map lick TIMES back to indices in the (trimmed) original trace: np.searchsorted returns
+        # the leftmost insertion point, i.e. the first sample with t >= lick_time (not nearest).
         lick_indices = np.searchsorted(t, lick_times)
         lick_indices = np.clip(lick_indices, 0, len(t) - 1)
         data["lick_times"] = lick_times

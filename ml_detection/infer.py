@@ -13,7 +13,7 @@ import torch
 
 from ml_detection.preprocess import (
     resample_to_100hz, offset_global, offset_window,
-    FS, WIN_SAMPLES, POINT_WIN, CENTER_SAMPLES, BOUT_STEP,
+    FS, WIN_SAMPLES, POINT_WIN, BOUT_STEP,
 )
 
 HALF_PT = (POINT_WIN - 1) // 2

@@ -1,3 +1,7 @@
+import os
+import subprocess
+import sys
+
 import numpy as np
 import data_analysis as da
 
@@ -31,3 +35,17 @@ def test_ml_algorithm_writes_expected_datasets(monkeypatch, tmp_path):
     assert data_by_animal["A1"]["num_licks"] == 3
     with h5py.File(out, "r") as f:
         assert np.allclose(f["A1"]["lick_times"][()], [1.0, 2.0, 3.0])
+
+
+def test_import_data_analysis_does_not_pull_torch():
+    """`ml_detection.infer` imports torch at module scope, so data_analysis must NOT import it
+    eagerly at module scope either -- otherwise every `import data_analysis` (including the
+    default basic_threshold path) pays torch's load cost. Run in a fresh subprocess so the
+    result doesn't depend on what this pytest process already imported."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, data_analysis; sys.exit(0 if 'torch' not in sys.modules else 1)"],
+        cwd=repo_root,
+    )
+    assert result.returncode == 0
