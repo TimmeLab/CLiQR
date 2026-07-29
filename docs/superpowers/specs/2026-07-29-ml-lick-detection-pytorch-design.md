@@ -158,8 +158,21 @@ Implement as a permutation of the FC weight columns.
 
 - Resample irregular `(time, cap)` to uniform 100 Hz via linear interpolation with extrapolation
   (`np.interp` / `scipy`), matching MATLAB `resampleCapacitance`.
-- Per-window offset `y - max(y)` so `max = 0`, matching the training convention. Applied to every
-  bout window and to point windows consistently with MATLAB.
+- Offset `y - max(y)` so `max = 0`.
+
+**Guiding principle: faithful-first.** The initial implementation reproduces the MATLAB behavior
+*exactly as written*, including its quirks, so the parity gate can pass. Every offset convention
+below matches MATLAB verbatim:
+
+- Bout net input: per-**bout-window** offset (`y(win) - max(y(win))`).
+- Point net input **at inference**: **global** offset (`y - max(y)` over the whole recording).
+- Point net windows **at training**: per-**segment** offset (each training segment offset by its
+  own max, as `buildInitialTrainingSet` does).
+
+This means the MATLAB point net is trained under one offset convention and inferred under another
+(a latent train/inference mismatch). We deliberately preserve it for the faithful port, and log
+it as a deferred improvement to test (see Potential Improvements). Offset conventions live in
+`preprocess.py` behind named functions so the improvement experiment is a one-line swap.
 
 ### bootstrap.py + dataset.py
 
@@ -208,10 +221,15 @@ Port `lickLabelerGUI` behavior to Solara (already in the env; matches cliqr-gui)
 1. Resample -> 100 Hz, offset.
 2. **Bout gate:** slide 3 s window, step 0.5 s (as MATLAB), but batch all windows through
    `LickBoutNet` in a single forward pass -> per-window lick/no-lick.
-3. **Point pass (the B optimization):** instead of MATLAB's per-sample re-classify loop, gather
-   all 21-sample windows centered on every sample inside positive bout spans as one batch (or run
+3. **Point pass (vectorized):** instead of MATLAB's per-sample re-classify loop, gather all
+   21-sample windows centered on every sample inside positive bout spans as one batch (or run
    `LickPointNet` stride-1 over the positive span), single forward pass -> per-sample lick mask.
-   Mathematically identical to the MATLAB loop, 10-100x faster.
+   This is the one intentional deviation from MATLAB-as-written, but it is **output-identical**
+   (same inputs, same labels) — a pure speed optimization, not a behavior change — and validation
+   gate #2 confirms it reproduces the loop's result. Overlapping positive bout windows are reduced
+   to their **union** before the batch: because the point net input uses the global offset, a
+   sample's label is independent of which bout window reached it, so the union is lossless and
+   matches MATLAB's OR semantics (`lickMaskGlobal` is set and never unset).
 4. Merge mask points within 20 ms; cluster center = lick time (port of MATLAB merge logic).
 5. Map times back to the original time base; return.
 
@@ -247,6 +265,28 @@ Port `lickLabelerGUI` behavior to Solara (already in the env; matches cliqr-gui)
 - **New:** `torch` (CPU wheel) added to `requirements.txt` and `environment.yml`.
 - Already present and reused: `h5py` (read `.mat` v7.3 and project h5), `numpy`, `scipy`
   (resample / threshold detector), `matplotlib`, `solara` / `panel` / `ipywidgets` (labeler).
+
+## Potential improvements (deferred)
+
+The first implementation is a faithful MATLAB port. While planning/building, log candidate
+improvements here rather than acting on them, so the parity gate stays meaningful. Each is a
+post-parity experiment, measured on held-out-session F1.
+
+1. **Fix the point-net train/inference offset mismatch (prioritized to test).** MATLAB trains the
+   point net on per-segment-offset windows but infers under global offset. Experiment: use the
+   **per-segment offset for BOTH training and inference** and compare F1 to the faithful port.
+   Requires the offset functions in `preprocess.py` to be swappable (already specified).
+2. **Bout-gate overlap resolution.** MATLAB resolves overlapping bout windows with OR (any
+   positive window makes the span positive). Alternative: `gate_mode='vote'` requiring a majority
+   of covering bout windows to agree — more conservative, possibly better generalization. Add as
+   a flag after parity.
+3. **Reuse of prior ML artifacts.** The repo already contains `checkpoints/best.pt` and training
+   data from earlier, un-integrated ML experiments (per project CLAUDE.md). During planning,
+   inspect these — the checkpoint architecture, any labeled data, and how `best.pt` was produced —
+   before generating fresh labels; they may seed or replace parts of this pipeline.
+4. **Combine ML with the threshold detector.** Longer term, ML could become the default or be
+   fused with `basic_algorithm` (e.g. ML gates, threshold refines timing, or ensemble). Out of
+   scope for the faithful port.
 
 ## Open questions / risks
 
