@@ -197,7 +197,7 @@ git commit -m "feat(ml): PyTorch netBout/netPoint definitions matching MATLAB to
   - `load_matlab_nets(mat_path: str) -> tuple[LickBoutNet, LickPointNet]` — returns both nets with ported weights + norm scalars loaded, in `.eval()` mode.
   - `permute_fc_for_flatten(W_matlab: np.ndarray, n_channels: int, width: int) -> np.ndarray` — reorders a MATLAB FC weight matrix `[out, C*W]` from MATLAB `(W, C)` column-major flatten order to PyTorch `(C, W)` row-major order.
 
-**Background for the implementer:** `lickNets.mat` is HDF5 (MATLAB v7.3). The trained `DAGNetwork` objects store layer arrays under `#refs#`. Each conv layer has `Weights [1,k,inC,outC]` and `Bias`; each batchnorm has `TrainedMean`, `TrainedVariance`, `Scale`, `Offset`, `Epsilon`; each FC has `Weights [out,in]` and `Bias`; the input layer's `Normalization` group has scalar `Mean` and `Std`. Because the exact `#refs#` layout is opaque, this task first writes a small explorer, then hardcodes the discovered ref paths.
+**Background for the implementer:** `lickNets.mat` is HDF5 (MATLAB v7.3). The trained nets are `SeriesNetwork` objects (a linear layer stack — confirmed via `class(netBout)`); their layer arrays store under `#refs#`. Each conv layer has `Weights [1,k,inC,outC]` and `Bias`; each batchnorm has `TrainedMean`, `TrainedVariance`, `Scale`, `Offset`, `Epsilon`; each FC has `Weights [out,in]` and `Bias`; the input layer's `Normalization` group has scalar `Mean` and `Std`. Because the exact `#refs#` layout is opaque, this task first writes a small explorer, then hardcodes the discovered ref paths.
 
 - [ ] **Step 1: Explore the .mat layer layout (one-off, keep output in a comment)**
 
@@ -266,7 +266,7 @@ Expected: FAIL (`ModuleNotFoundError` / function not defined).
 ```python
 # ml_detection/weights_io.py
 """
-Port trained weights from the MATLAB `lickNets.mat` DAGNetworks into the PyTorch models.
+Port trained weights from the MATLAB `lickNets.mat` SeriesNetworks into the PyTorch models.
 
 MATLAB stores networks in HDF5 (v7.3). Conv/BN/FC parameters live under `#refs#`. The two
 subtleties handled here:
