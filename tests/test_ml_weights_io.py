@@ -24,10 +24,11 @@ def test_permute_fc_for_flatten_reorders_columns():
 @pytest.mark.skipif(not os.path.exists(MAT), reason="lickNets.mat not present")
 def test_load_matlab_nets_shapes_and_norm():
     bout, point = load_matlab_nets(MAT)
-    # Norm scalars from the .mat (netBout mean approx -6.87 / std 8.22; point -5.0 / 8.97)
-    assert bout.norm_mean.item() == pytest.approx(-6.8734145, abs=1e-3)
-    assert bout.norm_std.item() == pytest.approx(8.215723, abs=1e-3)
-    assert point.norm_mean.item() == pytest.approx(-4.9988613, abs=1e-3)
+    # Norm scalars from the .mat, verified directly against S.netBout.Layers(1).Mean and
+    # S.netPoint.Layers(1).Mean in MATLAB (netBout mean approx -5.0 / std 8.97; point -6.87 / 8.22).
+    assert bout.norm_mean.item() == pytest.approx(-4.9988613, abs=1e-3)
+    assert bout.norm_std.item() == pytest.approx(8.966024, abs=1e-3)
+    assert point.norm_mean.item() == pytest.approx(-6.8734145, abs=1e-3)
     # Forward runs and produces finite logits
     assert torch.isfinite(bout(torch.zeros(1, 1, 300))).all()
     assert torch.isfinite(point(torch.zeros(1, 1, 21))).all()

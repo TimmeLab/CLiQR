@@ -21,10 +21,18 @@ subtleties handled here:
 
 Discovered `#refs#` dataset paths (from the Step-1 explorer). NOTE: the norm-scalar group letters
 do NOT cluster with the conv group letters -- each layer is mapped by shape (conv/fc) and the
-input-norm is mapped/asserted by value, so a mislabeled path fails loudly.
+input-norm is mapped by VALUE against the true `net.Layers(1).Mean/StandardDeviation` (see below),
+so a mislabeled path fails loudly.
+
+  CAUTION (found by Task 3's MATLAB parity gate): the norm-scalar refs #refs#/C and #refs#/c are
+  swapped relative to the naive "uppercase clusters with bout, lowercase with point" guess -- i.e.
+  #refs#/C is actually POINT's zscore constant and #refs#/c is actually BOUT's, confirmed directly
+  against `S.netBout.Layers(1).Mean` / `S.netPoint.Layers(1).Mean` in MATLAB. The conv/bn/fc refs
+  below were independently value-verified against `S.netBout.Layers(k).Weights` /
+  `S.netPoint.Layers(k).Weights` and are NOT swapped.
 
   BOUT net (kernel 15, width 75 after pool):
-    input zscore : #refs#/C/Normalization/Mean , #refs#/C/Normalization/Std   (mean ~ -6.8734)
+    input zscore : #refs#/c/Normalization/Mean , #refs#/c/Normalization/Std   (mean ~ -4.9989)
     conv1        : #refs#/d/Weights/Value (16,1,15,1) , #refs#/d/Bias/Value (16,1,1)
     bn1          : #refs#/g/{TrainedMean,TrainedVariance,Scale/Value,Offset/Value,Epsilon} (16)
     conv2        : #refs#/j/Weights/Value (32,16,15,1) , #refs#/j/Bias/Value (32,1,1)
@@ -33,7 +41,7 @@ input-norm is mapped/asserted by value, so a mislabeled path fails loudly.
     fc2          : #refs#/s/Weights/Value (2,32,1,1) , #refs#/s/Bias/Value (2,1,1)
 
   POINT net (kernel 5, width 21, no pool):
-    input zscore : #refs#/c/Normalization/Mean , #refs#/c/Normalization/Std   (mean ~ -4.9989)
+    input zscore : #refs#/C/Normalization/Mean , #refs#/C/Normalization/Std   (mean ~ -6.8734)
     conv1        : #refs#/D/Weights/Value (16,1,5,1) , #refs#/D/Bias/Value (16,1,1)
     bn1          : #refs#/G/{...} (16)
     conv2        : #refs#/I/Weights/Value (32,16,5,1) , #refs#/I/Bias/Value (32,1,1)
@@ -48,10 +56,13 @@ import torch
 from ml_detection.nets import LickBoutNet, LickPointNet
 
 # Expected input zscore scalars, asserted so a wrong norm ref path fails loudly.
-_EXPECTED_BOUT_MEAN = -6.8734145
-_EXPECTED_BOUT_STD = 8.215723
-_EXPECTED_POINT_MEAN = -4.9988613
-_EXPECTED_POINT_STD = 8.966024
+# NOTE: these were swapped vs. an earlier version of this file -- verified against the real
+# S.netBout.Layers(1).Mean/StandardDeviation and S.netPoint.Layers(1).Mean/StandardDeviation
+# in MATLAB (Task 3 parity-gate debugging). #refs#/C belongs to POINT and #refs#/c to BOUT.
+_EXPECTED_BOUT_MEAN = -4.9988613
+_EXPECTED_BOUT_STD = 8.966024
+_EXPECTED_POINT_MEAN = -6.8734145
+_EXPECTED_POINT_STD = 8.215723
 
 
 def _deref(f, name):
@@ -172,8 +183,8 @@ def load_matlab_nets(mat_path):
 
         with torch.no_grad():
             # ---- BOUT net (kernel 15, width 75 after pool) ----
-            b_mean = _scalar(f, "#refs#/C/Normalization/Mean")
-            b_std = _scalar(f, "#refs#/C/Normalization/Std")
+            b_mean = _scalar(f, "#refs#/c/Normalization/Mean")
+            b_std = _scalar(f, "#refs#/c/Normalization/Std")
             assert abs(b_mean - _EXPECTED_BOUT_MEAN) < 1e-3, b_mean
             assert abs(b_std - _EXPECTED_BOUT_STD) < 1e-3, b_std
             bout.norm_mean.fill_(b_mean)
@@ -187,8 +198,8 @@ def load_matlab_nets(mat_path):
             _load_fc_plain(f, bout.fc2, "#refs#/s/Weights/Value", "#refs#/s/Bias/Value")
 
             # ---- POINT net (kernel 5, width 21, no pool) ----
-            p_mean = _scalar(f, "#refs#/c/Normalization/Mean")
-            p_std = _scalar(f, "#refs#/c/Normalization/Std")
+            p_mean = _scalar(f, "#refs#/C/Normalization/Mean")
+            p_std = _scalar(f, "#refs#/C/Normalization/Std")
             assert abs(p_mean - _EXPECTED_POINT_MEAN) < 1e-3, p_mean
             assert abs(p_std - _EXPECTED_POINT_STD) < 1e-3, p_std
             point.norm_mean.fill_(p_mean)
