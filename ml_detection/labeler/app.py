@@ -128,6 +128,28 @@ def redraw():
     )
 
 
+def _select_default_lick():
+    """Preselect the furthest-left lick of the current segment (index 0, since licks are sorted),
+    or -1 if the segment has no licks. Used whenever a new segment is shown."""
+    _, lick_idx = _current_segment()
+    state.selected = 0 if lick_idx is not None and len(lick_idx) else -1
+
+
+def _step_selection(delta):
+    """Move the selection to the previous/next lick within the current segment (no wrap)."""
+    if state.training is None:
+        return
+    _, lick_idx = _current_segment()
+    if lick_idx is None or len(lick_idx) == 0:
+        state.selected = -1
+    elif state.selected < 0:
+        # Nothing selected yet: land on the leftmost (delta>0) or rightmost (delta<0) lick.
+        state.selected = 0 if delta > 0 else len(lick_idx) - 1
+    else:
+        state.selected = int(np.clip(state.selected + delta, 0, len(lick_idx) - 1))
+    redraw()
+
+
 def _commit_edit(new_lick_idx, new_selected):
     """Store an edited lick array back into the training dict, refresh its label, and redraw."""
     new_lick_idx = np.asarray(new_lick_idx, dtype=int)
@@ -173,7 +195,7 @@ def on_prev(_event=None):
     if state.training is None:
         return
     state.index = max(0, state.index - 1)
-    state.selected = -1
+    _select_default_lick()
     redraw()
 
 
@@ -181,7 +203,7 @@ def on_next(_event=None):
     if state.training is None:
         return
     state.index = min(len(state.training["samples"]) - 1, state.index + 1)
-    state.selected = -1
+    _select_default_lick()
     redraw()
 
 
@@ -197,7 +219,7 @@ def on_load(_event=None):
     # Ensure lick_idx entries are mutable numpy arrays we can reassign per segment.
     state.training["lick_idx"] = [np.asarray(li, dtype=int) for li in state.training["lick_idx"]]
     state.index = 0
-    state.selected = -1
+    _select_default_lick()
     redraw()
 
 
@@ -224,8 +246,10 @@ file_browser = pn.widgets.FileSelector(
 )
 
 load_button = pn.widgets.Button(name="Load", button_type="primary")
-prev_button = pn.widgets.Button(name="◀ Prev")
-next_button = pn.widgets.Button(name="Next ▶")
+prev_button = pn.widgets.Button(name="◀ Prev segment")
+next_button = pn.widgets.Button(name="Next segment ▶")
+prev_lick_button = pn.widgets.Button(name="◀ Lick")
+next_lick_button = pn.widgets.Button(name="Lick ▶")
 remove_button = pn.widgets.Button(name="Remove selected", button_type="warning")
 nudge_left_button = pn.widgets.Button(name="Nudge −1")
 nudge_right_button = pn.widgets.Button(name="Nudge +1")
@@ -234,14 +258,16 @@ save_button = pn.widgets.Button(name="Save curated", button_type="success")
 load_button.on_click(on_load)
 prev_button.on_click(on_prev)
 next_button.on_click(on_next)
+prev_lick_button.on_click(lambda e: _step_selection(-1))
+next_lick_button.on_click(lambda e: _step_selection(1))
 remove_button.on_click(on_remove)
 nudge_left_button.on_click(lambda e: _nudge(-1))
 nudge_right_button.on_click(lambda e: _nudge(1))
 save_button.on_click(on_save)
 
 controls = pn.Row(
-    prev_button, next_button, remove_button,
-    nudge_left_button, nudge_right_button, save_button,
+    prev_button, next_button, prev_lick_button, next_lick_button,
+    remove_button, nudge_left_button, nudge_right_button, save_button,
 )
 
 layout = pn.Column(
