@@ -35,7 +35,7 @@ old-scale validation oracles.
 - Port the trained weights from `lickNets.mat` into the PyTorch models.
 - Adapt to new high-CDT data via transfer learning: refit zscore normalization + fine-tune all
   layers at low learning rate.
-- Provide a Python labeling tool (Solara) to curate new training data, seeded by the existing
+- Provide a Python labeling tool (Panel; see labeler note below) to curate new training data, seeded by the existing
   threshold detector.
 - Expose ML detection through the existing `filter_data(..., algorithm='ml')` flag, writing the
   same per-animal HDF5 datasets so downstream analysis is unchanged.
@@ -98,7 +98,7 @@ ml_detection/
   bootstrap.py    # seed labels via existing basic_algorithm threshold detector
   train.py        # refit normalization, fine-tune all layers, save checkpoints
   infer.py        # vectorized cascade -> lick_times; detect_licks() entry point
-  labeler/app.py  # Solara curation app
+  labeler/app.py  # Panel curation app (+ labeler/logic.py pure helpers)
   checkpoints/    # ported + fine-tuned weights (.pt) + norm constants + meta
 ```
 
@@ -111,7 +111,10 @@ Each module has one clear responsibility and a narrow interface:
 - `dataset.py` / `bootstrap.py` — build/curate labeled segments.
 - `train.py` — fine-tuning driver.
 - `infer.py` — the public `detect_licks()`; the only module `data_analysis.py` imports.
-- `labeler/` — standalone Solara app, reads/writes curated HDF5.
+- `labeler/` — standalone Panel app (bokeh clickable trace), reads/writes curated HDF5. Pure
+  edit logic lives in `labeler/logic.py` (unit-tested); `app.py` is the `panel serve` entrypoint.
+  (Originally scoped as Solara, but a clickable trace with Python callbacks needs a Bokeh server
+  backend; Panel — already a project dependency — provides that plus a filesystem file browser.)
 
 ### Integration point
 
@@ -196,9 +199,9 @@ it as a deferred improvement to test (see Potential Improvements). Offset conven
 5. Persist a training struct to **HDF5** (our own schema): `samples`, `t`, `lickIdx`,
    `labelsBout`, `fs`, `winSec`, `centerSec`, plus provenance (source recording, sensor, cycle).
 
-### labeler/app.py — Solara curation tool
+### labeler/app.py — Panel curation tool
 
-Port `lickLabelerGUI` behavior to Solara (already in the env; matches cliqr-gui):
+Port `lickLabelerGUI` behavior to Panel (bokeh clickable trace; Panel already in the env):
 
 - Show one 3 s segment with the capacitance trace and red lick markers.
 - Click on plot: add a lick at nearest sample, or select the nearest existing lick.
