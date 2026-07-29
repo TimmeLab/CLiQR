@@ -138,7 +138,7 @@ The system supports 24 sensors arranged in a 4×6 grid (matching the physical ra
 - 4 MPR121 capacitive touch sensors (one per FT232H board)
 - 6 sensors per board (using every other channel: 1, 3, 5, 7, 9, 11)
 
-Data is recorded at approximately 56 Hz and saved in HDF5 format with the structure:
+Data is recorded at approximately 100 Hz and saved in HDF5 format with the structure:
 ```
 /board_{serial_number}/sensor_{sensor_id}/
     ├── cap_data       # Capacitance readings
