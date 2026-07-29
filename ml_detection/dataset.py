@@ -10,7 +10,10 @@ sample is a lick.
 import h5py
 import numpy as np
 
-from ml_detection.preprocess import WIN_SAMPLES, CENTER_SAMPLES, POINT_WIN
+from ml_detection.preprocess import FS, WIN_SAMPLES, CENTER_SAMPLES, POINT_WIN
+
+DEFAULT_WIN_SEC = WIN_SAMPLES // FS
+DEFAULT_CENTER_SEC = CENTER_SAMPLES // FS
 
 
 def save_training_h5(path, segments, times, lick_idx, labels_bout, meta):
@@ -22,10 +25,15 @@ def save_training_h5(path, segments, times, lick_idx, labels_bout, meta):
         g = f.create_group("lick_idx")
         for i, li in enumerate(lick_idx):
             g.create_dataset(str(i), data=np.asarray(li, dtype=np.int64))
-        f.attrs["fs"] = 100
-        f.attrs["win_sec"] = 3
-        f.attrs["center_sec"] = 1
+        # Derive fs/win_sec/center_sec from meta if the caller supplied them (e.g. a training dict
+        # produced by bootstrap_segments), else fall back to the shared preprocess constants — this
+        # keeps the schema from silently drifting away from ml_detection.preprocess.
+        f.attrs["fs"] = meta.get("fs", FS)
+        f.attrs["win_sec"] = meta.get("win_sec", DEFAULT_WIN_SEC)
+        f.attrs["center_sec"] = meta.get("center_sec", DEFAULT_CENTER_SEC)
         for k, v in meta.items():
+            if k in ("fs", "win_sec", "center_sec"):
+                continue
             f.attrs[f"meta_{k}"] = v
 
 
@@ -33,6 +41,7 @@ def load_training_h5(path):
     with h5py.File(path, "r") as f:
         n = f["samples"].shape[0]
         lick_idx = [np.asarray(f["lick_idx"][str(i)]) for i in range(n)]
+        meta = {k[len("meta_"):]: v for k, v in f.attrs.items() if k.startswith("meta_")}
         return {
             "samples": np.asarray(f["samples"]),
             "t": np.asarray(f["t"]),
@@ -41,6 +50,7 @@ def load_training_h5(path):
             "fs": int(f.attrs["fs"]),
             "win_sec": int(f.attrs["win_sec"]),
             "center_sec": int(f.attrs["center_sec"]),
+            "meta": meta,
         }
 
 

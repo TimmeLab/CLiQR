@@ -26,7 +26,9 @@ def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0)
     """
     rng = np.random.RandomState(seed)
     t, y = resample_to_100hz(time_s, cap)
-    # Convert seeded lick times to 100 Hz sample indices.
+    # Convert seeded lick times to 100 Hz sample indices. np.searchsorted defaults to side='left',
+    # which biases each lick forward by up to one 10 ms sample; left as-is since these are bootstrap
+    # SEED labels only, later hand-curated in the Solara labeler, so the bias is immaterial.
     lick_samples = np.clip(np.searchsorted(t, threshold_lick_times), 0, len(t) - 1)
     lick_flags = np.zeros(len(t), dtype=bool)
     lick_flags[lick_samples] = True
@@ -58,8 +60,10 @@ def bootstrap_segments(time_s, cap, threshold_lick_times, n_samples=200, seed=0)
             segments.append(win.astype(np.float32))
             times.append((t[s:s + WIN_SAMPLES] - t[s]).astype(np.float64))
             lick_idx.append(in_win.astype(np.int64))
-            labels.append(1 if count_center_licks(s) > 0 else 0)
+            labels.append(1 if n_c > 0 else 0)
             got += 1
+        if got < per_cat:
+            print(f"Warning: bootstrap_segments category {cat} under-filled: got {got} of {per_cat} requested windows.")
 
     return {
         "samples": np.asarray(segments, dtype=np.float32),
