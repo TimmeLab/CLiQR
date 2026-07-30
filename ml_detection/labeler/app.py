@@ -237,7 +237,12 @@ def on_load(_event=None):
 def on_save(_event=None):
     if state.training is None:
         return
-    out_path = os.path.splitext(state.path)[0] + "_curated.h5"
+    # Strip any existing "_curated" suffixes first, so re-saving an already-curated file
+    # overwrites <name>_curated.h5 instead of piling up <name>_curated_curated.h5.
+    stem = os.path.splitext(state.path)[0]
+    while stem.endswith("_curated"):
+        stem = stem[: -len("_curated")]
+    out_path = stem + "_curated.h5"
     meta = dict(state.training.get("meta", {}))
     meta["curated"] = "true"
     save_training_h5(
