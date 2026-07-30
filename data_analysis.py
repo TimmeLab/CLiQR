@@ -162,6 +162,8 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
         missing_data = basic_algorithm(data_by_animal, filtered_h5f, logfile)
     elif algorithm == 'hilbert':
         missing_data = hilbert_algorithm(data_by_animal, filtered_h5f, logfile)
+    elif algorithm == 'ml':
+        missing_data = ml_algorithm(data_by_animal, filtered_h5f, logfile)
     return missing_data
 
 
@@ -486,6 +488,67 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
         missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
         if missing_data: return missing_data
     return False # no data missing
+
+
+# --- ML lick detection (opt-in via algorithm='ml') --------------------------------------------
+# Imported lazily so the heavy torch import is only paid when the ML path is actually used.
+def _load_ml_nets(checkpoint=None):
+    """Load the bout/point networks. Defaults to the fine-tuned checkpoint, falling back to the
+    weights ported straight from MATLAB. Returns (bout_net, point_net) in eval mode."""
+    import os
+    import torch
+    from ml_detection.nets import LickBoutNet, LickPointNet
+    from ml_detection.weights_io import load_matlab_nets
+    default_finetuned = os.path.join("ml_detection", "checkpoints", "finetuned.pt")
+    ckpt = checkpoint or default_finetuned
+    if os.path.exists(ckpt):
+        state = torch.load(ckpt, map_location="cpu")
+        bout, point = LickBoutNet(), LickPointNet()
+        bout.load_state_dict(state["bout"]); point.load_state_dict(state["point"])
+        bout.eval(); point.eval()
+        return bout, point
+    # Fall back to the raw MATLAB port (old-scale weights) if no fine-tuned checkpoint exists yet.
+    return load_matlab_nets(os.path.join("ML Detection MATLAB Code", "lickNets.mat"))
+
+
+# Module-level indirection so tests can monkeypatch `data_analysis.detect_licks`. Left as None
+# here (rather than imported eagerly) so `import data_analysis` never pulls in torch via
+# ml_detection.infer -- the default basic_threshold path shouldn't pay that cost. The real
+# function is imported lazily on first use inside ml_algorithm (see below).
+detect_licks = None
+
+
+def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None):
+    """Detect licks with the ML cascade. Mirrors basic_algorithm's I/O contract exactly:
+    writes lick_times, lick_indices, num_licks per animal (num_licks is in-memory only, same
+    as basic_algorithm -- neither is persisted via save_filtered_data)."""
+    global detect_licks
+    if detect_licks is None:
+        from ml_detection.infer import detect_licks as _dl
+        detect_licks = _dl
+    bout_net, point_net = _load_ml_nets(checkpoint)
+    for animal, data in data_by_animal.items():
+        cap = np.asarray(data["cap_data"])
+        t = np.asarray(data["time_data"])
+        if len(cap) == 0:
+            data["lick_times"] = np.array([]); data["lick_indices"] = np.array([], dtype=int)
+            data["num_licks"] = 0
+            missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
+            if missing_data: return missing_data
+            continue
+        lick_times = np.asarray(detect_licks(t, cap, bout_net, point_net))
+        # Map lick TIMES back to indices in the (trimmed) original trace: np.searchsorted returns
+        # the leftmost insertion point, i.e. the first sample with t >= lick_time (not nearest).
+        lick_indices = np.searchsorted(t, lick_times)
+        lick_indices = np.clip(lick_indices, 0, len(t) - 1)
+        data["lick_times"] = lick_times
+        data["lick_indices"] = lick_indices
+        data["num_licks"] = int(len(lick_times))
+        print(f"Animal {animal} had {len(lick_times)} licks detected (ML)")
+        missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
+        if missing_data: return missing_data
+    return False
+
 
 def _optimize_simple_threshold(data_by_animal, n_steps=200):
     """Grid-search threshold fraction f ∈ [0, 1] of each animal's dynamic range
