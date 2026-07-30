@@ -541,3 +541,36 @@ def test_render_clip_probes_frame_session_with_latency_corrected_anchor(tmp_path
     # labels frames correctly; a latency-less clock would be the regression.
     assert recorded["clock"].latency == pytest.approx(latency)
     assert recorded["clock"].pts_start_sec == pytest.approx(vb)
+
+
+def test_read_trace_from_combined_reads_named_cycle(tmp_path):
+    # A minimal combined-results file: <animal>/<cycle>/{cap_data,time_data,lick_times,lick_indices}.
+    # _read_trace_from_combined must return exactly that cycle's arrays (the fast path that avoids
+    # re-running filter_data on the raw recording).
+    import h5py
+    path = tmp_path / "results_combined.h5"
+    cap = np.array([676, 675, 660, 676], dtype=np.int64)
+    time = np.array([0.0, 0.01, 0.02, 0.03])
+    lick_times = np.array([0.02])
+    lick_indices = np.array([2], dtype=int)
+    with h5py.File(str(path), "w") as f:
+        g = f.create_group("ACG-1").create_group("3")   # animal ACG-1, cycle 3
+        g.create_dataset("cap_data", data=cap)
+        g.create_dataset("time_data", data=time)
+        g.create_dataset("lick_times", data=lick_times)
+        g.create_dataset("lick_indices", data=lick_indices)
+
+    got_cap, got_time, got_lt, got_li = msv._read_trace_from_combined(str(path), "ACG-1", 3)
+    assert np.array_equal(got_cap, cap)
+    assert np.array_equal(got_time, time)
+    assert np.array_equal(got_lt, lick_times)
+    assert np.array_equal(got_li, lick_indices)
+
+
+def test_read_trace_from_combined_missing_cycle_raises(tmp_path):
+    import h5py
+    path = tmp_path / "results_combined.h5"
+    with h5py.File(str(path), "w") as f:
+        f.create_group("ACG-1").create_group("0")
+    with pytest.raises(ValueError, match="cycle 5 not found"):
+        msv._read_trace_from_combined(str(path), "ACG-1", 5)

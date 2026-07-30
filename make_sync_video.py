@@ -105,30 +105,63 @@ def read_session_duration(h5_path):
     return stop_time - start_time
 
 
-def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor):
+def _read_trace_from_combined(combined_h5_path, animal, cycle):
+    """Read one animal/cycle's cap, time, and lick arrays straight out of a combined results file.
+
+    The combined file (results_combined_*.h5) was produced by the SAME filter_data pipeline that
+    load_recording would otherwise re-run, so the arrays are identical -- this just avoids
+    re-analyzing every sensor in the raw recording when the answer is already on disk. Layout is:
+        <animal>/<cycle>/{cap_data, time_data, lick_times, lick_indices, ...}
+    Returns (cap, time, lick_times, lick_indices)."""
+    with h5py.File(combined_h5_path, "r") as combined:
+        if animal not in combined:
+            raise ValueError(f"animal {animal!r} not found in combined file {combined_h5_path!r}")
+        animal_group = combined[animal]
+        cycle_key = str(cycle)
+        if cycle_key not in animal_group:
+            raise ValueError(f"cycle {cycle} not found for animal {animal!r} in combined file "
+                             f"(have cycles {sorted(animal_group.keys())})")
+        g = animal_group[cycle_key]
+        cap = g["cap_data"][:]
+        time = g["time_data"][:]
+        lick_times = g["lick_times"][:] if "lick_times" in g else np.array([])
+        lick_indices = (
+            g["lick_indices"][:] if "lick_indices" in g else np.array([], dtype=int)
+        )
+    return cap, time, lick_times, lick_indices
+
+
+def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor,
+                   combined_h5=None, cycle=None):
     layout = pd.read_csv(layout_path, header=None, index_col=0)
     session_duration = anchor.session_duration
     animal = str(layout.loc[anchor.sensor_number].iloc[0])
 
-    with tempfile.TemporaryDirectory() as td:
-        filt_path = os.path.join(td, "filtered.h5")
-        log_path = os.path.join(td, "filter.log")
-        with h5py.File(h5_path, "r") as raw, h5py.File(filt_path, "w") as filt:
-            filter_data(
-                raw, filt, layout, log_path,
-                algorithm="basic_threshold",
-                recording_length=session_duration + 1.0,
-            )
-        with h5py.File(filt_path, "r") as filt:
-            if animal not in filt:
-                raise ValueError(f"filter_data produced no group for animal {animal!r}")
-            g = filt[animal]
-            cap = g["cap_data"][:]
-            time = g["time_data"][:]
-            lick_times = g["lick_times"][:] if "lick_times" in g else np.array([])
-            lick_indices = (
-                g["lick_indices"][:] if "lick_indices" in g else np.array([], dtype=int)
-            )
+    if combined_h5 is not None:
+        # Fast path: the trace already exists in the combined results file; read it directly
+        # instead of re-running filter_data on the whole raw recording.
+        cap, time, lick_times, lick_indices = _read_trace_from_combined(
+            combined_h5, animal, cycle)
+    else:
+        with tempfile.TemporaryDirectory() as td:
+            filt_path = os.path.join(td, "filtered.h5")
+            log_path = os.path.join(td, "filter.log")
+            with h5py.File(h5_path, "r") as raw, h5py.File(filt_path, "w") as filt:
+                filter_data(
+                    raw, filt, layout, log_path,
+                    algorithm="basic_threshold",
+                    recording_length=session_duration + 1.0,
+                )
+            with h5py.File(filt_path, "r") as filt:
+                if animal not in filt:
+                    raise ValueError(f"filter_data produced no group for animal {animal!r}")
+                g = filt[animal]
+                cap = g["cap_data"][:]
+                time = g["time_data"][:]
+                lick_times = g["lick_times"][:] if "lick_times" in g else np.array([])
+                lick_indices = (
+                    g["lick_indices"][:] if "lick_indices" in g else np.array([], dtype=int)
+                )
 
     lick_indices = np.asarray(lick_indices, dtype=int)
     lick_vals = cap[lick_indices] if lick_indices.size else np.array([])
@@ -393,6 +426,14 @@ def build_arg_parser():
     p.add_argument("--intermediate", default=None,
                    help="path for the trimmed subclip (kept); "
                         "default: <out>_trimcrop.mp4")
+    p.add_argument("--combined-h5", dest="combined_h5", default=None,
+                   help="results_combined_*.h5 to read the animal's cap/time/lick data from "
+                        "directly, instead of re-running filter_data on the raw --h5. Requires "
+                        "--cycle. The trace is identical (both come from filter_data), but this "
+                        "skips re-analyzing every sensor in the raw file.")
+    p.add_argument("--cycle", type=int, default=None,
+                   help="cycle (per-file subgroup) index within --combined-h5 for this recording; "
+                        "required when --combined-h5 is given")
     return p
 
 
@@ -402,11 +443,15 @@ def main(argv=None):
         print("error: ffmpeg not found on PATH (needed to write the video)",
               file=sys.stderr)
         return 1
+    if args.combined_h5 is not None and args.cycle is None:
+        print("error: --cycle is required when --combined-h5 is given", file=sys.stderr)
+        return 1
     try:
         anchor = read_video_anchor(args.h5)
         video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt)
         validate_window(args.start, args.end, anchor.session_duration)
-        rec = load_recording(args.h5, args.layout, pts_txt, video, anchor)
+        rec = load_recording(args.h5, args.layout, pts_txt, video, anchor,
+                             combined_h5=args.combined_h5, cycle=args.cycle)
         crop = load_crop(video, args.crop_params, args.no_crop)
         intermediate = args.intermediate or (os.path.splitext(args.out)[0] + "_trimcrop.mp4")
         print(f"animal {rec.animal} (sensor {rec.sensor}); clip "
