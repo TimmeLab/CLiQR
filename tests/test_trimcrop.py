@@ -460,10 +460,33 @@ def test_trim_window_seconds():
     # frames every 0.1 s; bookmark frame 2 -> session zero at 0.2 s
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
     clock = _clock(pts_start_sec=float(pts_ns[2]) / 1e9)  # 0.2
-    sf, ef, start_sec, end_sec = tc.trim_window_seconds(clock, pts_ns, 0.0, 0.3)
+    sf, ef, start_sec, end_sec = tc.trim_window_seconds(clock, pts_ns, 0.0, 0.3,
+                                                        framerate=10.0)
     assert (sf, ef) == (2, 5)
     assert start_sec == pytest.approx(0.2)          # original-timeline seconds
     assert end_sec == pytest.approx(0.5 + tc.TAIL_MARGIN)
+
+
+def test_trim_window_seconds_uses_cfr_not_sidecar_drift():
+    """The seek seconds must be CONTAINER (CFR) time -- frame_index / framerate --
+    NOT the capture SensorTimestamp elapsed, which drifts off CFR. subclip_copy
+    seeks the CFR container; if these seconds carry the sidecar drift, the cut
+    lands off by that drift (seconds on a long recording) and the render freezes
+    when the trimmed clip runs out of frames before the window ends.
+
+    Here the container is a clean 10 fps, but each capture timestamp lags an
+    extra 20 ms, so the sidecar reads 0.12 s/frame while the container sits at
+    0.10 s/frame."""
+    pts_ns = (np.arange(0, 11) * 120_000_000).astype(np.int64)  # 0.12 s/frame
+    clock = _clock(pts_start_sec=0.0)  # session τ = 0.12·k for frame k
+    sf, ef, start_sec, end_sec = tc.trim_window_seconds(clock, pts_ns, 0.36, 0.60,
+                                                        framerate=10.0)
+    assert (sf, ef) == (3, 5)
+    # CFR seconds, drift-free:
+    assert start_sec == pytest.approx(3 / 10.0)
+    assert end_sec == pytest.approx(5 / 10.0 + tc.TAIL_MARGIN)
+    # and NOT the drifting sidecar elapsed (0.36 / 0.60), the old buggy value:
+    assert start_sec != pytest.approx(float(pts_ns[sf] - pts_ns[0]) / 1e9)
 
 
 def test_trim_window_seconds_honors_the_anchor():
@@ -471,8 +494,10 @@ def test_trim_window_seconds_honors_the_anchor():
     resolves to earlier frames and earlier video seconds."""
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
     ps = float(pts_ns[2]) / 1e9
-    plain = tc.trim_window_seconds(_clock(ps, latency=0.0), pts_ns, 0.0, 0.3)
-    shifted = tc.trim_window_seconds(_clock(ps, latency=0.25), pts_ns, 0.0, 0.3)
+    plain = tc.trim_window_seconds(_clock(ps, latency=0.0), pts_ns, 0.0, 0.3,
+                                   framerate=10.0)
+    shifted = tc.trim_window_seconds(_clock(ps, latency=0.25), pts_ns, 0.0, 0.3,
+                                     framerate=10.0)
     assert shifted[0] < plain[0]
     assert shifted[2] < plain[2]
 
@@ -480,7 +505,7 @@ def test_trim_window_seconds_honors_the_anchor():
 def test_trim_window_seconds_empty_raises():
     pts_ns = (np.arange(0, 3) * 100_000_000).astype(np.int64)
     with pytest.raises(ValueError):
-        tc.trim_window_seconds(_clock(0.0), pts_ns, 0.0, -400.0)
+        tc.trim_window_seconds(_clock(0.0), pts_ns, 0.0, -400.0, framerate=10.0)
 
 
 # --- display-time crop (params sidecar + per-frame slice) ------------------

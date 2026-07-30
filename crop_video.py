@@ -23,6 +23,7 @@ from matplotlib.widgets import Button
 from video.trimcrop import (
     clamp_origin,
     crop_params_path,
+    probe_frame_rate,
     read_video_anchor,
     resolve_paths,
     session_clock,
@@ -31,15 +32,16 @@ from video.trimcrop import (
 )
 
 
-def compute_crop_window(anchor, pts_ns):
+def compute_crop_window(anchor, pts_ns, framerate):
     """Return (start_frame, stop_frame, start_sec, end_sec) covering the whole
-    session. Frames are the indices into the original video; the seconds are on
-    the original video's timeline. Uses the same SessionClock (latency + drift)
-    as make_sync_video's clip_trim_window, so crop and render select identical
-    frames."""
+    session. Frames are the indices into the original video; the seconds are
+    CONTAINER seconds on the original video's CFR ``framerate``. Uses the same
+    SessionClock (latency + drift) and framerate as make_sync_video's
+    clip_trim_window, so crop and render select identical frames."""
     pts_ns = np.asarray(pts_ns)
     clock = session_clock(anchor, pts_ns)
-    return trim_window_seconds(clock, pts_ns, 0.0, anchor.session_duration)
+    return trim_window_seconds(clock, pts_ns, 0.0, anchor.session_duration,
+                               framerate)
 
 
 def resolve_out_path(video, out, force):
@@ -162,7 +164,8 @@ def main(argv=None):
         video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt)
         out = resolve_out_path(video, args.out, args.force)
         pts_ns = np.loadtxt(pts_txt, dtype=np.int64)
-        sf, ef, start_sec, end_sec = compute_crop_window(anchor, pts_ns)
+        sf, ef, start_sec, end_sec = compute_crop_window(
+            anchor, pts_ns, probe_frame_rate(video))
         print(f"animal sensor {anchor.sensor_number}; session "
               f"{anchor.session_duration:.1f} s -> frames {sf}..{ef} "
               f"({start_sec:.2f}..{end_sec:.2f} s of video)")

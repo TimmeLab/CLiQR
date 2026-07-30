@@ -174,21 +174,31 @@ def compute_trim_frames(clock, pts_ns, start, end):
 TAIL_MARGIN = 0.3  # seconds of slack past the last in-window frame
 
 
-def trim_window_seconds(clock, pts_ns, start, end, tail_margin=TAIL_MARGIN):
+def trim_window_seconds(clock, pts_ns, start, end, framerate,
+                        tail_margin=TAIL_MARGIN):
     """Resolve session window [start, end] to (start_frame, stop_frame, start_sec,
-    end_sec). The seconds are REAL original-video-timeline seconds (raw PTS, NOT
-    drift-scaled) — that is what trim_and_crop and subclip_copy seek by; only the
-    frame *selection* is drift/latency-aware, via ``clock``.
+    end_sec). The seconds are CONTAINER (CFR) timeline seconds — frame index over
+    ``framerate`` — because that is the timeline ``subclip_copy`` seeks by; only
+    the frame *selection* is drift/latency-aware, via ``clock``.
+
+    Do NOT derive the seconds from ``pts_ns``: that sidecar holds the capture
+    SensorTimestamps, whose clock drifts off the container's constant frame rate
+    (a fraction of a percent, but SECONDS by the end of a long recording). Seeking
+    the CFR container with a sidecar-elapsed second lands the cut off by that
+    drift, so the trimmed clip omits the tail of the window and the render freezes
+    on its last frame while the trace runs on (worse the later the clip). The
+    container is CFR at ``framerate`` and starts at PTS 0, so frame k sits at
+    k / framerate — exactly what ffprobe reports and ``subclip_copy`` seeks.
 
     Both crop_video and make_sync_video route through this function with the SAME
-    SessionClock so their windows cannot drift apart: if they did, the crop tool
-    would trim to one window while the renderer placed frames using another, and
-    every cropped video would silently misalign against its trace.
+    SessionClock and framerate so their windows cannot drift apart: if they did,
+    the crop tool would trim to one window while the renderer placed frames using
+    another, and every cropped video would silently misalign against its trace.
     """
     pts_ns = np.asarray(pts_ns)
     sf, ef = compute_trim_frames(clock, pts_ns, start, end)
-    start_sec = float(pts_ns[sf] - pts_ns[0]) / 1e9
-    end_sec = float(pts_ns[ef] - pts_ns[0]) / 1e9 + tail_margin
+    start_sec = sf / framerate
+    end_sec = ef / framerate + tail_margin
     return sf, ef, start_sec, end_sec
 
 

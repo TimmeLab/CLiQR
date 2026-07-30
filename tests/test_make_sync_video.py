@@ -410,7 +410,7 @@ def _synthetic_rec(pts_ns, video_base, latency, n=3, slope=1.0):
         cap = np.sin(time)
     clock = msv.SessionClock(pts_start_sec=video_base, latency=latency, slope=slope)
     return msv.Recording(
-        animal="X", sensor=1, cap=cap, time=time,
+        animal="X", date="2026-07-24", sensor=1, cap=cap, time=time,
         lick_times=np.array([]), lick_indices=np.array([], dtype=int),
         lick_vals=np.array([]), clock=clock, video_path="v.mp4",
         session_duration=10.0, pts_ns=pts_ns, container_pts_ns=pts_ns,
@@ -427,9 +427,9 @@ def test_clip_trim_window_applies_bookmark_latency():
     """
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
     vb = msv.compute_video_base(pts_ns, 2)  # 0.2
-    plain = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.0), 0.0, 0.3)
+    plain = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.0), 0.0, 0.3, 10.0)
     assert plain[0] == 2 and plain[2] == pytest.approx(0.2)
-    shifted = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.25), 0.0, 0.3)
+    shifted = msv.clip_trim_window(_synthetic_rec(pts_ns, vb, 0.25), 0.0, 0.3, 10.0)
     assert shifted[0] == 0
     assert shifted[0] < plain[0]           # earlier start frame
     assert shifted[2] < plain[2]           # earlier start second
@@ -455,8 +455,8 @@ def test_clip_trim_window_matches_crop_window():
     vb = msv.compute_video_base(pts_ns, anchor.video_frame_index)
     rec = _synthetic_rec(pts_ns, vb, anchor.latency)
 
-    assert (msv.clip_trim_window(rec, 0.0, anchor.session_duration)[:4]
-            == cv.compute_crop_window(anchor, pts_ns))
+    assert (msv.clip_trim_window(rec, 0.0, anchor.session_duration, 10.0)[:4]
+            == cv.compute_crop_window(anchor, pts_ns, 10.0))
 
 
 def test_render_clip_default_sync_offset_delays_video(tmp_path, monkeypatch):

@@ -20,7 +20,7 @@ def test_compute_crop_window_spans_the_session():
     # frames every 0.1 s over 1.0 s; bookmark frame 2 -> session zero at 0.2 s
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
     sf, ef, start_sec, end_sec = cv.compute_crop_window(
-        _anchor(frame_index=2, start=110.0, stop=110.5), pts_ns)
+        _anchor(frame_index=2, start=110.0, stop=110.5), pts_ns, 10.0)
     assert (sf, ef) == (2, 7)              # session [0, 0.5] s
     assert start_sec == pytest.approx(0.2)  # video-file seconds
     assert end_sec == pytest.approx(0.7 + 0.3)  # tail margin
@@ -38,12 +38,12 @@ def test_compute_crop_window_applies_bookmark_latency():
     representable, so 0.25 keeps the `sess >= start` edge off a float knife-edge.
     """
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
-    plain = cv.compute_crop_window(_anchor(frame_index=2, start=110.0, stop=110.3), pts_ns)
+    plain = cv.compute_crop_window(_anchor(frame_index=2, start=110.0, stop=110.3), pts_ns, 10.0)
     assert plain[0] == 2 and plain[2] == pytest.approx(0.2)
     # host_after 0.25 s after start_time -> latency 0.25 (exact)
     shifted = cv.compute_crop_window(
         _anchor(frame_index=2, start=110.0, stop=110.3,
-                host_before=110.0, host_after=110.25), pts_ns)
+                host_before=110.0, host_after=110.25), pts_ns, 10.0)
     assert shifted[0] == 0
     assert shifted[0] < plain[0]           # earlier start frame
     assert shifted[2] < plain[2]           # earlier start second
@@ -61,7 +61,7 @@ def test_compute_crop_window_empty_raises():
     """
     pts_ns = (np.arange(0, 3) * 100_000_000).astype(np.int64)
     with pytest.raises(ValueError):
-        cv.compute_crop_window(_anchor(frame_index=0, start=900.0, stop=500.0), pts_ns)
+        cv.compute_crop_window(_anchor(frame_index=0, start=900.0, stop=500.0), pts_ns, 10.0)
 
 
 def test_resolve_out_path_default(tmp_path):
