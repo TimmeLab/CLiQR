@@ -162,8 +162,8 @@ def main():
     print(f"\nSaved fine-tuned checkpoint to {args.out}")
     print(f"  train sessions: {len(metrics['meta']['train_sessions'])}   "
           f"val sessions: {len(val_sessions)}")
-    print(f"  fine_tune val accuracy — bout: {metrics['bout_val_acc']:.4f}   "
-          f"point: {metrics['point_val_acc']:.4f}")
+    print(f"  fine_tune val — bout accuracy: {metrics['bout_val_acc']:.4f}   "
+          f"point positive-class F1: {metrics['point_val_f1']:.4f}")
 
     # Held-out precision/recall/F1 (the real gate-3 metric).
     ev = evaluate_split(args.out, labeled, sources, val_sessions)

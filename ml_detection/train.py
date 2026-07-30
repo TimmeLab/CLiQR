@@ -36,13 +36,36 @@ def session_split(session_ids, val_fraction=0.25, seed=0):
     return train, val
 
 
-def _train_one(net, X, y, Xval, yval, epochs, lr, batch_size):
-    """Fine-tune a single net; return best val accuracy (early-stopped)."""
+def _positive_f1(pred, true):
+    """F1 of the positive class (label 1) for 1-D integer tensors. Returns 0.0 if undefined."""
+    pred = pred.bool()
+    true = true.bool()
+    tp = int((pred & true).sum())
+    fp = int((pred & ~true).sum())
+    fn = int((~pred & true).sum())
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    return 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+
+def _train_one(net, X, y, Xval, yval, epochs, lr, batch_size,
+               class_weight=None, monitor="accuracy", patience=5):
+    """
+    Fine-tune a single net, early-stopping on a validation metric; return the best metric value.
+
+    class_weight : optional torch.Tensor([w_neg, w_pos]) passed to CrossEntropyLoss. Used for the
+        heavily imbalanced point net (few lick-center samples) so the loss stops being dominated by
+        the negative class, which otherwise suppresses recall.
+    monitor : "accuracy" (default) or "f1". The point net monitors positive-class F1 because
+        accuracy on an imbalanced set is maximized by predicting the majority (no-lick) class, which
+        is exactly the low-recall behavior we are trying to fix.
+    """
     opt = torch.optim.Adam(net.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(weight=class_weight)
     loader = DataLoader(TensorDataset(torch.tensor(X), torch.tensor(y)),
                         batch_size=batch_size, shuffle=True, drop_last=True)
-    best, best_state, patience, bad = 0.0, None, 5, 0
+    best, best_state, bad = 0.0, None, 0
+    yval_t = torch.tensor(yval)
     for _ in range(epochs):
         net.train()
         for xb, yb in loader:
@@ -51,9 +74,13 @@ def _train_one(net, X, y, Xval, yval, epochs, lr, batch_size):
             opt.step()
         net.eval()
         with torch.no_grad():
-            acc = (net(torch.tensor(Xval)).argmax(1) == torch.tensor(yval)).float().mean().item()
-        if acc > best:
-            best, best_state, bad = acc, {k: v.clone() for k, v in net.state_dict().items()}, 0
+            pred = net(torch.tensor(Xval)).argmax(1)
+            if monitor == "f1":
+                score = _positive_f1(pred, yval_t)
+            else:
+                score = (pred == yval_t).float().mean().item()
+        if score > best:
+            best, best_state, bad = score, {k: v.clone() for k, v in net.state_dict().items()}, 0
         else:
             bad += 1
             if bad >= patience:
@@ -63,7 +90,15 @@ def _train_one(net, X, y, Xval, yval, epochs, lr, batch_size):
     return best
 
 
-def fine_tune(training_files, out_path, epochs=100, lr=1e-4, batch_size=64,
+def _inverse_frequency_weights(labels):
+    """Class weights ~ inverse frequency, normalized to mean 1, as a torch.Tensor([w0, w1])."""
+    counts = np.bincount(labels, minlength=2).astype(float)
+    counts[counts == 0] = 1.0                      # avoid divide-by-zero for a missing class
+    weights = counts.sum() / (2.0 * counts)        # inverse frequency, mean ~ 1
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def fine_tune(training_files, out_path, epochs=100, lr=1e-4, batch_size=64, point_epochs=80,
               mat_path="ML Detection MATLAB Code/lickNets.mat"):
     """
     Fine-tune both nets on curated training HDF5 files (one per session).
@@ -71,6 +106,11 @@ def fine_tune(training_files, out_path, epochs=100, lr=1e-4, batch_size=64,
     `training_files` is a dict {session_id: path}. Sessions are split into train/val; both nets are
     fine-tuned; the best checkpoint is saved to out_path as {'bout', 'point', 'meta'}.
     Returns a metrics dict.
+
+    The point net is trained with inverse-frequency class weighting and early-stopped on positive-
+    class F1 (not accuracy), for more epochs than the bout net. Lick-center samples are a small
+    minority of the central-1 s windows, so plain cross-entropy + accuracy monitoring produce a
+    conservative net that misses licks; weighting the loss and monitoring F1 restores recall.
     """
     bout, point = load_matlab_nets(mat_path)
     train_ids, val_ids = session_split(list(training_files))
@@ -109,10 +149,17 @@ def fine_tune(training_files, out_path, epochs=100, lr=1e-4, batch_size=64,
         refit_zscore(point, PXt[:, 0, :])
 
     bout_acc = _train_one(bout, BXt, BYt, BXv, BYv, epochs, lr, batch_size)
+    point_f1 = 0.0
     if len(PXt) > 0:
-        point_acc = _train_one(point, PXt, PYt, PXv, PYv, epochs=20, lr=lr, batch_size=128)
+        # Inverse-frequency class weights from the TRAIN point labels only (no val leakage),
+        # and monitor positive-class F1 so early stopping rewards recovering licks, not just
+        # predicting the dominant no-lick class.
+        point_weight = _inverse_frequency_weights(PYt)
+        point_f1 = _train_one(point, PXt, PYt, PXv, PYv, epochs=point_epochs, lr=lr,
+                              batch_size=128, class_weight=point_weight, monitor="f1")
 
     meta = {"fs": 100, "win_sec": 3, "point_win": 21,
             "train_sessions": sorted(train_ids), "val_sessions": sorted(val_ids)}
     torch.save({"bout": bout.state_dict(), "point": point.state_dict(), "meta": meta}, out_path)
-    return {"bout_val_acc": bout_acc, "point_val_acc": point_acc, "meta": meta}
+    # Note: point_val_f1 now reports positive-class F1 (was accuracy before class weighting).
+    return {"bout_val_acc": bout_acc, "point_val_f1": point_f1, "meta": meta}
