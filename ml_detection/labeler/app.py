@@ -207,6 +207,17 @@ def on_next(_event=None):
     redraw()
 
 
+def on_seek(_event=None):
+    """Jump to the 1-based segment number in the seek box (clamped to the valid range)."""
+    if state.training is None:
+        return
+    total = len(state.training["samples"])
+    target = int(np.clip(seek_input.value, 1, total)) - 1   # UI is 1-based; index is 0-based
+    state.index = target
+    _select_default_lick()
+    redraw()
+
+
 def on_load(_event=None):
     """Load the file currently selected in the file browser."""
     selection = file_browser.value
@@ -254,8 +265,11 @@ remove_button = pn.widgets.Button(name="Remove selected", button_type="warning")
 nudge_left_button = pn.widgets.Button(name="Nudge −1")
 nudge_right_button = pn.widgets.Button(name="Nudge +1")
 save_button = pn.widgets.Button(name="Save curated", button_type="success")
+seek_input = pn.widgets.IntInput(name="Go to segment", value=1, start=1, width=140)
+seek_button = pn.widgets.Button(name="Go")
 
 load_button.on_click(on_load)
+seek_button.on_click(on_seek)
 prev_button.on_click(on_prev)
 next_button.on_click(on_next)
 prev_lick_button.on_click(lambda e: _step_selection(-1))
@@ -279,6 +293,7 @@ layout = pn.Column(
     file_browser,
     load_button,
     status,
+    pn.Row(seek_input, pn.Column(pn.Spacer(height=18), seek_button)),
     pn.pane.Bokeh(plot, sizing_mode="stretch_width"),
     controls,
 )
