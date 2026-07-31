@@ -9,12 +9,22 @@ hours of mostly-flat signal. We want a short list of windows where SOMETHING hap
 
   * LICKING  -- the animal drank. These are already detected: the lick-detection analysis writes
                 per-bout `bout_start_times` / `bout_durations` into the combined results file, so we
-                do NOT re-detect anything. We simply pick a few of the busiest bouts.
+                do NOT re-detect anything. We simply pick a few of the busiest bouts. Each window
+                spans the WHOLE bout plus `--lick-pad` seconds of context on each side, so a long
+                bout is never cut off mid-drink; `--roi-seconds` is only a minimum width.
 
   * CLIMBING -- the animal moved on/around the sipper without drinking. These are NOT licks, so the
                 detector ignores them, but they show up as large, slow excursions in the raw
                 capacitance. We surface them as high-VARIANCE stretches that do NOT overlap a
                 detected bout (masking the bouts is what keeps licking out of this category).
+                The first and last `--climb-skip-edges` seconds of a session are excluded: those
+                are start-up / shut-down transients (cage handling, sipper insertion, sensor
+                settling), which are usually the loudest excursions in the recording and would
+                otherwise crowd out the real climbing. Licking is not edge-restricted.
+                Both the variance windows and the mask are positioned using the trace's own
+                `time_data`: the capacitance is NOT sampled uniformly (spacing ranges from a few ms
+                to several hundred ms), so converting a sample index with an average rate drifts by
+                tens of seconds over a 2 h recording.
 
 This script is meant to run AFTER the lick-detection analysis (i.e. on a `results_combined_*.h5`
 produced by DataAnalysis.ipynb). It never re-runs detection.
@@ -28,7 +38,9 @@ What it produces
    so t = 0 is the recording's Start bookmark).
 
 2. A runnable shell script (`--sh`, default make_clips.sh) with one make_sync_video.py command per
-   region -- but ONLY for the single animal that each recording's camera actually filmed. A
+   region -- climbing commands get `--no-crop` (the sipper-tip crop box hides the cage the animal
+   climbs on; licking commands keep the crop, which is what makes the tongue visible) -- but ONLY
+   for the single animal that each recording's camera actually filmed. A
    recording has exactly one video sensor (see video.trimcrop.find_video_sensor), hence one filmed
    animal; the other animals in the same cycle have no video, so we cannot make a sync clip for
    them (they still appear in the CSV for reference).
@@ -217,16 +229,45 @@ def count_licks_in_window(lick_times, start_s, end_s):
     return int(np.sum((lick_times >= start_s) & (lick_times <= end_s)))
 
 
-def clip_window(center_s, roi_seconds, span_s):
-    """Fixed-width window of `roi_seconds` centered on `center_s`, clipped to [0, span_s].
+def clip_window(center_s, roi_seconds, span_s, first_s=0.0):
+    """Fixed-width window of `roi_seconds` centered on `center_s`, clipped to [first_s, span_s].
 
     The window is kept `roi_seconds` wide whenever possible; it only shrinks if the recording edge
-    forces it (near t = 0 or near the end). Returns (start_s, end_s).
+    forces it (near the first sample or near the end). Returns (start_s, end_s).
     """
     half = roi_seconds / 2.0
-    start_s = max(0.0, center_s - half)
+    start_s = max(first_s, center_s - half)
     end_s = min(span_s, center_s + half)
     return start_s, end_s
+
+
+def bout_window(bout_start_s, bout_duration_s, roi_seconds, lick_pad_s, span_s, first_s=0.0):
+    """Window for a licking bout: the WHOLE bout plus `lick_pad_s` of context on each side.
+
+    A fixed `roi_seconds` window centered on the bout would truncate any bout longer than
+    `roi_seconds` (real recordings have bouts of 25 s+), cutting licks off the end of the clip --
+    which defeats the point of watching the clip. So the window grows to fit the bout, and
+    `roi_seconds` acts only as a MINIMUM width, so a one-second bout still gets context around it.
+
+    Returns (start_s, end_s), clipped to the recording bounds [first_s, span_s].
+    """
+    start_s = bout_start_s - lick_pad_s
+    end_s = bout_start_s + bout_duration_s + lick_pad_s
+    if end_s - start_s < roi_seconds:
+        # Too short: widen symmetrically about the bout center to the minimum width.
+        center_s = bout_start_s + bout_duration_s / 2.0
+        start_s = center_s - roi_seconds / 2.0
+        end_s = center_s + roi_seconds / 2.0
+    return max(first_s, start_s), min(span_s, end_s)
+
+
+def bout_window_half_width(bout_duration_s, roi_seconds, lick_pad_s):
+    """How far a bout's licking window extends beyond the bout's CENTER, in seconds.
+
+    Used to size the climbing exclusion guard: it must cover the bout's own licking window, not
+    just the bout, so climbing and licking clips never show the same stretch of recording.
+    """
+    return max(bout_duration_s / 2.0 + lick_pad_s, roi_seconds / 2.0)
 
 
 def build_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
@@ -239,13 +280,18 @@ def build_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
     `score` is the bout lick count (licking) or the window variance (climbing).
     """
     rois = []
+    time_data = np.asarray(time_data, dtype=np.float64)
     span_s = float(time_data[-1]) if len(time_data) else 0.0
+    first_s = float(time_data[0]) if len(time_data) else 0.0
+    lick_pad_s = float(params.get("lick_pad", 2.0))
 
-    # --- Sampling rate (Hz), needed to turn the variance window from seconds into samples. ---
-    # The capacitance is sampled at ~112 Hz but not exactly; derive it from the actual trace.
+    # --- Typical sample spacing, needed to turn the variance window from seconds into samples. ---
+    # The capacitance is nominally sampled at ~112 Hz, but the real trace is NOT uniform: the
+    # hardware stalls, so the spacing ranges from ~2 ms to several hundred ms. We use the MEDIAN
+    # spacing (robust to those stalls) purely to size the variance window in samples; every window
+    # POSITION is read from `time_data` itself (see below), never inferred from a rate.
     n_samples = len(time_data)
-    duration_s = span_s - float(time_data[0]) if n_samples > 1 else 0.0
-    sampling_rate_hz = (n_samples - 1) / duration_s if duration_s > 0 else 0.0
+    median_dt_s = float(np.median(np.diff(time_data))) if n_samples > 1 else 0.0
 
     # ----------------------------------------------------------------------
     # LICKING regions: take the busiest detected bouts (most licks).
@@ -254,20 +300,22 @@ def build_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
     bout_durations = np.asarray(bout_durations, dtype=np.float64)
     bout_lick_counts = np.asarray(bout_lick_counts)
     if params["n_lick"] > 0 and len(bout_start_times) > 0:
-        # Visit bouts busiest-first, but keep the chosen windows non-overlapping: skip a bout whose
-        # window center falls within `roi_seconds` of an already-chosen licking window (two windows
-        # of width `roi_seconds` overlap iff their centers are closer than `roi_seconds`).
+        # Visit bouts busiest-first, but keep the chosen windows non-overlapping. Windows are no
+        # longer all the same width (a long bout makes a wide one), so we compare the actual
+        # intervals rather than the distance between centers.
         busiest = np.argsort(bout_lick_counts)[::-1]
-        chosen_lick_centers = []
+        chosen_lick_windows = []
         rank = 0
         for bout_index in busiest:
-            if len(chosen_lick_centers) >= params["n_lick"]:
+            if len(chosen_lick_windows) >= params["n_lick"]:
                 break
             bout_center = bout_start_times[bout_index] + bout_durations[bout_index] / 2.0
-            if any(abs(bout_center - c) < params["roi_seconds"] for c in chosen_lick_centers):
+            start_s, end_s = bout_window(bout_start_times[bout_index], bout_durations[bout_index],
+                                         params["roi_seconds"], lick_pad_s, span_s, first_s)
+            if any(start_s < chosen_end and end_s > chosen_start
+                   for chosen_start, chosen_end in chosen_lick_windows):
                 continue
-            chosen_lick_centers.append(bout_center)
-            start_s, end_s = clip_window(bout_center, params["roi_seconds"], span_s)
+            chosen_lick_windows.append((start_s, end_s))
             rois.append({
                 "category": "lick",
                 "rank": rank,
@@ -282,19 +330,36 @@ def build_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
     # ----------------------------------------------------------------------
     # CLIMBING regions: high-variance windows that avoid the detected bouts.
     # ----------------------------------------------------------------------
-    variance_window_samples = max(1, int(round(params["var_window"] * sampling_rate_hz)))
+    variance_window_samples = (max(1, int(round(params["var_window"] / median_dt_s)))
+                               if median_dt_s > 0 else 1)
     window_variance = sliding_variance(cap_data, variance_window_samples)
-    if window_variance.size > 0 and sampling_rate_hz > 0:
+    if window_variance.size > 0 and median_dt_s > 0:
         centers = center_sample_indices(window_variance.size, variance_window_samples)
-        center_times_s = centers / sampling_rate_hz
+        # Read each window's time from the trace's own time base. Converting a sample index with an
+        # average rate silently assumes uniform sampling; on a real recording that drifts by tens of
+        # SECONDS by the end (the stalls above), which both mis-times the emitted clip and makes the
+        # bout mask below disqualify the wrong stretches.
+        center_times_s = time_data[centers]
 
-        # Disqualify windows on/near any detected bout. Guard by the FULL ROI width: a licking
-        # window is centered on the bout and is `roi_seconds` wide, and a climbing window is also
-        # `roi_seconds` wide, so keeping climbing centers at least `roi_seconds` away from every
-        # bout guarantees a climbing window overlaps neither the bout nor the bout's licking window.
-        guard_seconds = params["roi_seconds"]
+        # Disqualify windows on/near any detected bout. Guard by `roi_seconds + lick_pad`: that is
+        # at least the half-width of the bout's own licking window plus the half-width of a climbing
+        # window, so a surviving climbing window overlaps neither the bout nor its licking clip.
+        guard_seconds = params["roi_seconds"] + lick_pad_s
         mask_bout_windows(window_variance, center_times_s, bout_start_times, bout_durations,
                           guard_seconds)
+
+        # Disqualify the start and end of the session. Both edges are dominated by transients that
+        # have nothing to do with the animal climbing -- the operator handling the cage, inserting
+        # the sipper, the sensor settling at the start, and the reverse at the end -- and those
+        # transients are usually the LOUDEST excursions in the whole recording, so without this they
+        # crowd out the real climbing. The whole window (not just its center) must clear the edge,
+        # hence the extra half-window. Licking is untouched: a real bout near an edge is real.
+        skip_edges_s = float(params.get("climb_skip_edges", 300.0))
+        if skip_edges_s > 0.0:
+            half_window_s = params["roi_seconds"] / 2.0
+            too_early = center_times_s < first_s + skip_edges_s + half_window_s
+            too_late = center_times_s > span_s - skip_edges_s - half_window_s
+            window_variance[too_early | too_late] = -np.inf
 
         # Optional variance floor: ignore windows below this, so we don't dredge up flat-signal
         # "climbing" on a quiet recording. 0.0 (the default) disables the floor.
@@ -307,7 +372,7 @@ def build_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
             min_separation_s=params["roi_seconds"],
         )
         for rank, (center_time, variance) in enumerate(picks):
-            start_s, end_s = clip_window(center_time, params["roi_seconds"], span_s)
+            start_s, end_s = clip_window(center_time, params["roi_seconds"], span_s, first_s)
             rois.append({
                 "category": "climb",
                 "rank": rank,
@@ -445,11 +510,16 @@ def build_command(row, out_dir, offsets, combined_h5):
 
     out_name = f"{row['animal']}_c{cycle}_{row['category']}{row['rank']}.mp4"
     out_path = os.path.join(out_dir, out_name)
+    # The crop box (crop_video.py's sidecar) is framed tightly on the sipper tip so the tongue is
+    # visible during licking. A CLIMBING clip needs the opposite: the animal is on/around the sipper
+    # and the cage, mostly OUTSIDE that box, so cropping hides the very behaviour we are reviewing.
+    # Render climbing clips full-frame.
+    crop_flag = " --no-crop" if row["category"] == "climb" else ""
     lines.append(
         f"python make_sync_video.py --h5 {shquote(row['raw_h5'])} "
         f"--layout {shquote(row['layout'])} "
         f"--combined-h5 {shquote(combined_h5)} --cycle {cycle} "
-        f"--start {start_s:.3f} --end {end_s:.3f} "
+        f"--start {start_s:.3f} --end {end_s:.3f}{crop_flag} "
         f"--out {shquote(out_path)}"
     )
     return lines
@@ -521,7 +591,15 @@ def main(argv=None):
                         help="climbing windows per (animal, cycle), highest variance first "
                              "(default 3)")
     parser.add_argument("--roi-seconds", type=float, default=12.0,
-                        help="width of each emitted window in seconds (default 12)")
+                        help="MINIMUM width of each emitted window in seconds (default 12); a "
+                             "licking window grows beyond this when the bout is longer")
+    parser.add_argument("--lick-pad", type=float, default=2.0,
+                        help="seconds of context kept on each side of a licking bout (default 2); "
+                             "the window always contains the whole bout")
+    parser.add_argument("--climb-skip-edges", type=float, default=300.0,
+                        help="seconds at the START and END of each session excluded from the "
+                             "CLIMBING search (default 300); start-up/shut-down transients are not "
+                             "climbing. Licking bouts near the edges are still reported")
     parser.add_argument("--var-window", type=float, default=1.0,
                         help="sliding variance window in seconds for climbing detection (default 1)")
     parser.add_argument("--min-var", type=float, default=0.0,
@@ -544,6 +622,8 @@ def main(argv=None):
         "n_lick": args.n_lick,
         "n_climb": args.n_climb,
         "roi_seconds": args.roi_seconds,
+        "lick_pad": args.lick_pad,
+        "climb_skip_edges": args.climb_skip_edges,
         "var_window": args.var_window,
         "min_var": args.min_var,
     }

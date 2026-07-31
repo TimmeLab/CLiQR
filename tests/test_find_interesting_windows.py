@@ -110,7 +110,8 @@ def test_build_rois_separates_licking_and_climbing():
     bout_lick_counts = np.array([7])
     lick_times = np.linspace(40.0, 40.5, 7)           # the 7 licks of that bout
 
-    params = {"n_lick": 3, "n_climb": 3, "roi_seconds": 6.0, "var_window": 1.0, "min_var": 0.0}
+    params = {"n_lick": 3, "n_climb": 3, "roi_seconds": 6.0, "climb_skip_edges": 0.0,
+              "var_window": 1.0, "min_var": 0.0}
     rois = build_rois_for_cycle(cap, t, bout_start_times, bout_durations,
                                 bout_lick_counts, lick_times, params)
 
@@ -126,6 +127,125 @@ def test_build_rois_separates_licking_and_climbing():
     # Licking and climbing windows do not overlap.
     for climb in climbs:
         assert climb["end"] <= licks[0]["start"] or climb["start"] >= licks[0]["end"]
+
+
+def test_build_rois_lick_window_contains_whole_bout():
+    # A bout LONGER than roi_seconds must not be truncated: the emitted window has to cover the
+    # entire bout (plus the pad), even though that makes it wider than roi_seconds. Truncating it
+    # cuts licks off the end of the clip, which is exactly what we watch the clip for.
+    fs = 100.0
+    t = np.arange(0, 120, 1.0 / fs)
+    cap = np.full(t.shape, 676.0)
+
+    bout_start, bout_duration = 50.0, 25.0            # 25 s bout vs a 12 s roi_seconds
+    lick_times = np.arange(bout_start, bout_start + bout_duration, 0.15)
+    params = {"n_lick": 1, "n_climb": 0, "roi_seconds": 12.0, "climb_skip_edges": 0.0,
+              "var_window": 1.0, "min_var": 0.0, "lick_pad": 2.0}
+    rois = build_rois_for_cycle(cap, t, [bout_start], [bout_duration], [len(lick_times)],
+                                lick_times, params)
+
+    lick = [r for r in rois if r["category"] == "lick"][0]
+    assert lick["start"] <= bout_start
+    assert lick["end"] >= bout_start + bout_duration
+    # Every lick of the bout is inside the emitted window.
+    assert lick["n_licks_in_window"] == len(lick_times)
+    # The pad is applied on both sides.
+    assert lick["start"] == bout_start - params["lick_pad"]
+    assert lick["end"] == bout_start + bout_duration + params["lick_pad"]
+
+
+def test_build_rois_short_bout_keeps_roi_seconds_width():
+    # A bout much SHORTER than roi_seconds still yields a full-width roi_seconds window centered on
+    # it, so the clip has context around the bout rather than a 1 s sliver.
+    fs = 100.0
+    t = np.arange(0, 120, 1.0 / fs)
+    cap = np.full(t.shape, 676.0)
+    lick_times = np.linspace(50.0, 50.5, 5)
+    params = {"n_lick": 1, "n_climb": 0, "roi_seconds": 12.0, "climb_skip_edges": 0.0,
+              "var_window": 1.0, "min_var": 0.0, "lick_pad": 2.0}
+    rois = build_rois_for_cycle(cap, t, [50.0], [0.5], [5], lick_times, params)
+    lick = [r for r in rois if r["category"] == "lick"][0]
+    assert lick["end"] - lick["start"] == params["roi_seconds"]
+    assert lick["start"] == 50.25 - 6.0
+
+
+def test_build_rois_climbing_uses_real_time_base_not_sample_rate():
+    # The capacitance trace is NOT uniformly sampled: the hardware stalls, so sample index / average
+    # rate drifts away from the real timestamp (seconds of error on a real recording). The climbing
+    # window must be positioned from `time_data` itself, not from an assumed constant rate.
+    #
+    # Here the first half of the trace is sampled at 100 Hz and the second half at 20 Hz, so the
+    # average rate (~36 Hz) matches neither. A bump sits at a known time in the SLOW half.
+    fast = np.arange(0, 60, 1.0 / 100.0)
+    slow = np.arange(60, 180, 1.0 / 20.0)
+    t = np.concatenate([fast, slow])
+    bump_time = 120.0
+    cap = np.full(t.shape, 676.0)
+    cap += 120.0 * np.exp(-((t - bump_time) ** 2) / (2 * 1.5 ** 2))
+
+    params = {"n_lick": 0, "n_climb": 1, "roi_seconds": 12.0, "climb_skip_edges": 0.0,
+              "var_window": 1.0, "min_var": 0.0, "lick_pad": 2.0}
+    rois = build_rois_for_cycle(cap, t, [], [], [], [], params)
+    climbs = [r for r in rois if r["category"] == "climb"]
+    assert len(climbs) == 1
+    # The window has to land ON the bump. With the index/rate assumption it lands far away.
+    assert abs(climbs[0]["center"] - bump_time) < 2.0
+
+
+def test_build_rois_climbing_mask_uses_real_time_base():
+    # Same non-uniform trace, but now the bump IS a detected licking bout. Masking is done in
+    # seconds, so with a wrong time base the mask misses the bout and the bout gets reported as
+    # "climbing". No lick-free window is loud enough here, so nothing should be returned.
+    fast = np.arange(0, 60, 1.0 / 100.0)
+    slow = np.arange(60, 180, 1.0 / 20.0)
+    t = np.concatenate([fast, slow])
+    bout_start, bout_duration = 118.5, 3.0
+    cap = np.full(t.shape, 676.0)
+    cap += 120.0 * np.exp(-((t - 120.0) ** 2) / (2 * 1.5 ** 2))
+    lick_times = np.arange(bout_start, bout_start + bout_duration, 0.15)
+
+    params = {"n_lick": 0, "n_climb": 1, "roi_seconds": 12.0, "climb_skip_edges": 0.0,
+              "var_window": 1.0, "min_var": 1.0, "lick_pad": 2.0}
+    rois = build_rois_for_cycle(cap, t, [bout_start], [bout_duration], [len(lick_times)],
+                                lick_times, params)
+    climbs = [r for r in rois if r["category"] == "climb"]
+    assert climbs == []
+
+
+def test_build_rois_climbing_skips_session_edges():
+    # The first and last few minutes of a session are dominated by start-up / shut-down transients
+    # (the operator handling the cage, sipper insertion, sensor settling), not by climbing. Those
+    # stretches must be excluded from the climbing search even though they are the loudest ones.
+    fs = 100.0
+    t = np.arange(0, 1800, 1.0 / fs)                  # 30 min session
+    cap = np.full(t.shape, 676.0)
+    cap += 300.0 * np.exp(-((t - 60.0) ** 2) / (2 * 1.5 ** 2))     # start-up transient (loudest)
+    cap += 300.0 * np.exp(-((t - 1740.0) ** 2) / (2 * 1.5 ** 2))   # shut-down transient
+    cap += 120.0 * np.exp(-((t - 900.0) ** 2) / (2 * 1.5 ** 2))    # real climbing, mid-session
+
+    params = {"n_lick": 0, "n_climb": 3, "roi_seconds": 12.0, "climb_skip_edges": 300.0,
+              "var_window": 1.0, "min_var": 1.0, "lick_pad": 2.0}
+    rois = build_rois_for_cycle(cap, t, [], [], [], [], params)
+    climbs = [r for r in rois if r["category"] == "climb"]
+    assert len(climbs) == 1
+    assert abs(climbs[0]["center"] - 900.0) < 2.0
+    # The whole window, not just its center, is clear of both excluded edges.
+    assert climbs[0]["start"] >= 300.0
+    assert climbs[0]["end"] <= 1800.0 - 300.0
+
+
+def test_build_rois_climbing_skip_edges_does_not_touch_licking():
+    # The edge exclusion is a CLIMBING heuristic only: a real bout in the first five minutes is
+    # still real drinking and must survive.
+    fs = 100.0
+    t = np.arange(0, 1800, 1.0 / fs)
+    cap = np.full(t.shape, 676.0)
+    lick_times = np.linspace(30.0, 33.0, 20)
+    params = {"n_lick": 3, "n_climb": 0, "roi_seconds": 12.0, "climb_skip_edges": 300.0,
+              "var_window": 1.0, "min_var": 0.0, "lick_pad": 2.0}
+    rois = build_rois_for_cycle(cap, t, [30.0], [3.0], [20], lick_times, params)
+    licks = [r for r in rois if r["category"] == "lick"]
+    assert len(licks) == 1 and licks[0]["n_licks_in_window"] == 20
 
 
 def test_parse_offsets():
@@ -157,6 +277,25 @@ def test_build_command_offset_shifts_and_silences_warning():
     text = "\n".join(lines)
     assert "WARNING" not in text
     assert "--start 380.000 --end 392.000" in text
+
+
+def test_build_command_climb_renders_full_frame():
+    # A climbing clip must show the WHOLE frame: the crop box is framed on the sipper tip for
+    # licking, so cropping a climbing clip cuts out the sipper/cage the animal is climbing on.
+    row = {"animal": "A1", "cycle": 0, "category": "climb", "rank": 0,
+           "start": 100.0, "end": 112.0, "restart": False,
+           "raw_h5": "data/raw_07-23.h5", "layout": "data/layout.csv"}
+    lines = build_command(row, out_dir="clips", offsets={}, combined_h5="results_combined.h5")
+    assert "--no-crop" in "\n".join(lines)
+
+
+def test_build_command_lick_keeps_crop():
+    # Licking clips keep the crop: the crop is what makes the tongue visible at all.
+    row = {"animal": "A1", "cycle": 0, "category": "lick", "rank": 0,
+           "start": 100.0, "end": 112.0, "restart": False,
+           "raw_h5": "data/raw_07-23.h5", "layout": "data/layout.csv"}
+    lines = build_command(row, out_dir="clips", offsets={}, combined_h5="results_combined.h5")
+    assert "--no-crop" not in "\n".join(lines)
 
 
 def test_is_control():
