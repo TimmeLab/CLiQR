@@ -8,9 +8,13 @@
 #   DLC_CONFIG   path to the project config.yaml                 (required)
 #   VIDEOS_DIR   videos to scan                                  (default <project>/videos)
 #   NUM_FRAMES   frames per video per algorithm                  (default 20)
-#   ALGORITHMS   comma-separated outlier algorithms              (default jump,uncertain)
+#   ALGORITHMS   comma-separated outlier criteria                (default window,jump,uncertain)
+#   BODYPARTS    bodyparts the criteria judge                    (default nose,jaw)
 #   DLC_ENV      conda env to activate                           (default deeplabcut)
 #   EXTRA_ARGS   passed through to extract_outliers.py           (e.g. "--savelabeled")
+#
+# Candidate frames are gated to the windows where the animal is in view (see the script docstring);
+# ungated, 'jump' flags ~57% of an empty-cage recording and you get frames of bedding.
 #
 # kmeans clustering of the flagged frames is CPU/IO bound and needs no GPU; this uses gpu-a100 only
 # because that is where the DLC environment lives. Drop the --gres line for a CPU partition.
@@ -33,7 +37,8 @@ set -euo pipefail
 
 DLC_ENV="${DLC_ENV:-deeplabcut}"
 NUM_FRAMES="${NUM_FRAMES:-20}"
-ALGORITHMS="${ALGORITHMS:-jump,uncertain}"
+ALGORITHMS="${ALGORITHMS:-window,jump,uncertain}"
+BODYPARTS="${BODYPARTS:-nose,jaw}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 if [[ -z "${DLC_CONFIG:-}" ]]; then
@@ -59,6 +64,7 @@ fi
 python dlc_integration/extract_outliers.py \
     --config "$DLC_CONFIG" \
     --outlieralgorithm "$ALGORITHMS" \
+    --bodyparts "$BODYPARTS" \
     --numframes2pick "$NUM_FRAMES" \
     "${VIDEOS_ARG[@]}" \
     ${EXTRA_ARGS}
