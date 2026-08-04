@@ -2,10 +2,10 @@
 # Submit the labeled-window array, sizing --array from the CSV so the two never drift apart.
 #
 #   DLC_CONFIG=/N/lustre/project/proj-530/dlc_projects/CLiQR_Validation-parkecp-2026-07-27/config.yaml \
-#   ./scripts/submit_dlc_label_windows.sh dlc_windows.csv
+#   ./dlc_integration/submit_dlc_label_windows.sh dlc_windows.csv
 #
 # Extra arguments are forwarded to sbatch, e.g.:
-#   ./scripts/submit_dlc_label_windows.sh dlc_windows.csv --array=1-5 --time=00:20:00
+#   ./dlc_integration/submit_dlc_label_windows.sh dlc_windows.csv --array=1-5 --time=00:20:00
 
 set -euo pipefail
 
@@ -13,7 +13,7 @@ CSV="${1:-dlc_windows.csv}"
 shift || true
 
 if [[ ! -f "$CSV" ]]; then
-    echo "no such windows CSV: $CSV (run scripts/find_dlc_windows.py first)" >&2
+    echo "no such windows CSV: $CSV (run dlc_integration/find_dlc_windows.py first)" >&2
     exit 1
 fi
 if [[ -z "${DLC_CONFIG:-}" ]]; then
@@ -31,6 +31,6 @@ fi
 echo "submitting $N windows from $CSV"
 exec sbatch \
     --array="1-${N}%8" \
-    --export=ALL,WINDOW_CSV="$CSV",DLC_CONFIG="$DLC_CONFIG",OUT_DIR="${OUT_DIR:-labeled_windows}",DLC_ENV="${DLC_ENV:-deeplabcut}",EXTRA_ARGS="${EXTRA_ARGS:-}" \
+    --export=ALL,WINDOW_CSV="$CSV",DLC_CONFIG="$DLC_CONFIG",OUT_DIR="${OUT_DIR:-labeled_windows}",DLC_ENV="${DLC_ENV:-deeplabcut}",EXTRA_ARGS="${EXTRA_ARGS:-}",STAGE_DIR="${STAGE_DIR:-}" \
     "$@" \
-    scripts/slurm_dlc_label_windows.sbatch
+    dlc_integration/slurm_dlc_label_windows.sbatch

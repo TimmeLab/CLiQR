@@ -16,17 +16,21 @@ reused, which is what keeps these renders honest as a check on the analysis.
 
 Two consequences drive the rest of this script:
 
-  * DLC finds the predictions by globbing `destfolder` for `<video stem><scorer>*.h5`, and it names
-    its output `<video stem><scorer>_labeled.mp4` -- with no window in the name. Two array tasks
-    working on the same source video therefore collide on both the temp folder and the output file.
-    So each task gets a private staging directory holding SYMLINKS to the video and the .h5, uses
-    that as `destfolder`, and moves the finished video out under a window-specific name.
+  * Every name DLC uses comes from the video's stem -- output `<stem><scorer>_labeled.mp4`, scratch
+    folder `temp-<stem>`, predictions `<stem><scorer>.h5` -- and none of them mention a frame
+    range. So all N windows of one recording look like the same job to DLC: the first task renders,
+    and every later task finds the output already there and skips with "Labeled video already
+    created". Symlinking the video per window does not help, because DLC resolves the path first
+    and every link collapses back to the one recording. Each task therefore HARDLINKS the video
+    (and its predictions) into a private staging directory under a window-specific name -- a real
+    path, no bytes copied -- which gives the window its own stem and so its own everything. See
+    `stage_inputs`.
 
   * The slow path renders with matplotlib, i.e. it is CPU/IO bound. A GPU is not actually needed
     here; the array runs on gpu-a100 only because that is where the DLC environment lives.
 
 Usage:
-    python scripts/dlc_label_window.py \
+    python dlc_integration/dlc_label_window.py \
         --config /N/lustre/project/proj-530/dlc_projects/CLiQR_Validation-parkecp-2026-07-27/config.yaml \
         --csv dlc_windows.csv --row 1 --out-dir labeled_windows
 """
@@ -38,6 +42,7 @@ import csv
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 
@@ -56,38 +61,95 @@ def read_row(csv_path, row):
     return rows[row - 1]
 
 
-def stage_inputs(video, h5, workdir):
-    """Symlink the video and its predictions into a private directory, return the staged video.
+def stage_inputs(video, h5, stagedir, label):
+    """HARDLINK the video and its analysis outputs into `stagedir` under a per-window name.
 
-    Symlinks (not copies) because the videos are multi-GB and live on Lustre; DLC only reads them.
+    Everything DLC does is keyed off the video's stem: the output is
+    `<stem><scorer>_labeled.mp4`, the scratch folder is `temp-<stem>`, and -- the part that bites
+    -- it short-circuits with "Labeled video already created" when that output already exists. The
+    stem carries no frame range, so all 18 windows of one recording are one and the same job as far
+    as DLC is concerned: the first task renders, every later task finds the file and skips.
+
+    Symlinks do not fix this, because DLC resolves the video path before deriving those names --
+    every link collapses back to the one real recording. Hardlinks do: a hardlink IS a real path
+    with its own name and no copied bytes, so `<label>.mp4` gives this window a private stem, a
+    private output name and a private scratch folder.
+
+    The predictions are hardlinked alongside under the matching renamed prefix, since DLC now looks
+    for `<label><scorer>.h5`. `<h5 stem>*` also matches `<h5 stem>_labeled.mp4` from an earlier
+    render, which must NOT come along -- find_output would hand that stale video back as this
+    window's result -- so only .h5/.pickle are taken. The `_meta.pickle` is required: without it
+    DLC aborts with "No metadata found in ... for video ... and scorer ...".
+
+    Returns the staged video path.
     """
-    workdir.mkdir(parents=True, exist_ok=True)
     video, h5 = Path(video), Path(h5)
     # The CSV is often written on the laptop, where the .h5 sits next to the recording; on the
     # cluster DLC keeps it beside the video instead. Fall back to that before giving up.
     if not h5.exists() and (video.parent / h5.name).exists():
         h5 = video.parent / h5.name
+    if not video.exists():
+        raise SystemExit(f"missing input: {video}")
+    if not h5.exists():
+        raise SystemExit(f"missing input: {h5}")
+    if not h5.name.startswith(video.stem):
+        raise SystemExit(
+            f"{h5.name} does not start with the video stem {video.stem!r}; cannot rename it "
+            "consistently with the staged video"
+        )
+
+    sidecars = sorted(
+        p for p in h5.parent.glob(h5.stem + "*")
+        if p.suffix.lower() in (".h5", ".pickle")
+    )
+    if not any(p.name.endswith("_meta.pickle") for p in sidecars):
+        print(
+            f"warning: no {h5.stem}_meta.pickle next to {h5}; "
+            "create_labeled_video will not be able to load the video metadata",
+            file=sys.stderr,
+        )
+
+    stagedir.mkdir(parents=True, exist_ok=True)
     staged = None
-    for src in (video, h5):
-        if not src.exists():
-            raise SystemExit(f"missing input: {src}")
-        dst = workdir / src.name
+    for src in [video] + sidecars:
+        # `<video stem>` -> `<label>`, keeping the scorer suffix DLC matches on.
+        dst = stagedir / (label + src.name[len(video.stem):])
         if dst.is_symlink() or dst.exists():
             dst.unlink()
-        dst.symlink_to(src.resolve())
-        if src.suffix.lower() != ".h5":
+        try:
+            os.link(src, dst)
+        except OSError as exc:
+            raise SystemExit(
+                f"cannot hardlink {src} -> {dst} ({exc}). The staging directory must be on the "
+                "same filesystem as the recording; pass --stage-dir with a path on that "
+                "filesystem (a symlink will not do -- DLC resolves it and the windows collide)."
+            ) from exc
+        if src == video:
             staged = dst
     return staged
 
 
-def find_output(workdir, before):
-    """The .mp4 that appeared in `workdir` during the render."""
-    after = {p for p in workdir.glob("*.mp4") if not p.is_symlink()}
-    new = sorted(after - before, key=lambda p: p.stat().st_mtime)
+def real_mp4s(directory):
+    """Real .mp4 files in `directory`, never symlinks.
+
+    Symlinks are excluded everywhere in this module: the staged inputs are symlinks, and moving one
+    would produce an output that merely points at a shared file instead of owning its own frames.
+    """
+    return {p for p in Path(directory).glob("*.mp4") if not p.is_symlink()}
+
+
+def find_output(workdir, before, started_at):
+    """The .mp4 this render produced in `workdir`, or None."""
+    new = sorted(real_mp4s(workdir) - before, key=lambda p: p.stat().st_mtime)
     if new:
         return new[-1]
-    labeled = sorted(workdir.glob("*labeled*.mp4"))
-    return labeled[-1] if labeled else None
+    # Fall back to any real, freshly written labeled video; `started_at` keeps a leftover from a
+    # previous attempt out of the result.
+    fresh = [
+        p for p in real_mp4s(workdir)
+        if "labeled" in p.name and p.stat().st_mtime >= started_at
+    ]
+    return max(fresh, key=lambda p: p.stat().st_mtime) if fresh else None
 
 
 def main(argv=None):
@@ -100,9 +162,11 @@ def main(argv=None):
     parser.add_argument("--row", type=int, required=True,
                         help="1-based window / task_id to render (SLURM_ARRAY_TASK_ID)")
     parser.add_argument("--out-dir", default="labeled_windows", help="where finished videos go")
-    parser.add_argument("--work-dir", default=None,
-                        help="staging root (default <out-dir>/.work); use node-local scratch "
-                             "($SLURM_TMPDIR) when available -- the temp PNGs are written here")
+    parser.add_argument("--stage-dir", default=None,
+                        help="staging root (default .dlc_label_staging beside the recording). "
+                             "MUST be on the same filesystem as the recording: the video is "
+                             "hardlinked in, which is what gives each window its own DLC output "
+                             "name. Node-local scratch will not work.")
     parser.add_argument("--shuffle", type=int, default=1)
     parser.add_argument("--trainingsetindex", type=int, default=0)
     parser.add_argument("--videotype", default="", help="passed through to DLC; '' auto-detects")
@@ -136,11 +200,16 @@ def main(argv=None):
         print(f"[{args.row}] {final} exists; skipping (use --overwrite)")
         return 0
 
-    work_root = Path(args.work_dir) if args.work_dir else out_dir / ".work"
-    workdir = work_root / label
+    # The staging dir must share a filesystem with the recording (hardlinks), so it defaults to a
+    # hidden directory beside it rather than to node-local scratch.
+    stage_root = (
+        Path(args.stage_dir) if args.stage_dir
+        else Path(entry["video"]).parent / ".dlc_label_staging"
+    )
+    workdir = stage_root / label
     if workdir.exists():
         shutil.rmtree(workdir)
-    staged_video = stage_inputs(entry["video"], entry["h5"], workdir)
+    staged_video = stage_inputs(entry["video"], entry["h5"], workdir, label)
 
     print(
         f"[{args.row}] {label}: frames {start}-{end} ({end - start} frames, "
@@ -174,7 +243,8 @@ def main(argv=None):
     if args.outputframerate is not None:
         kwargs["outputframerate"] = args.outputframerate
 
-    before = {p for p in workdir.glob("*.mp4") if not p.is_symlink()}
+    before = real_mp4s(workdir)
+    started_at = time.time()
     try:
         deeplabcut.create_labeled_video(**kwargs)
     except TypeError as exc:
@@ -185,16 +255,25 @@ def main(argv=None):
             kwargs.pop(key, None)
         deeplabcut.create_labeled_video(**kwargs)
 
-    produced = find_output(workdir, before)
+    produced = find_output(workdir, before, started_at)
     if produced is None:
-        raise SystemExit(f"[{args.row}] DLC produced no video in {workdir}")
+        # Listing the staging dir is the fastest way to tell "DLC wrote nothing" apart from
+        # "DLC wrote somewhere other than destfolder".
+        listing = "\n  ".join(sorted(p.name for p in workdir.iterdir())) or "(empty)"
+        raise SystemExit(
+            f"[{args.row}] DLC produced no video in {workdir}. Contents:\n  {listing}"
+        )
+    if final.is_symlink():
+        final.unlink()
     shutil.move(str(produced), str(final))
-    print(f"[{args.row}] wrote {final}", flush=True)
+    if final.is_symlink():
+        raise SystemExit(f"[{args.row}] refusing a symlinked result: {final} -> {os.readlink(final)}")
+    print(f"[{args.row}] wrote {final} ({final.stat().st_size / 1e6:.1f} MB)", flush=True)
 
     if not args.keep_frames:
         shutil.rmtree(workdir, ignore_errors=True)
         try:
-            os.rmdir(work_root)  # only succeeds once the last task is done
+            os.rmdir(stage_root)  # only succeeds once the last task is done
         except OSError:
             pass
     return 0

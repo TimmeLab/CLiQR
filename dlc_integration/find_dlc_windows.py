@@ -36,12 +36,21 @@ Frame ranges are half-open, `[start_frame, end_frame)`, matching
 `Frames2plot=list(range(start_frame, end_frame))`.
 
 Usage (from the repository root):
-    python scripts/find_dlc_windows.py \
+    # every analyzed video in a directory (the normal case)
+    python dlc_integration/find_dlc_windows.py "Lickometry Data/ACG-26-3" --csv dlc_windows.csv
+
+    # or one specific prediction file
+    python dlc_integration/find_dlc_windows.py \
         "Lickometry Data/ACG-26-3/raw_data_2026-07-21_12-59-50_cfrDLC_Resnet50_CLiQR_ValidationJul27shuffle1_snapshot_best-90.h5" \
         --csv dlc_windows.csv
 
-Multiple .h5 files (or directories containing them) may be given; every window from every file
-lands in the same CSV, numbered by `task_id`, which is exactly the SLURM array index.
+Inputs default to the current directory, and any directory given is scanned for DLC prediction
+.h5 files. Multiple .h5 files and/or directories may be given; every window from every file lands
+in the same CSV, numbered by `task_id`, which is exactly the SLURM array index -- so one array
+covers all videos.
+
+Re-running with `--append` adds the new windows to an existing CSV instead of replacing it,
+continuing the `task_id` numbering and skipping windows that are already in the file.
 """
 
 from __future__ import annotations
@@ -247,12 +256,21 @@ def find_windows(likelihood, pcutoff, merge_gap, min_frames, min_confident, pad,
 # --------------------------------------------------------------------------------------------
 # driver
 # --------------------------------------------------------------------------------------------
-def collect_h5_paths(inputs):
+def collect_h5_paths(inputs, recursive=False):
+    """Expand a mix of .h5 files and directories into a sorted, de-duplicated file list.
+
+    Directories are scanned for DLC prediction files (`*DLC_*.h5`). If a directory holds .h5 files
+    but none carry the scorer marker, every .h5 in it is taken instead -- the directories we point
+    this at contain nothing but the predictions we care about, and silently finding zero files is
+    worse than trying to read one.
+    """
     paths = []
     for item in inputs:
         p = Path(item)
         if p.is_dir():
-            paths.extend(sorted(q for q in p.glob("*.h5") if _SCORER_RE.search(q.stem)))
+            found = sorted(p.rglob("*.h5") if recursive else p.glob("*.h5"))
+            predictions = [q for q in found if _SCORER_RE.search(q.stem)]
+            paths.extend(predictions or found)
         else:
             paths.append(p)
     seen, unique = set(), []
@@ -264,11 +282,32 @@ def collect_h5_paths(inputs):
     return unique
 
 
+def window_key(row):
+    """Identity of a window for de-duplication across runs: which video, which frames."""
+    return (str(row["video"]), int(row["start_frame"]), int(row["end_frame"]))
+
+
+def read_existing_csv(path):
+    """Rows already in `path` (empty list if it doesn't exist), for --append."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    with path.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        missing = set(CSV_FIELDS) - set(reader.fieldnames or [])
+        if missing:
+            raise SystemExit(
+                f"{path}: existing CSV is missing column(s) {sorted(missing)}; "
+                "it was written by a different version -- drop --append or use a new --csv"
+            )
+        return [{k: row[k] for k in CSV_FIELDS} for row in reader]
+
+
 def rows_for_file(h5_path, args, task_id_start):
     scorer, bodyparts, likelihood = load_dlc_h5(h5_path)
     if args.bodypart not in likelihood:
-        raise SystemExit(
-            f"{h5_path}: bodypart '{args.bodypart}' not in this file. Available: {bodyparts}"
+        raise ValueError(
+            f"bodypart '{args.bodypart}' not in this file. Available: {bodyparts}"
         )
     like = likelihood[args.bodypart]
 
@@ -321,9 +360,15 @@ def main(argv=None):
         description="Extract high-confidence frame windows from DLC prediction .h5 files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("h5", nargs="+",
-                        help="DLC prediction .h5 file(s), or director(ies) to scan for them")
+    parser.add_argument("h5", nargs="*", default=["."],
+                        help="director(ies) to scan for DLC prediction .h5 files, or individual "
+                             ".h5 files; every window found goes into the one CSV")
+    parser.add_argument("--recursive", action="store_true",
+                        help="also scan subdirectories of any directory given")
     parser.add_argument("--csv", default="dlc_windows.csv", help="output CSV path")
+    parser.add_argument("--append", action="store_true",
+                        help="add to an existing --csv instead of replacing it: task_id numbering "
+                             "continues from the last row and windows already present are skipped")
     parser.add_argument("--bodypart", default="nose",
                         help="bodypart whose likelihood decides 'mouse is in frame'")
     parser.add_argument("--pcutoff", type=float, default=0.8,
@@ -353,15 +398,38 @@ def main(argv=None):
                         help="also write a per-file summary here")
     args = parser.parse_args(argv)
 
-    h5_paths = collect_h5_paths(args.h5)
+    h5_paths = collect_h5_paths(args.h5, recursive=args.recursive)
     if not h5_paths:
-        raise SystemExit("no .h5 files found")
+        raise SystemExit(f"no .h5 files found in: {', '.join(map(str, args.h5))}")
     if args.video and len(h5_paths) > 1:
         raise SystemExit("--video only makes sense with a single .h5")
 
-    all_rows, summaries = [], []
+    out = Path(args.csv)
+    existing_rows = read_existing_csv(out) if args.append else []
+    existing_keys = {window_key(r) for r in existing_rows}
+    next_task_id = max((int(r["task_id"]) for r in existing_rows), default=0) + 1
+
+    all_rows, summaries, n_skipped = [], [], 0
     for h5_path in h5_paths:
-        rows, summary = rows_for_file(h5_path, args, task_id_start=len(all_rows) + 1)
+        try:
+            rows, summary = rows_for_file(h5_path, args, task_id_start=next_task_id)
+        except Exception as exc:
+            # One unreadable / non-DLC file shouldn't kill a whole-directory run; with a single
+            # explicit file there is nothing to salvage, so fail loudly instead.
+            msg = str(exc) if str(h5_path) in str(exc) else f"{h5_path}: {exc}"
+            if len(h5_paths) == 1:
+                raise SystemExit(msg)
+            print(f"skipping {msg}", file=sys.stderr)
+            continue
+        if existing_keys:
+            kept = [r for r in rows if window_key(r) not in existing_keys]
+            n_skipped += len(rows) - len(kept)
+            # task_id is the SLURM array index, so it must stay gapless after dropping duplicates.
+            for i, row in enumerate(kept):
+                row["task_id"] = next_task_id + i
+            rows = kept
+        existing_keys.update(window_key(r) for r in rows)
+        next_task_id += len(rows)
         all_rows.extend(rows)
         summaries.append(summary)
         print(
@@ -370,20 +438,32 @@ def main(argv=None):
             file=sys.stderr,
         )
 
-    out = Path(args.csv)
     if out.parent != Path(""):
         out.parent.mkdir(parents=True, exist_ok=True)
+    # Always rewrite the whole file, existing rows included: one header, one contiguous task_id
+    # range, and re-running with --append twice can't produce a half-written CSV.
     with out.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         writer.writeheader()
+        writer.writerows(existing_rows)
         writer.writerows(all_rows)
 
-    total_sec = sum(r["duration_sec"] for r in all_rows)
+    n_total = len(existing_rows) + len(all_rows)
+    total_sec = sum(float(r["duration_sec"]) for r in existing_rows) \
+        + sum(r["duration_sec"] for r in all_rows)
+    added = f"added {len(all_rows)} windows to {len(existing_rows)} already in" if existing_rows \
+        else f"wrote {len(all_rows)} windows from {len(h5_paths)} file(s) to"
+    skipped = f" (skipped {n_skipped} duplicates)" if n_skipped else ""
     print(
-        f"wrote {len(all_rows)} windows ({total_sec:.1f} s of video) to {out}\n"
-        f"submit with: sbatch --array=1-{len(all_rows)} scripts/slurm_dlc_label_windows.sbatch",
+        f"{added} {out}{skipped}; {n_total} windows total ({total_sec:.1f} s of video)",
         file=sys.stderr,
     )
+    if n_total:
+        print(
+            f"submit with: sbatch --array=1-{n_total} "
+            "dlc_integration/slurm_dlc_label_windows.sbatch",
+            file=sys.stderr,
+        )
 
     if args.summary_json:
         Path(args.summary_json).write_text(json.dumps(summaries, indent=2))
