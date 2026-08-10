@@ -313,9 +313,16 @@ def split_long(windows, max_frames):
     return out
 
 
-def find_windows(likelihood, pcutoff, merge_gap, min_frames, min_confident, pad, max_frames):
-    """Full window pipeline; returns half-open [start, end) frame ranges."""
-    mask = np.asarray(likelihood) >= pcutoff
+def find_windows(mask, merge_gap, min_frames, min_confident, pad, max_frames):
+    """Full window pipeline over a per-frame "the animal is here" mask.
+
+    Takes the mask rather than a likelihood array because the gate is no longer a single
+    threshold: a frame counts when the bodypart is confidently detected AND close to the sipper.
+    Callers build the mask; everything below is unchanged.
+
+    Returns half-open [start, end) frame ranges.
+    """
+    mask = np.asarray(mask, dtype=bool)
     windows = merge_close(runs_of_true(mask), merge_gap)
     windows = [
         (s, e) for s, e in windows
@@ -394,8 +401,7 @@ def rows_for_file(h5_path, args, task_id_start):
     fps = args.fps or probe_fps(video) or 120.0
 
     windows = find_windows(
-        like,
-        pcutoff=args.pcutoff,
+        like >= args.pcutoff,
         merge_gap=args.merge_gap,
         min_frames=args.min_frames,
         min_confident=args.min_confident,

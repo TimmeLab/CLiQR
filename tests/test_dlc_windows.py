@@ -157,3 +157,48 @@ def test_sipper_anchor_on_a_real_session():
     assert len(points) == 4
     # Measured across all ten analyzed ACG-26-3 sessions: 140-165 px.
     assert 100.0 < arc < 250.0
+
+
+# ------------------------------------------------------------------ find_windows
+def test_find_windows_takes_a_boolean_mask():
+    mask = np.zeros(1000, dtype=bool)
+    mask[100:400] = True
+    windows = fdw.find_windows(
+        mask, merge_gap=0, min_frames=30, min_confident=15, pad=0, max_frames=0
+    )
+    assert windows == [(100, 400)]
+
+
+def test_find_windows_merges_across_gaps_and_drops_thin_windows():
+    """Two runs 50 frames apart merge at merge_gap=120; a lone 5-frame flicker does not survive
+    min_confident even though the merge gap would happily absorb it."""
+    mask = np.zeros(2000, dtype=bool)
+    mask[100:200] = True
+    mask[250:350] = True   # 50-frame gap -> merges with the run above
+    mask[1500:1505] = True  # isolated flicker -> dropped by min_confident=15
+    windows = fdw.find_windows(
+        mask, merge_gap=120, min_frames=30, min_confident=15, pad=0, max_frames=0
+    )
+    assert windows == [(100, 350)]
+
+
+def test_find_windows_pads_and_splits():
+    mask = np.zeros(1000, dtype=bool)
+    mask[400:700] = True
+    padded = fdw.find_windows(
+        mask, merge_gap=0, min_frames=30, min_confident=15, pad=60, max_frames=0
+    )
+    assert padded == [(340, 760)]
+    split = fdw.find_windows(
+        mask, merge_gap=0, min_frames=30, min_confident=15, pad=0, max_frames=100
+    )
+    assert split == [(400, 500), (500, 600), (600, 700)]
+
+
+def test_find_windows_clamps_padding_at_the_session_edges():
+    mask = np.zeros(500, dtype=bool)
+    mask[10:480] = True
+    windows = fdw.find_windows(
+        mask, merge_gap=0, min_frames=30, min_confident=15, pad=60, max_frames=0
+    )
+    assert windows == [(0, 500)]

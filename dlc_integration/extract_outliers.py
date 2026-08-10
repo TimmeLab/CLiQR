@@ -239,8 +239,7 @@ def gate_mask(arrays, args, video, n_frames):
             f"available: {list(arrays)}"
         )
     windows = find_dlc_windows.find_windows(
-        arrays[args.gate_bodypart][:, 2],
-        pcutoff=args.gate_pcutoff,
+        arrays[args.gate_bodypart][:, 2] >= args.gate_pcutoff,
         merge_gap=args.gate_merge_gap,
         min_frames=args.gate_min_frames,
         min_confident=args.gate_min_confident,
