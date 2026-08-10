@@ -170,12 +170,15 @@ def test_find_windows_takes_a_boolean_mask():
 
 
 def test_find_windows_merges_across_gaps_and_drops_thin_windows():
-    """Two runs 50 frames apart merge at merge_gap=120; a lone 5-frame flicker does not survive
-    min_confident even though the merge gap would happily absorb it."""
+    """Two runs 50 frames apart merge at merge_gap=120; two separate 5-frame flickers that
+    merge together still do not survive min_confident even though the merge gap absorbs them:
+    [1500:1505] and [1600:1605] merge to (1500, 1605) with length 105 >= min_frames 30,
+    but only 10 confident frames < min_confident 15, rejected by min_confident only."""
     mask = np.zeros(2000, dtype=bool)
     mask[100:200] = True
     mask[250:350] = True   # 50-frame gap -> merges with the run above
-    mask[1500:1505] = True  # isolated flicker -> dropped by min_confident=15
+    mask[1500:1505] = True
+    mask[1600:1605] = True  # 95-frame gap <= merge_gap 120, so these two flickers merge
     windows = fdw.find_windows(
         mask, merge_gap=120, min_frames=30, min_confident=15, pad=0, max_frames=0
     )
@@ -308,7 +311,10 @@ def test_extract_outliers_gate_mask_is_unchanged_by_the_signature_change():
     n = 2000
     like = np.full(n, 0.1)
     like[100:400] = 0.95
-    like[1500:1505] = 0.95  # flicker, below gate_min_confident
+    like[1500:1505] = 0.95
+    like[1600:1605] = 0.95  # two 5-frame runs, 95-frame gap <= merge_gap 120; merged window
+                             # (1500, 1605) has length 105 >= min_frames 30, but only 10 confident
+                             # frames < min_confident 15, so rejected by min_confident only
     arrays = {"nose": np.column_stack([np.zeros(n), np.zeros(n), like])}
     args = types.SimpleNamespace(
         windows_csv=None, gate_bodypart="nose", gate_pcutoff=0.8, gate_merge_gap=120,
