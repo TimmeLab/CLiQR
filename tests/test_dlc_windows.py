@@ -242,3 +242,11 @@ def test_tongue_rate_respects_the_window_bounds():
 def test_tongue_rate_of_an_empty_window_is_zero():
     like = _square_wave(600, period=15)
     assert fdw.tongue_upcross_rate(like, 300, 300, pcutoff=0.6, fps=120.0) == 0.0
+
+
+def test_tongue_rate_does_not_count_a_leading_run_already_above_cutoff():
+    """Opens HIGH: the leading run is not a crossing, so 3 pulses yield 2 crossings, not 3."""
+    like = np.array([0.9] * 5 + [0.1] * 5 + [0.9] * 5 + [0.1] * 5 + [0.9] * 5)
+    # Rising edges at indices 10 and 20 only -- index 0 has no predecessor to rise from.
+    rate = fdw.tongue_upcross_rate(like, 0, 25, pcutoff=0.6, fps=120.0)
+    assert rate == pytest.approx(2 / (25 / 120.0))
