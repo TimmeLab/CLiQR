@@ -5,15 +5,17 @@ them out as one-row-per-window jobs for `dlc_label_window.py` / the SLURM array.
 Motivation
 ----------
 A session video is ~45 min long but the animal is only at the sipper for a tiny fraction of it: in
-`raw_data_2026-07-21_12-59-50_cfr` the `nose` keypoint clears likelihood 0.8 in ~2% of frames.
+`raw_data_2026-07-21_12-59-50_cfr` the `nose` keypoint clears likelihood 0.8 in ~2% of frames, and
+most of those confident detections are the animal elsewhere in the cage, not at the sipper.
 Rendering a labeled video of the whole recording to eyeball how DeepLabCut did is therefore mostly
 a waste of GPU-hours and of your time. Instead we use the pose predictions themselves as an
-"is the mouse here?" detector: contiguous runs of high-confidence `nose` frames are the only parts
-worth looking at.
+"is the mouse drinking?" detector: a frame counts only when the chosen bodypart is confidently
+detected AND close to the sipper tip, and contiguous runs of such frames are the only parts worth
+looking at.
 
 This script does NOT re-run inference and does NOT cut any video. It reads the DLC prediction .h5
-that `analyze_videos` already wrote, thresholds one bodypart's likelihood, and emits frame ranges.
-The actual subsetting happens later, inside `create_labeled_video(..., fastmode=False,
+that `analyze_videos` already wrote, gates on bodypart likelihood and sipper proximity, and emits
+frame ranges. The actual subsetting happens later, inside `create_labeled_video(..., fastmode=False,
 Frames2plot=range(start, end))`, so frame numbers stay in the ORIGINAL video's index space and
 remain relatable to the capacitance trace.
 
@@ -98,6 +100,9 @@ CSV_FIELDS = [
     "start_sec",
     "end_sec",
     "duration_sec",
+    # frac_above deliberately still means "confident anywhere in the padded row" (mean(likelihood
+    # >= pcutoff) over start:end) -- it is NOT proximity-aware like the columns appended below.
+    # Leaving it as-is is what makes --max-nose-dist 0 reproduce the pre-branch CSV byte-for-byte.
     "frac_above",
     "mean_likelihood",
     # Appended, so the original column order is untouched. The distance columns are empty when
@@ -253,38 +258,54 @@ def point_to_polyline_distance(px, py, points):
 
 
 def sipper_anchor(coords, pcutoff=0.6, min_frames=100):
-    """Static per-session sipper position: (points, arc_length_px).
+    """Static per-session sipper position: (points, arc_length_px, position_iqr).
 
     The sipper does not move within a recording -- across the ten analyzed ACG-26-3 sessions each
-    keypoint's position IQR over confident frames is 0.5-3.5 px -- so one median per keypoint is
-    both more robust and cheaper than tracking it frame by frame, and it survives the 1-23% of
-    frames where a keypoint drops below `pcutoff`.
+    keypoint's position IQR over frames clearing likelihood 0.8 is 0.5-3.5 px (that is the cutoff
+    the measurement was taken at; `pcutoff` here defaults to 0.6 via --sipper-pcutoff, which admits
+    more, slightly noisier frames into the median) -- so one median per keypoint is both more
+    robust and cheaper than tracking it frame by frame, and it survives the 1-23% of frames where a
+    keypoint drops below `pcutoff`.
 
     `arc_length` is the length of the polyline through the surviving keypoints. It is the natural
     scale of the sipper in this recording (140-165 px across our sessions, varying with camera
     distance), which is what makes a proximity threshold expressed as a fraction of it portable
     between sessions.
+
+    `position_iqr` maps each surviving keypoint to (iqr_x, iqr_y) in px, the same spread measured
+    above but computed for THIS session -- the evidence that would show a moved or long-occluded
+    sipper (a much wider spread than 0.5-3.5 px) with nothing else in this script's output
+    otherwise raising a flag. It does not feed the gate; it is surfaced for --summary-json only.
     """
     points = []
+    position_iqr = {}
     for bp in SIPPER_BODYPARTS:
         if bp not in coords:
             continue
-        confident = coords[bp]["likelihood"] >= pcutoff
+        x, y, likelihood = coords[bp]["x"], coords[bp]["y"], coords[bp]["likelihood"]
+        # Excluding non-finite coordinates alongside the likelihood mask matters: a single NaN
+        # surviving into np.median silently propagates to NaN arc_length -> NaN threshold ->
+        # "dist <= NaN" False everywhere -> zero windows, with nothing but "arc nan px" on stderr.
+        confident = (likelihood >= pcutoff) & np.isfinite(x) & np.isfinite(y)
         if confident.sum() < min_frames:
             continue
-        points.append(
-            (float(np.median(coords[bp]["x"][confident])),
-             float(np.median(coords[bp]["y"][confident])))
+        cx, cy = x[confident], y[confident]
+        points.append((float(np.median(cx)), float(np.median(cy))))
+        position_iqr[bp] = (
+            round(float(np.percentile(cx, 75) - np.percentile(cx, 25)), 2),
+            round(float(np.percentile(cy, 75) - np.percentile(cy, 25)), 2),
         )
     if len(points) < 2:
         raise ValueError(
             f"no usable sipper keypoints: fewer than two of {list(SIPPER_BODYPARTS)} have "
-            f"{min_frames}+ frames at likelihood >= {pcutoff}"
+            f"{min_frames}+ frames at likelihood >= {pcutoff} (with finite x/y). Bodyparts in "
+            f"this file: {sorted(coords)}. If this model doesn't track the sipper, pass "
+            f"--max-nose-dist 0 to disable proximity gating and fall back to likelihood-only."
         )
     arc_length = sum(
         float(np.hypot(b[0] - a[0], b[1] - a[1])) for a, b in zip(points[:-1], points[1:])
     )
-    return points, arc_length
+    return points, arc_length, position_iqr
 
 
 def tongue_upcross_rate(likelihood, start, end, pcutoff, fps):
@@ -297,7 +318,9 @@ def tongue_upcross_rate(likelihood, start, end, pcutoff, fps):
     without an FFT.
 
     A window that opens already above the cutoff contributes no crossing for that leading run. That
-    undercounts by at most one crossing, which is immaterial against a 3+/s threshold.
+    undercounts by at most one crossing, which is immaterial against a 3+/s threshold for windows a
+    few seconds or longer -- but not for short ones: at --min-frames 30 (0.25 s at 120 fps), one
+    missed crossing is 4.0/s all by itself.
     """
     duration = (end - start) / fps
     if duration <= 0:
@@ -454,13 +477,20 @@ def rows_for_file(h5_path, args, task_id_start):
 
     # Proximity is off only when the user asked for it: --max-nose-dist 0 and no pixel override.
     if args.max_nose_dist_px is not None:
-        points, arc_length = sipper_anchor(coords, pcutoff=args.sipper_pcutoff)
+        points, arc_length, sipper_iqr = sipper_anchor(coords, pcutoff=args.sipper_pcutoff)
         threshold_px = float(args.max_nose_dist_px)
+    elif args.max_nose_dist < 0:
+        # A negative fraction is nonsensical and, left unchecked, falls through to the same
+        # branch as 0 -- silently disabling proximity gating instead of erroring.
+        raise SystemExit(
+            f"--max-nose-dist must be >= 0 (0 disables proximity gating), got "
+            f"{args.max_nose_dist}"
+        )
     elif args.max_nose_dist > 0:
-        points, arc_length = sipper_anchor(coords, pcutoff=args.sipper_pcutoff)
+        points, arc_length, sipper_iqr = sipper_anchor(coords, pcutoff=args.sipper_pcutoff)
         threshold_px = args.max_nose_dist * arc_length
     else:
-        points, arc_length, threshold_px = None, None, None
+        points, arc_length, threshold_px, sipper_iqr = None, None, None, None
 
     mask, dist = build_near_mask(coords, args.bodypart, args.pcutoff, points, threshold_px)
     like = coords[args.bodypart]["likelihood"]
@@ -513,6 +543,11 @@ def rows_for_file(h5_path, args, task_id_start):
         # Report the rate of the pre-pad window(s) this row came from, NOT a rate recomputed over
         # the padded row: padding is quiet by construction and would dilute the number, so a user
         # tuning --tongue-min-rate from an unfiltered CSV would pick a threshold that is too low.
+        # max() over overlapping parents is safe under two invariants: distinct pre-pad windows are
+        # always more than merge_gap frames apart, so with pad <= merge_gap a padded row's range
+        # only ever overlaps its own parent(s); and a parent --require-tongue drops always scores
+        # below every kept parent, so max() still lands on a kept parent's rate even if a dropped
+        # one happens to overlap. Raising --pad above --merge-gap is what would break this.
         overlapping = [r for (ws, we), r in rates.items() if ws < end and we > start]
         rate = max((r for r in overlapping if r is not None), default="")
         if dist is not None and in_window.any():
@@ -547,6 +582,7 @@ def rows_for_file(h5_path, args, task_id_start):
         frames_above=int(np.sum(like >= args.pcutoff)), frames_near=int(np.sum(mask)),
         sipper_scale=round(arc_length, 2) if arc_length is not None else None,
         nose_dist_thresh_px=round(threshold_px, 2) if threshold_px is not None else None,
+        sipper_iqr=sipper_iqr if arc_length is not None else None,
         n_windows=len(final),
     )
 

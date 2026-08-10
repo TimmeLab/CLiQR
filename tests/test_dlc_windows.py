@@ -4,6 +4,7 @@
 `extract_outliers.py` does rather than inventing an import mechanism for tests only.
 """
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -113,10 +114,13 @@ def test_sipper_anchor_medians_ignore_low_likelihood_frames():
         n=500, confident={"sipper_top": 200, "sipper_midtop": 200,
                           "sipper_midbottom": 200, "sipper_bottom": 200},
     )
-    points, arc = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
+    points, arc, iqr = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
     np.testing.assert_allclose(points, [(100.0, 100.0), (100.0, 130.0),
                                         (100.0, 160.0), (100.0, 190.0)])
     assert arc == pytest.approx(90.0)
+    # Every keypoint is parked at a fixed position (no spread) over the confident frames.
+    assert set(iqr) == {"sipper_top", "sipper_midtop", "sipper_midbottom", "sipper_bottom"}
+    assert all(v == (0.0, 0.0) for v in iqr.values())
 
 
 def test_sipper_anchor_drops_keypoints_with_too_few_confident_frames():
@@ -126,9 +130,11 @@ def test_sipper_anchor_drops_keypoints_with_too_few_confident_frames():
         n=500, confident={"sipper_top": 5, "sipper_midtop": 200,
                           "sipper_midbottom": 200, "sipper_bottom": 200},
     )
-    points, arc = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
+    points, arc, iqr = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
     np.testing.assert_allclose(points, [(100.0, 130.0), (100.0, 160.0), (100.0, 190.0)])
     assert arc == pytest.approx(60.0)
+    # The dropped keypoint contributes no IQR entry at all.
+    assert set(iqr) == {"sipper_midtop", "sipper_midbottom", "sipper_bottom"}
 
 
 def test_sipper_anchor_keeps_anatomical_order_for_a_diagonal_sipper():
@@ -137,7 +143,7 @@ def test_sipper_anchor_keeps_anatomical_order_for_a_diagonal_sipper():
         {"sipper_top": (200.0, 100.0), "sipper_midtop": (230.0, 140.0),
          "sipper_midbottom": (180.0, 180.0), "sipper_bottom": (120.0, 190.0)},
     )
-    points, arc = fdw.sipper_anchor(coords)
+    points, arc, _iqr = fdw.sipper_anchor(coords)
     np.testing.assert_allclose(points, [(200.0, 100.0), (230.0, 140.0),
                                         (180.0, 180.0), (120.0, 190.0)])
     expected = 50.0 + np.hypot(50.0, 40.0) + np.hypot(60.0, 10.0)
@@ -150,10 +156,60 @@ def test_sipper_anchor_raises_when_fewer_than_two_keypoints_survive():
         fdw.sipper_anchor(coords)
 
 
+def test_sipper_anchor_error_names_available_bodyparts_and_the_escape_hatch():
+    """The error should say what bodyparts the file DOES have (this model may just lack sipper
+    keypoints) and that --max-nose-dist 0 disables proximity gating, not just fault the data."""
+    coords = _sipper_coords({"sipper_top": (100.0, 100.0)})
+    coords["jaw"] = coords.pop("sipper_top")
+    with pytest.raises(ValueError, match=r"jaw") as excinfo:
+        fdw.sipper_anchor(coords)
+    assert "--max-nose-dist 0" in str(excinfo.value)
+
+
+def test_sipper_anchor_ignores_nan_coordinates_in_otherwise_confident_frames():
+    """A few NaN x/y values in confident frames must not NaN-poison the median: M1 regression.
+
+    5 of the 200 "confident" frames for sipper_top carry a NaN coordinate. Excluding them leaves
+    195 clean frames all parked at (100, 100), so the median is still exactly (100, 100) and the
+    arc length is still exactly 90.0 -- not NaN.
+    """
+    coords = _sipper_coords(
+        {"sipper_top": (100.0, 100.0), "sipper_midtop": (100.0, 130.0),
+         "sipper_midbottom": (100.0, 160.0), "sipper_bottom": (100.0, 190.0)},
+        n=500, confident={"sipper_top": 200, "sipper_midtop": 200,
+                          "sipper_midbottom": 200, "sipper_bottom": 200},
+    )
+    nan_idx = [3, 17, 42, 99, 150]  # all within the first 200 (confident) frames
+    coords["sipper_top"]["x"][nan_idx] = np.nan
+    coords["sipper_top"]["y"][1] = np.nan
+    points, arc, iqr = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
+    np.testing.assert_allclose(points, [(100.0, 100.0), (100.0, 130.0),
+                                        (100.0, 160.0), (100.0, 190.0)])
+    assert arc == pytest.approx(90.0)
+    assert not any(np.isnan(v) for pair in iqr.values() for v in pair)
+
+
+def test_sipper_anchor_nan_coordinates_count_against_min_frames():
+    """A keypoint whose confident frames are mostly NaN must be dropped, not silently kept with a
+    median computed over too few real points."""
+    coords = _sipper_coords(
+        {"sipper_top": (100.0, 100.0), "sipper_midtop": (100.0, 130.0),
+         "sipper_midbottom": (100.0, 160.0), "sipper_bottom": (100.0, 190.0)},
+        n=500, confident={"sipper_top": 200, "sipper_midtop": 200,
+                          "sipper_midbottom": 200, "sipper_bottom": 200},
+    )
+    # Only 50 of sipper_top's 200 "confident" frames have finite coordinates -- below min_frames.
+    coords["sipper_top"]["x"][50:200] = np.nan
+    points, arc, iqr = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
+    np.testing.assert_allclose(points, [(100.0, 130.0), (100.0, 160.0), (100.0, 190.0)])
+    assert arc == pytest.approx(60.0)
+    assert "sipper_top" not in iqr
+
+
 @needs_predictions
 def test_sipper_anchor_on_a_real_session():
     _scorer, _bodyparts, coords = fdw.load_dlc_h5(PRED_H5)
-    points, arc = fdw.sipper_anchor(coords)
+    points, arc, _iqr = fdw.sipper_anchor(coords)
     assert len(points) == 4
     # Measured across all ten analyzed ACG-26-3 sessions: 140-165 px.
     assert 100.0 < arc < 250.0
@@ -300,9 +356,151 @@ def test_build_near_mask_rejects_an_unknown_bodypart():
         fdw.build_near_mask(coords, "jaw", 0.8, points, threshold_px=90.0)
 
 
-# ------------------------------------------------------------------ extract_outliers regression
-import types  # noqa: E402
+# ------------------------------------------------------------------ rows_for_file (assembly)
+def _sipper_polyline_coords(n=6000):
+    """Sipper polyline at x=300, y=100..190 (four keypoints, arc length 90 px), all confident."""
+    like = np.full(n, 0.95)
+    return {
+        "sipper_top": {"x": np.full(n, 300.0), "y": np.full(n, 100.0), "likelihood": like},
+        "sipper_midtop": {"x": np.full(n, 300.0), "y": np.full(n, 130.0), "likelihood": like},
+        "sipper_midbottom": {"x": np.full(n, 300.0), "y": np.full(n, 160.0), "likelihood": like},
+        "sipper_bottom": {"x": np.full(n, 300.0), "y": np.full(n, 190.0), "likelihood": like},
+    }
 
+
+def _tongue_pulse(n, start, end, period=15):
+    """8 Hz (at 120 fps) square wave over [start, end) that starts LOW, unlike `_square_wave`
+    above (which starts high and loses its leading edge): every one of the (end-start)/period
+    cycles then contributes a counted rising edge, giving an exact, hand-checkable rate rather
+    than one diluted by the "opens already above cutoff" undercount."""
+    like = np.full(n, 0.1)
+    phase = np.arange(end - start) % period
+    like[start:end] = np.where(phase < period // 2, 0.1, 0.9)
+    return like
+
+
+def _session_coords(with_sipper=True, third_bout=False):
+    """6000-frame synthetic session built to the final reviewer's spec:
+
+    - sipper polyline at x=300, y=100..190 (arc length 90 px), all confident.
+    - a confident nose bout at frames 1000-1600, 5 px off the polyline, tongue pulsing at 8 Hz.
+    - a second, equally confident nose bout at frames 3000-3600, at x=5000 (across the cage),
+      no tongue activity.
+    - with `third_bout`: a third confident, near-sipper bout at 4500-5100 with no tongue rhythm,
+      for exercising --require-tongue.
+    """
+    n = 6000
+    nose_like = np.full(n, 0.1)
+    nose_x = np.zeros(n)
+    nose_y = np.full(n, 140.0)  # within the polyline's y range for every bout
+    bouts = [(1000, 1600), (3000, 3600)] + ([(4500, 5100)] if third_bout else [])
+    for s, e in bouts:
+        nose_like[s:e] = 0.95
+    nose_x[1000:1600] = 305.0   # 5 px off the (x=300) polyline
+    nose_x[3000:3600] = 5000.0  # across the cage
+    if third_bout:
+        nose_x[4500:5100] = 305.0  # near, but silent tongue
+
+    coords = {
+        "nose": {"x": nose_x, "y": nose_y, "likelihood": nose_like},
+        "tongue": {"x": np.zeros(n), "y": np.zeros(n), "likelihood": _tongue_pulse(n, 1000, 1600)},
+    }
+    if with_sipper:
+        coords.update(_sipper_polyline_coords(n))
+    return coords
+
+
+def _rows_args(**overrides):
+    """`args` namespace with exactly the attributes `rows_for_file` reads, at CLI defaults."""
+    defaults = dict(
+        video="dummy.mp4", video_dir=None, fps=120.0,
+        bodypart="nose", pcutoff=0.8, sipper_pcutoff=0.6,
+        max_nose_dist=0.6, max_nose_dist_px=None,
+        require_tongue=False, tongue_pcutoff=0.6, tongue_min_rate=3.0,
+        merge_gap=120, min_frames=30, min_confident=15,
+        pad=60, max_frames=3600,
+    )
+    defaults.update(overrides)
+    return types.SimpleNamespace(**defaults)
+
+
+def test_rows_for_file_default_gates_on_proximity(monkeypatch):
+    """Hand-verified arithmetic (see final-fix-report.md for the full derivation):
+    - mask is True only for frames 1000-1600 (bout 2 is 5000 px away, threshold is 54.0 px).
+    - find_windows pre-pad keeps (1000, 1600) whole (600 >= min_frames 30, all confident).
+    - padding by 60 each side -> (940, 1660); nothing else to merge with.
+    - the near-mask is True on exactly [1000, 1600) within that range, all at distance 5.0 px,
+      so mean/min over "mask-True frames only" is 5.0/5.0, not diluted by the quiet padding.
+    - the tongue pulse is a clean 40 cycles over 600 frames / 5.0 s = 8.0 crossings/s exactly
+      (see `_tongue_pulse`), inherited unchanged from the one overlapping pre-pad window.
+    """
+    coords = _session_coords()
+    monkeypatch.setattr(fdw, "load_dlc_h5", lambda path: ("scorer", list(coords), coords))
+    args = _rows_args()
+
+    rows, summary = fdw.rows_for_file(Path("dummy.h5"), args, task_id_start=1)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["start_frame"], row["end_frame"]) == (940, 1660)
+    assert row["mean_nose_dist"] == 5.0
+    assert row["min_nose_dist"] == 5.0
+    assert row["tongue_rate"] == 8.0
+    assert summary["sipper_scale"] == 90.0
+    assert summary["nose_dist_thresh_px"] == 54.0
+
+
+def test_rows_for_file_max_nose_dist_zero_disables_proximity(monkeypatch):
+    """--max-nose-dist 0 must let the far bout back in, with the distance columns left empty
+    and no sipper scale reported -- proximity is off, not just failing to exclude anything."""
+    coords = _session_coords()
+    monkeypatch.setattr(fdw, "load_dlc_h5", lambda path: ("scorer", list(coords), coords))
+    args = _rows_args(max_nose_dist=0)
+
+    rows, summary = fdw.rows_for_file(Path("dummy.h5"), args, task_id_start=1)
+
+    assert len(rows) == 2
+    far = rows[1]
+    assert (far["start_frame"], far["end_frame"]) == (2940, 3660)
+    assert far["mean_nose_dist"] == ""
+    assert far["min_nose_dist"] == ""
+    assert summary["sipper_scale"] is None
+
+
+def test_rows_for_file_max_nose_dist_zero_never_calls_sipper_anchor(monkeypatch):
+    """With proximity disabled, sipper_anchor must never run at all -- so a file with no
+    sipper_* keypoints whatsoever still works, and a call would blow up this stub anyway."""
+    coords = _session_coords(with_sipper=False)
+    monkeypatch.setattr(fdw, "load_dlc_h5", lambda path: ("scorer", list(coords), coords))
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("sipper_anchor must not be called when proximity is disabled")
+    monkeypatch.setattr(fdw, "sipper_anchor", _boom)
+
+    args = _rows_args(max_nose_dist=0)
+    rows, summary = fdw.rows_for_file(Path("dummy.h5"), args, task_id_start=1)
+
+    assert len(rows) == 2
+    assert summary["sipper_scale"] is None
+
+
+def test_rows_for_file_require_tongue_drops_silent_near_bouts(monkeypatch):
+    """A third, near-sipper bout with no tongue rhythm must be dropped by --require-tongue, and
+    the surviving drinking window's tongue_rate must still be its own parent's rate (8.0), not
+    something recomputed over the padded row or contaminated by the dropped bout."""
+    coords = _session_coords(third_bout=True)
+    monkeypatch.setattr(fdw, "load_dlc_h5", lambda path: ("scorer", list(coords), coords))
+    args = _rows_args(require_tongue=True)
+
+    rows, _summary = fdw.rows_for_file(Path("dummy.h5"), args, task_id_start=1)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["start_frame"], row["end_frame"]) == (940, 1660)
+    assert row["tongue_rate"] == 8.0
+
+
+# ------------------------------------------------------------------ extract_outliers regression
 import extract_outliers  # noqa: E402  (same sys.path entry as find_dlc_windows)
 
 
