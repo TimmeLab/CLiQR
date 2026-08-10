@@ -295,3 +295,36 @@ def test_build_near_mask_rejects_an_unknown_bodypart():
     coords = {"nose": _nose_coords([1.0], [1.0], [1.0])}
     with pytest.raises(ValueError, match="jaw"):
         fdw.build_near_mask(coords, "jaw", 0.8, points, threshold_px=90.0)
+
+
+# ------------------------------------------------------------------ extract_outliers regression
+import types  # noqa: E402
+
+import extract_outliers  # noqa: E402  (same sys.path entry as find_dlc_windows)
+
+
+def test_extract_outliers_gate_mask_is_unchanged_by_the_signature_change():
+    """gate_mask must still mean 'likelihood >= gate_pcutoff, run through the window pipeline'."""
+    n = 2000
+    like = np.full(n, 0.1)
+    like[100:400] = 0.95
+    like[1500:1505] = 0.95  # flicker, below gate_min_confident
+    arrays = {"nose": np.column_stack([np.zeros(n), np.zeros(n), like])}
+    args = types.SimpleNamespace(
+        windows_csv=None, gate_bodypart="nose", gate_pcutoff=0.8, gate_merge_gap=120,
+        gate_min_frames=30, gate_min_confident=15, gate_pad=0,
+    )
+    mask = extract_outliers.gate_mask(arrays, args, video="whatever.mp4", n_frames=n)
+    assert mask[100:400].all()
+    assert not mask[:100].any()
+    assert not mask[400:].any()
+
+
+def test_extract_outliers_gate_mask_rejects_an_unknown_bodypart():
+    arrays = {"nose": np.zeros((10, 3))}
+    args = types.SimpleNamespace(
+        windows_csv=None, gate_bodypart="whisker", gate_pcutoff=0.8, gate_merge_gap=120,
+        gate_min_frames=30, gate_min_confident=15, gate_pad=0,
+    )
+    with pytest.raises(ValueError, match="whisker"):
+        extract_outliers.gate_mask(arrays, args, video="whatever.mp4", n_frames=10)
