@@ -194,6 +194,41 @@ def probe_fps(video):
 
 
 # --------------------------------------------------------------------------------------------
+# sipper geometry and tongue rhythm
+# --------------------------------------------------------------------------------------------
+# The four sipper_* keypoints trace the curve of the sipper tip. Anatomical order matters: the
+# polyline models the physical tube, so the points must be joined top -> bottom, never re-sorted
+# by coordinate (the sipper sits diagonally in most recordings).
+SIPPER_BODYPARTS = ("sipper_top", "sipper_midtop", "sipper_midbottom", "sipper_bottom")
+
+
+def point_to_polyline_distance(px, py, points):
+    """Distance from each (px, py) to the nearest point ON the polyline through `points`.
+
+    Segment distance, not nearest-vertex distance: adjacent sipper keypoints are ~40-50 px apart,
+    so a nose resting midway between two of them reads as up to ~25 px farther from the sipper
+    than it really is if you only measure to the vertices.
+    """
+    px = np.asarray(px, dtype=float)
+    py = np.asarray(py, dtype=float)
+    if len(points) < 2:
+        raise ValueError("need at least two points to form a polyline")
+
+    best = None
+    for (ax, ay), (bx, by) in zip(points[:-1], points[1:]):
+        vx, vy = bx - ax, by - ay
+        length_sq = vx * vx + vy * vy
+        if length_sq == 0:
+            # Degenerate segment (two identical keypoint medians): fall back to the endpoint.
+            d = np.hypot(px - ax, py - ay)
+        else:
+            t = np.clip(((px - ax) * vx + (py - ay) * vy) / length_sq, 0.0, 1.0)
+            d = np.hypot(px - (ax + t * vx), py - (ay + t * vy))
+        best = d if best is None else np.minimum(best, d)
+    return best
+
+
+# --------------------------------------------------------------------------------------------
 # window construction
 # --------------------------------------------------------------------------------------------
 def runs_of_true(mask):
