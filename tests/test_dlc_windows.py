@@ -57,3 +57,32 @@ def test_distance_is_vectorized():
         np.array([5.0, 14.0, 5.0]), np.array([3.0, 3.0, 0.0]), points
     )
     assert d == pytest.approx([3.0, 5.0, 0.0])
+
+
+# ------------------------------------------------------------------ real-file smoke test
+PRED_H5 = (
+    REPO_ROOT / "Lickometry Data" / "ACG-26-3" / "dlc_analysis_results"
+    / "raw_data_2026-07-21_12-59-50_cfrDLC_Resnet50_CLiQR_ValidationJul27shuffle1"
+      "_snapshot_best-140.h5"
+)
+needs_predictions = pytest.mark.skipif(
+    not PRED_H5.exists(), reason=f"no analyzed session data at {PRED_H5}"
+)
+
+
+@needs_predictions
+def test_load_dlc_h5_returns_xy_and_likelihood():
+    scorer, bodyparts, coords = fdw.load_dlc_h5(PRED_H5)
+    assert scorer
+    assert set(fdw.SIPPER_BODYPARTS) <= set(bodyparts)
+    assert {"nose", "tongue"} <= set(bodyparts)
+    nose = coords["nose"]
+    assert set(nose) == {"x", "y", "likelihood"}
+    n = nose["likelihood"].size
+    assert n > 0
+    assert nose["x"].size == n and nose["y"].size == n
+    # Likelihoods are probabilities; coordinates are pixels well outside [0, 1].
+    assert nose["likelihood"].min() >= 0.0 and nose["likelihood"].max() <= 1.0
+    confident = nose["likelihood"] >= 0.8
+    assert confident.any()
+    assert nose["x"][confident].max() > 1.0

@@ -93,7 +93,9 @@ CSV_FIELDS = [
 # reading DLC predictions
 # --------------------------------------------------------------------------------------------
 def load_dlc_h5(path):
-    """Return (scorer, bodyparts, likelihood_array_dict) from a DLC prediction file.
+    """Return (scorer, bodyparts, coords) from a DLC prediction file.
+
+    `coords[bodypart]` is a dict of `x`, `y`, `likelihood` float arrays, one entry per frame.
 
     Uses pandas/pytables when available; otherwise falls back to reading the pytables `table`
     dataset directly with h5py and unpickling the column MultiIndex out of the group attributes.
@@ -106,11 +108,14 @@ def load_dlc_h5(path):
         df = pd.read_hdf(path)
         scorer = df.columns.get_level_values(0)[0]
         bodyparts = list(dict.fromkeys(df.columns.get_level_values(1)))
-        likelihood = {
-            bp: np.asarray(df[(scorer, bp, "likelihood")].values, dtype=float)
+        coords = {
+            bp: {
+                coord: np.asarray(df[(scorer, bp, coord)].values, dtype=float)
+                for coord in ("x", "y", "likelihood")
+            }
             for bp in bodyparts
         }
-        return scorer, bodyparts, likelihood
+        return scorer, bodyparts, coords
     except ImportError:
         pass  # no pytables -> h5py fallback below
 
@@ -137,11 +142,11 @@ def load_dlc_h5(path):
 
     scorer = columns[0][0]
     bodyparts = list(dict.fromkeys(col[1] for col in columns))
-    likelihood = {}
+    coords = {}
     for i, (_scorer, bp, coord) in enumerate(columns):
-        if coord == "likelihood":
-            likelihood[bp] = values[:, i]
-    return scorer, bodyparts, likelihood
+        if coord in ("x", "y", "likelihood"):
+            coords.setdefault(bp, {})[coord] = values[:, i]
+    return scorer, bodyparts, coords
 
 
 def guess_video(h5_path):
@@ -339,12 +344,12 @@ def read_existing_csv(path):
 
 
 def rows_for_file(h5_path, args, task_id_start):
-    scorer, bodyparts, likelihood = load_dlc_h5(h5_path)
-    if args.bodypart not in likelihood:
+    scorer, bodyparts, coords = load_dlc_h5(h5_path)
+    if args.bodypart not in coords:
         raise ValueError(
             f"bodypart '{args.bodypart}' not in this file. Available: {bodyparts}"
         )
-    like = likelihood[args.bodypart]
+    like = coords[args.bodypart]["likelihood"]
 
     video = Path(args.video) if args.video else guess_video(h5_path)
     if args.video_dir:
