@@ -202,3 +202,43 @@ def test_find_windows_clamps_padding_at_the_session_edges():
         mask, merge_gap=0, min_frames=30, min_confident=15, pad=60, max_frames=0
     )
     assert windows == [(0, 500)]
+
+
+# ------------------------------------------------------------------ tongue rhythm
+def _square_wave(n, period, duty=0.5, high=0.9, low=0.1):
+    """Likelihood trace that rises above 0.6 once per `period` frames."""
+    phase = np.arange(n) % period
+    return np.where(phase < period * duty, high, low)
+
+
+def test_tongue_rate_counts_one_crossing_per_cycle():
+    """120 fps, a 15-frame period is 8 Hz -- squarely in the 7-9 Hz mouse licking band."""
+    like = _square_wave(1200, period=15)
+    rate = fdw.tongue_upcross_rate(like, 0, 1200, pcutoff=0.6, fps=120.0)
+    # 1200 frames / 15 = 80 cycles, minus the leading run that starts already high, over 10 s.
+    assert rate == pytest.approx(7.9, abs=0.15)
+
+
+def test_tongue_rate_is_zero_when_never_confident():
+    like = np.full(600, 0.05)
+    assert fdw.tongue_upcross_rate(like, 0, 600, pcutoff=0.6, fps=120.0) == 0.0
+
+
+def test_tongue_rate_is_zero_when_continuously_confident():
+    """A tongue that never disappears is not licking -- it is a stuck detection."""
+    like = np.full(600, 0.95)
+    assert fdw.tongue_upcross_rate(like, 0, 600, pcutoff=0.6, fps=120.0) == 0.0
+
+
+def test_tongue_rate_respects_the_window_bounds():
+    like = np.full(1200, 0.05)
+    like[600:] = _square_wave(600, period=15)
+    quiet = fdw.tongue_upcross_rate(like, 0, 600, pcutoff=0.6, fps=120.0)
+    busy = fdw.tongue_upcross_rate(like, 600, 1200, pcutoff=0.6, fps=120.0)
+    assert quiet == 0.0
+    assert busy > 7.0
+
+
+def test_tongue_rate_of_an_empty_window_is_zero():
+    like = _square_wave(600, period=15)
+    assert fdw.tongue_upcross_rate(like, 300, 300, pcutoff=0.6, fps=120.0) == 0.0

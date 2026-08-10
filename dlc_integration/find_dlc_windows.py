@@ -268,6 +268,26 @@ def sipper_anchor(coords, pcutoff=0.6, min_frames=100):
     return points, arc_length
 
 
+def tongue_upcross_rate(likelihood, start, end, pcutoff, fps):
+    """Upward crossings of `pcutoff` per second within [start, end).
+
+    The tongue is only visible at the top of each lick, so during drinking its likelihood PULSES
+    rather than staying high: in the analyzed sessions, drinking stretches cross 0.6 upward 3.4-7.8
+    times per second (a 7.9-9.1 Hz rhythm, part of it below the cutoff) while non-drinking
+    stretches near the sipper cross it 0-0.4 times per second. Counting crossings separates the two
+    without an FFT.
+
+    A window that opens already above the cutoff contributes no crossing for that leading run. That
+    undercounts by at most one crossing, which is immaterial against a 3+/s threshold.
+    """
+    duration = (end - start) / fps
+    if duration <= 0:
+        return 0.0
+    confident = np.asarray(likelihood[start:end]) >= pcutoff
+    crossings = int(np.sum(np.diff(confident.astype(np.int8)) == 1))
+    return crossings / duration
+
+
 # --------------------------------------------------------------------------------------------
 # window construction
 # --------------------------------------------------------------------------------------------
