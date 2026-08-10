@@ -233,6 +233,41 @@ def point_to_polyline_distance(px, py, points):
     return best
 
 
+def sipper_anchor(coords, pcutoff=0.6, min_frames=100):
+    """Static per-session sipper position: (points, arc_length_px).
+
+    The sipper does not move within a recording -- across the ten analyzed ACG-26-3 sessions each
+    keypoint's position IQR over confident frames is 0.5-3.5 px -- so one median per keypoint is
+    both more robust and cheaper than tracking it frame by frame, and it survives the 1-23% of
+    frames where a keypoint drops below `pcutoff`.
+
+    `arc_length` is the length of the polyline through the surviving keypoints. It is the natural
+    scale of the sipper in this recording (140-165 px across our sessions, varying with camera
+    distance), which is what makes a proximity threshold expressed as a fraction of it portable
+    between sessions.
+    """
+    points = []
+    for bp in SIPPER_BODYPARTS:
+        if bp not in coords:
+            continue
+        confident = coords[bp]["likelihood"] >= pcutoff
+        if confident.sum() < min_frames:
+            continue
+        points.append(
+            (float(np.median(coords[bp]["x"][confident])),
+             float(np.median(coords[bp]["y"][confident])))
+        )
+    if len(points) < 2:
+        raise ValueError(
+            f"no usable sipper keypoints: fewer than two of {list(SIPPER_BODYPARTS)} have "
+            f"{min_frames}+ frames at likelihood >= {pcutoff}"
+        )
+    arc_length = sum(
+        float(np.hypot(b[0] - a[0], b[1] - a[1])) for a, b in zip(points[:-1], points[1:])
+    )
+    return points, arc_length
+
+
 # --------------------------------------------------------------------------------------------
 # window construction
 # --------------------------------------------------------------------------------------------

@@ -86,3 +86,78 @@ def test_load_dlc_h5_returns_xy_and_likelihood():
     confident = nose["likelihood"] >= 0.8
     assert confident.any()
     assert nose["x"][confident].max() > 1.0
+
+
+# ------------------------------------------------------------------ sipper anchor
+def _sipper_coords(positions, n=500, confident=None, jitter=0.0):
+    """Synthetic `coords` dict: each sipper keypoint parked at a fixed position.
+
+    `positions` maps bodypart -> (x, y). `confident` maps bodypart -> how many of the n frames
+    clear likelihood 0.9 (the rest are 0.1, with their coordinates thrown far away so a median
+    that fails to mask them is obviously wrong).
+    """
+    coords = {}
+    for bp, (x, y) in positions.items():
+        k = n if confident is None else confident[bp]
+        like = np.concatenate([np.full(k, 0.95), np.full(n - k, 0.1)])
+        xs = np.concatenate([np.full(k, x), np.full(n - k, x + 5000.0)])
+        ys = np.concatenate([np.full(k, y), np.full(n - k, y + 5000.0)])
+        if jitter:
+            rng = np.random.default_rng(0)
+            xs[:k] += rng.uniform(-jitter, jitter, k)
+            ys[:k] += rng.uniform(-jitter, jitter, k)
+        coords[bp] = {"x": xs, "y": ys, "likelihood": like}
+    return coords
+
+
+def test_sipper_anchor_medians_ignore_low_likelihood_frames():
+    coords = _sipper_coords(
+        {"sipper_top": (100.0, 100.0), "sipper_midtop": (100.0, 130.0),
+         "sipper_midbottom": (100.0, 160.0), "sipper_bottom": (100.0, 190.0)},
+        n=500, confident={"sipper_top": 400, "sipper_midtop": 400,
+                          "sipper_midbottom": 400, "sipper_bottom": 400},
+    )
+    points, arc = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
+    np.testing.assert_allclose(points, [(100.0, 100.0), (100.0, 130.0),
+                                        (100.0, 160.0), (100.0, 190.0)])
+    assert arc == pytest.approx(90.0)
+
+
+def test_sipper_anchor_drops_keypoints_with_too_few_confident_frames():
+    coords = _sipper_coords(
+        {"sipper_top": (100.0, 100.0), "sipper_midtop": (100.0, 130.0),
+         "sipper_midbottom": (100.0, 160.0), "sipper_bottom": (100.0, 190.0)},
+        n=500, confident={"sipper_top": 5, "sipper_midtop": 400,
+                          "sipper_midbottom": 400, "sipper_bottom": 400},
+    )
+    points, arc = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
+    np.testing.assert_allclose(points, [(100.0, 130.0), (100.0, 160.0), (100.0, 190.0)])
+    assert arc == pytest.approx(60.0)
+
+
+def test_sipper_anchor_keeps_anatomical_order_for_a_diagonal_sipper():
+    """Points are joined top -> bottom even though sorting by x or y would reorder them."""
+    coords = _sipper_coords(
+        {"sipper_top": (200.0, 100.0), "sipper_midtop": (230.0, 140.0),
+         "sipper_midbottom": (180.0, 180.0), "sipper_bottom": (120.0, 190.0)},
+    )
+    points, arc = fdw.sipper_anchor(coords)
+    np.testing.assert_allclose(points, [(200.0, 100.0), (230.0, 140.0),
+                                        (180.0, 180.0), (120.0, 190.0)])
+    expected = 50.0 + np.hypot(50.0, 40.0) + np.hypot(60.0, 10.0)
+    assert arc == pytest.approx(expected)
+
+
+def test_sipper_anchor_raises_when_fewer_than_two_keypoints_survive():
+    coords = _sipper_coords({"sipper_top": (100.0, 100.0)})
+    with pytest.raises(ValueError, match="usable sipper keypoints"):
+        fdw.sipper_anchor(coords)
+
+
+@needs_predictions
+def test_sipper_anchor_on_a_real_session():
+    _scorer, _bodyparts, coords = fdw.load_dlc_h5(PRED_H5)
+    points, arc = fdw.sipper_anchor(coords)
+    assert len(points) == 4
+    # Measured across all ten analyzed ACG-26-3 sessions: 140-165 px.
+    assert 100.0 < arc < 250.0
