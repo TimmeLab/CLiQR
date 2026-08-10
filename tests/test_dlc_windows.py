@@ -250,3 +250,48 @@ def test_tongue_rate_does_not_count_a_leading_run_already_above_cutoff():
     # Rising edges at indices 10 and 20 only -- index 0 has no predecessor to rise from.
     rate = fdw.tongue_upcross_rate(like, 0, 25, pcutoff=0.6, fps=120.0)
     assert rate == pytest.approx(2 / (25 / 120.0))
+
+
+# ------------------------------------------------------------------ the gate
+def _nose_coords(x, y, likelihood):
+    return {"x": np.asarray(x, float), "y": np.asarray(y, float),
+            "likelihood": np.asarray(likelihood, float)}
+
+
+def test_build_near_mask_excludes_a_confident_but_distant_nose():
+    """Frames 0-99: nose right at the sipper. Frames 100-199: nose confident but 400 px away."""
+    points = [(100.0, 100.0), (100.0, 190.0)]
+    n = 200
+    x = np.concatenate([np.full(100, 105.0), np.full(100, 505.0)])
+    y = np.full(n, 140.0)
+    like = np.full(n, 0.95)
+    coords = {"nose": _nose_coords(x, y, like)}
+    mask, dist = fdw.build_near_mask(coords, "nose", 0.8, points, threshold_px=90.0)
+    assert mask[:100].all()
+    assert not mask[100:].any()
+    assert dist[0] == pytest.approx(5.0)
+    assert dist[100] == pytest.approx(405.0)
+
+
+def test_build_near_mask_still_requires_likelihood():
+    points = [(100.0, 100.0), (100.0, 190.0)]
+    coords = {"nose": _nose_coords(np.full(50, 105.0), np.full(50, 140.0), np.full(50, 0.5))}
+    mask, _dist = fdw.build_near_mask(coords, "nose", 0.8, points, threshold_px=90.0)
+    assert not mask.any()
+
+
+def test_build_near_mask_without_a_threshold_is_likelihood_only():
+    """--max-nose-dist 0 must reproduce the old behavior exactly, distant nose included."""
+    points = [(100.0, 100.0), (100.0, 190.0)]
+    x = np.concatenate([np.full(100, 105.0), np.full(100, 5005.0)])
+    coords = {"nose": _nose_coords(x, np.full(200, 140.0), np.full(200, 0.95))}
+    mask, dist = fdw.build_near_mask(coords, "nose", 0.8, points, threshold_px=None)
+    assert mask.all()
+    assert dist is None
+
+
+def test_build_near_mask_rejects_an_unknown_bodypart():
+    points = [(100.0, 100.0), (100.0, 190.0)]
+    coords = {"nose": _nose_coords([1.0], [1.0], [1.0])}
+    with pytest.raises(ValueError, match="jaw"):
+        fdw.build_near_mask(coords, "jaw", 0.8, points, threshold_px=90.0)
