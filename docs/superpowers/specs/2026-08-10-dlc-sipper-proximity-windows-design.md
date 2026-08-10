@@ -137,7 +137,10 @@ gets split into chunks is judged as one bout.
 - `--tongue-pcutoff` (default 0.6), `--tongue-min-rate` (default 3.0 crossings/s).
 - `--require-tongue` (flag, default off) drops windows below the rate.
 - The rate is **always computed and written to the CSV**, filtered only when the flag is set. One
-  unfiltered run therefore tells you what threshold to use on the next.
+  unfiltered run therefore tells you what threshold to use on the next. A CSV row inherits the rate
+  of the pre-pad window it came from (the maximum, if padding merged several), rather than a rate
+  recomputed over the padded row — padding is quiet by construction and would bias the number
+  downward, misleading exactly the threshold-tuning the column exists for.
 - If the file has no `tongue` bodypart, the column is empty and `--require-tongue` raises
   `ValueError` naming the available bodyparts.
 
