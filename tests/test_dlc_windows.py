@@ -89,11 +89,11 @@ def test_load_dlc_h5_returns_xy_and_likelihood():
 
 
 # ------------------------------------------------------------------ sipper anchor
-def _sipper_coords(positions, n=500, confident=None, jitter=0.0):
+def _sipper_coords(positions, n=500, confident=None):
     """Synthetic `coords` dict: each sipper keypoint parked at a fixed position.
 
     `positions` maps bodypart -> (x, y). `confident` maps bodypart -> how many of the n frames
-    clear likelihood 0.9 (the rest are 0.1, with their coordinates thrown far away so a median
+    clear likelihood 0.95 (the rest are 0.1, with their coordinates thrown far away so a median
     that fails to mask them is obviously wrong).
     """
     coords = {}
@@ -102,10 +102,6 @@ def _sipper_coords(positions, n=500, confident=None, jitter=0.0):
         like = np.concatenate([np.full(k, 0.95), np.full(n - k, 0.1)])
         xs = np.concatenate([np.full(k, x), np.full(n - k, x + 5000.0)])
         ys = np.concatenate([np.full(k, y), np.full(n - k, y + 5000.0)])
-        if jitter:
-            rng = np.random.default_rng(0)
-            xs[:k] += rng.uniform(-jitter, jitter, k)
-            ys[:k] += rng.uniform(-jitter, jitter, k)
         coords[bp] = {"x": xs, "y": ys, "likelihood": like}
     return coords
 
@@ -114,8 +110,8 @@ def test_sipper_anchor_medians_ignore_low_likelihood_frames():
     coords = _sipper_coords(
         {"sipper_top": (100.0, 100.0), "sipper_midtop": (100.0, 130.0),
          "sipper_midbottom": (100.0, 160.0), "sipper_bottom": (100.0, 190.0)},
-        n=500, confident={"sipper_top": 400, "sipper_midtop": 400,
-                          "sipper_midbottom": 400, "sipper_bottom": 400},
+        n=500, confident={"sipper_top": 200, "sipper_midtop": 200,
+                          "sipper_midbottom": 200, "sipper_bottom": 200},
     )
     points, arc = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
     np.testing.assert_allclose(points, [(100.0, 100.0), (100.0, 130.0),
@@ -127,8 +123,8 @@ def test_sipper_anchor_drops_keypoints_with_too_few_confident_frames():
     coords = _sipper_coords(
         {"sipper_top": (100.0, 100.0), "sipper_midtop": (100.0, 130.0),
          "sipper_midbottom": (100.0, 160.0), "sipper_bottom": (100.0, 190.0)},
-        n=500, confident={"sipper_top": 5, "sipper_midtop": 400,
-                          "sipper_midbottom": 400, "sipper_bottom": 400},
+        n=500, confident={"sipper_top": 5, "sipper_midtop": 200,
+                          "sipper_midbottom": 200, "sipper_bottom": 200},
     )
     points, arc = fdw.sipper_anchor(coords, pcutoff=0.6, min_frames=100)
     np.testing.assert_allclose(points, [(100.0, 130.0), (100.0, 160.0), (100.0, 190.0)])
