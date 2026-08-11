@@ -534,9 +534,13 @@ def frame_window_to_session(sess, start_frame, end_frame):
 
     `end_frame` is EXCLUSIVE (the CSV mirrors `Frames2plot=range(start, end)`), so the window ends
     at frame `end_frame - 1`, clamped to the last frame we have a time for.
+
+    A NEGATIVE `start_frame` is rejected for the same reason a too-large one is: `sess[-5]` does not
+    fail, it silently returns a time from the END of the recording, which would emit a clip of a
+    completely different stretch of the session.
     """
     sess = np.asarray(sess, dtype=np.float64)
-    if sess.size == 0 or start_frame >= sess.size:
+    if sess.size == 0 or start_frame < 0 or start_frame >= sess.size:
         return None
     last = min(int(end_frame) - 1, sess.size - 1)
     if last < start_frame:
