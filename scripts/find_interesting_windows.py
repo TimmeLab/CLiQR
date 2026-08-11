@@ -652,6 +652,66 @@ def build_dlc_rois(dlc_rows, cycles, sess_loader=None):
     return rows, skips
 
 
+def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
+    """Everything `build_dlc_rois` needs about each cycle, keyed by the raw recording's stem.
+
+    The DLC CSV names a video, never a raw `.h5`, so the stem is the join key: a cycle's `raw_h5`
+    provenance attribute (or the `--raw-map` fallback) is named after the same recording the video
+    is. Only the FILMED animal matters here -- it is the one with a camera, so it is the only one a
+    sync clip can exist for -- so the trace bounds and lick times come from that animal's group.
+
+    `animals` (from --animals) filters on the resolved filmed animal; a cycle whose filmed animal is
+    not in the list is dropped entirely.
+    """
+    raw_map = raw_map or {}
+    cycles = {}
+    with h5py.File(combined_h5_path, "r") as combined:
+        # Provenance is per-cycle, so visit each cycle once, via whichever animal group carries it.
+        seen_cycles = set()
+        for animal_id in combined.keys():
+            for cycle_key in combined[animal_id].keys():
+                if cycle_key in seen_cycles:
+                    continue
+                raw_h5_path, layout_path = cycle_provenance(combined, animal_id, cycle_key, raw_map)
+                if not raw_h5_path:
+                    continue
+                seen_cycles.add(cycle_key)
+
+                filmed_animal = resolve_filmed_animal(raw_h5_path, layout_path)
+                if animals and filmed_animal not in set(animals):
+                    continue
+
+                first_s, span_s = 0.0, 0.0
+                lick_times = np.array([])
+                if filmed_animal is not None and filmed_animal in combined:
+                    group = combined[filmed_animal].get(cycle_key)
+                    if group is not None and "time_data" in group:
+                        time_data = group["time_data"][:]
+                        if len(time_data) >= 2:
+                            first_s = float(time_data[0])
+                            span_s = float(time_data[-1])
+                        if "lick_times" in group:
+                            lick_times = group["lick_times"][:]
+
+                try:
+                    cycle_value = int(cycle_key)
+                except ValueError:
+                    cycle_value = cycle_key
+
+                stem = os.path.splitext(os.path.basename(raw_h5_path))[0]
+                cycles[stem] = {
+                    "cycle": cycle_value,
+                    "raw_h5": raw_h5_path,
+                    "layout": layout_path,
+                    "animal": filmed_animal,
+                    "restart": is_restart_recording(raw_h5_path),
+                    "first_s": first_s,
+                    "span_s": span_s,
+                    "lick_times": lick_times,
+                }
+    return cycles
+
+
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------

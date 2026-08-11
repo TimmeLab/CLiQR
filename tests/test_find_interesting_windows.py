@@ -23,6 +23,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     frame_window_to_session, clamp_to_trace,
     load_frame_session_times,
     build_dlc_rois,
+    build_cycles_for_dlc,
 )
 
 
@@ -610,3 +611,64 @@ def test_dlc_row_builds_a_cropped_command_with_speed():
     assert "--no-crop" not in lines[0]
     assert "--speed 0.25" in lines[0]
     assert "clips/ACG-26-3-1_c2_dlc0.mp4" in lines[0]
+
+
+def _write_combined(tmp_path, raw_h5_path):
+    """A minimal results_combined_*.h5: one animal, one cycle, provenance attrs, and the arrays
+    build_cycles_for_dlc reads."""
+    import h5py
+    combined = tmp_path / "combined.h5"
+    with h5py.File(combined, "w") as f:
+        g = f.create_group("ACG-26-3-1").create_group("0")
+        g.attrs["raw_h5"] = str(raw_h5_path)
+        g.attrs["layout"] = "/data/layout.csv"
+        g.create_dataset("time_data", data=np.linspace(0.0, 100.0, 1001))
+        g.create_dataset("lick_times", data=np.array([5.0, 6.0]))
+    return str(combined)
+
+
+def test_build_cycles_for_dlc_keys_on_raw_stem(tmp_path, monkeypatch):
+    import scripts.find_interesting_windows as fiw
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")  # never opened: both readers below are stubbed
+    combined = _write_combined(tmp_path, raw_h5)
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "ACG-26-3-1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+
+    cycles = build_cycles_for_dlc(combined)
+
+    assert list(cycles) == ["raw_data_2026-07-24_12-02-14"]
+    info = cycles["raw_data_2026-07-24_12-02-14"]
+    assert info["cycle"] == 0
+    assert info["animal"] == "ACG-26-3-1"
+    assert info["layout"] == "/data/layout.csv"
+    assert info["first_s"] == 0.0
+    assert info["span_s"] == 100.0
+    assert info["restart"] is False
+    np.testing.assert_allclose(info["lick_times"], [5.0, 6.0])
+
+
+def test_build_cycles_for_dlc_unfilmed_cycle_has_no_animal(tmp_path, monkeypatch):
+    import scripts.find_interesting_windows as fiw
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")
+    combined = _write_combined(tmp_path, raw_h5)
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: None)
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+
+    info = build_cycles_for_dlc(combined)["raw_data_2026-07-24_12-02-14"]
+    assert info["animal"] is None
+    # No filmed animal means no trace to draw either, so the bounds stay empty rather than
+    # borrowing some other animal's.
+    assert info["lick_times"].size == 0
+
+
+def test_build_cycles_for_dlc_animals_filter_drops_other_cycles(tmp_path, monkeypatch):
+    import scripts.find_interesting_windows as fiw
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")
+    combined = _write_combined(tmp_path, raw_h5)
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "ACG-26-3-1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+
+    assert build_cycles_for_dlc(combined, animals=["SOMEONE-ELSE"]) == {}
