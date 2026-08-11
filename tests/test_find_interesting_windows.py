@@ -17,6 +17,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     sliding_variance, center_sample_indices, mask_bout_windows, select_climbing_centers,
     clip_window, count_licks_in_window, build_rois_for_cycle, parse_offsets, build_command,
     is_control,
+    parse_dlc_video_stem, read_dlc_windows,
 )
 
 
@@ -322,3 +323,57 @@ def test_build_command_omits_speed_at_real_time():
 def test_is_control():
     assert is_control("Control1") and is_control("Control12")
     assert not is_control("ACG-26-3-5")
+
+
+# ---------------------------------------------------------------------------
+# DLC window mode
+# ---------------------------------------------------------------------------
+def test_parse_dlc_video_stem_strips_cfr():
+    # DLC ran on a CFR re-encode: the stem the raw .h5 is named after is the one WITHOUT _cfr,
+    # and the caller needs to know it was a re-encode (those rows are not renderable).
+    stem, is_cfr = parse_dlc_video_stem(
+        "/N/lustre/project/proj-530/videos/raw_data_2026-07-13_11-59-47_cfr.mp4")
+    assert stem == "raw_data_2026-07-13_11-59-47"
+    assert is_cfr is True
+
+
+def test_parse_dlc_video_stem_leaves_original_alone():
+    stem, is_cfr = parse_dlc_video_stem("videos/raw_data_2026-07-24_12-02-14.mp4")
+    assert stem == "raw_data_2026-07-24_12-02-14"
+    assert is_cfr is False
+
+
+def test_parse_dlc_video_stem_only_strips_a_trailing_cfr():
+    # "_cfr" in the middle of a name is part of the name, not the re-encode marker.
+    stem, is_cfr = parse_dlc_video_stem("raw_data_cfr_test_2026-07-24.mp4")
+    assert stem == "raw_data_cfr_test_2026-07-24"
+    assert is_cfr is False
+
+
+def test_read_dlc_windows_parses_numbers(tmp_path):
+    csv_path = tmp_path / "windows.csv"
+    csv_path.write_text(
+        "task_id,label,video,h5,scorer,bodypart,start_frame,end_frame,n_frames,"
+        "start_sec,end_sec,duration_sec,frac_above,mean_likelihood,mean_nose_dist,"
+        "min_nose_dist,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,/p.h5,SCORER,nose,"
+        "2606,2799,193,21.717,23.325,1.608,0.1347,0.4471,45.37,20.29,7.119\n"
+    )
+    rows = read_dlc_windows(str(csv_path))
+    assert len(rows) == 1
+    assert rows[0]["label"] == "w000"
+    assert rows[0]["video"] == "/videos/raw_data_2026-07-24_12-02-14.mp4"
+    assert rows[0]["start_frame"] == 2606
+    assert rows[0]["end_frame"] == 2799
+    assert rows[0]["tongue_rate"] == 7.119
+
+
+def test_read_dlc_windows_empty_tongue_rate_is_zero(tmp_path):
+    # tongue_rate is written on every run, but a hand-edited or older CSV may leave it blank.
+    csv_path = tmp_path / "windows.csv"
+    csv_path.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/v.mp4,10,20,\n"
+    )
+    rows = read_dlc_windows(str(csv_path))
+    assert rows[0]["tongue_rate"] == 0.0

@@ -461,6 +461,51 @@ def is_restart_recording(raw_h5_path):
 
 
 # ---------------------------------------------------------------------------
+# DLC window mode
+# ---------------------------------------------------------------------------
+# `dlc_integration/find_dlc_windows.py` writes one row per stretch of video where the animal was
+# confidently at the sipper. Those rows are frame ranges into the ORIGINAL recording's container
+# (half-open, `[start_frame, end_frame)`), which is a different time reference from the one
+# make_sync_video takes -- see `frame_window_to_session` for the conversion.
+
+
+def parse_dlc_video_stem(video_path):
+    """(raw_stem, is_cfr) for a DLC CSV `video` path.
+
+    DLC was run on a CFR re-encode for the older sessions (`<stem>_cfr.mp4`) and on the original
+    recording for the newer ones. The raw `.h5` is always named after the stem WITHOUT `_cfr`, so
+    strip it -- but report that we did, because a re-encode's frame indices are NOT guaranteed to be
+    the original container's ordinals (`-fps_mode cfr` drops frames to hit a flat rate), which makes
+    those rows unrenderable rather than merely inconvenient.
+    """
+    stem = os.path.splitext(os.path.basename(str(video_path)))[0]
+    if stem.endswith("_cfr"):
+        return stem[: -len("_cfr")], True
+    return stem, False
+
+
+def read_dlc_windows(path):
+    """Read a find_dlc_windows.py CSV into plain dicts with the fields this script needs.
+
+    Only `label`, `video`, `start_frame`, `end_frame` and `tongue_rate` are used; the rest of the
+    columns (likelihoods, distances, the derived seconds) are diagnostics for a human reading that
+    CSV. `tongue_rate` is blank on a row written before the column existed, which reads as 0.0.
+    """
+    rows = []
+    with open(path, "r", newline="") as f:
+        for record in csv.DictReader(f):
+            rate = (record.get("tongue_rate") or "").strip()
+            rows.append({
+                "label": record.get("label", ""),
+                "video": record.get("video", ""),
+                "start_frame": int(record["start_frame"]),
+                "end_frame": int(record["end_frame"]),
+                "tongue_rate": float(rate) if rate else 0.0,
+            })
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
 CSV_COLUMNS = [
