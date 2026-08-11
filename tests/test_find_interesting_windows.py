@@ -672,3 +672,43 @@ def test_build_cycles_for_dlc_animals_filter_drops_other_cycles(tmp_path, monkey
     monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
 
     assert build_cycles_for_dlc(combined, animals=["SOMEONE-ELSE"]) == {}
+
+
+def test_main_dlc_mode_writes_csv_and_commands(tmp_path, monkeypatch):
+    # End-to-end through main(): a DLC CSV plus a combined file becomes a .sh of make_sync_video
+    # calls, with no lick/climb search anywhere in it.
+    import scripts.find_interesting_windows as fiw
+
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")
+    combined = _write_combined(tmp_path, raw_h5)
+    windows = tmp_path / "windows.csv"
+    windows.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,100,200,7.1\n"
+        "2,w001,/videos/raw_data_2026-07-13_11-59-47_cfr.mp4,100,200,7.1\n"
+    )
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "ACG-26-3-1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+    # frame k at k/100 s, so window [100, 200) is 1.0 .. 1.99 s
+    monkeypatch.setattr(fiw, "load_frame_session_times",
+                        lambda path: np.arange(5000, dtype=np.float64) / 100.0)
+
+    out_csv = tmp_path / "dlc_rois.csv"
+    out_sh = tmp_path / "make_dlc_clips.sh"
+    rc = fiw.main([combined, "--dlc-windows", str(windows),
+                   "--csv", str(out_csv), "--sh", str(out_sh),
+                   "--out-dir", str(tmp_path / "clips"), "--speed", "0.25"])
+    assert rc == 0
+
+    csv_text = out_csv.read_text()
+    assert "dlc" in csv_text
+    assert "climb" not in csv_text
+    assert ",lick," not in csv_text
+
+    sh_text = out_sh.read_text()
+    assert sh_text.count("make_sync_video.py") == 1     # the _cfr row produced nothing
+    assert "--start 1.000 --end 1.990" in sh_text
+    assert "--speed 0.25" in sh_text
+    assert "--no-crop" not in sh_text
+    assert "--cycle 0" in sh_text
