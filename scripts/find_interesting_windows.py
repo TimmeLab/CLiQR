@@ -479,14 +479,15 @@ def write_csv(rows, csv_path):
             writer.writerow({column: row.get(column, "") for column in CSV_COLUMNS})
 
 
-def build_command(row, out_dir, offsets, combined_h5):
+def build_command(row, out_dir, offsets, combined_h5, speed=1.0):
     """Build the make_sync_video.py command (a list of lines) for one filmed-animal region.
 
     Returns a list of text lines: any WARNING comment(s) followed by the command itself. `offsets`
     maps a cycle index (int) to a manual offset in seconds that is ADDED to start/end (used to
     correct a restart recording's time base once you've measured it). `combined_h5` is the analyzed
     results file; the command reads the trace from it (via --combined-h5/--cycle) so make_sync_video
-    does not re-run filter_data on the raw recording."""
+    does not re-run filter_data on the raw recording. `speed` < 1 renders slow motion (see
+    make_sync_video's --speed); at the default 1.0 no flag is emitted, so the script is unchanged."""
     lines = []
     cycle = row["cycle"]
     start_s = row["start"]
@@ -515,11 +516,12 @@ def build_command(row, out_dir, offsets, combined_h5):
     # and the cage, mostly OUTSIDE that box, so cropping hides the very behaviour we are reviewing.
     # Render climbing clips full-frame.
     crop_flag = " --no-crop" if row["category"] == "climb" else ""
+    speed_flag = f" --speed {speed:g}" if speed != 1.0 else ""
     lines.append(
         f"python make_sync_video.py --h5 {shquote(row['raw_h5'])} "
         f"--layout {shquote(row['layout'])} "
         f"--combined-h5 {shquote(combined_h5)} --cycle {cycle} "
-        f"--start {start_s:.3f} --end {end_s:.3f}{crop_flag} "
+        f"--start {start_s:.3f} --end {end_s:.3f}{crop_flag}{speed_flag} "
         f"--out {shquote(out_path)}"
     )
     return lines
@@ -530,7 +532,7 @@ def shquote(path):
     return f'"{path}"' if re.search(r"\s", str(path)) else str(path)
 
 
-def write_shell_script(rows, sh_path, out_dir, offsets, combined_h5):
+def write_shell_script(rows, sh_path, out_dir, offsets, combined_h5, speed=1.0):
     """Write a runnable shell script with one make_sync_video command per FILMED-animal region.
 
     Rows that are not for the filmed animal (or lack provenance) are skipped -- there is no video
@@ -541,7 +543,7 @@ def write_shell_script(rows, sh_path, out_dir, offsets, combined_h5):
             continue
         if not row.get("raw_h5") or not row.get("layout"):
             continue
-        command_blocks.append(build_command(row, out_dir, offsets, combined_h5))
+        command_blocks.append(build_command(row, out_dir, offsets, combined_h5, speed))
 
     with open(sh_path, "w") as f:
         f.write("#!/usr/bin/env bash\n")
@@ -614,6 +616,9 @@ def main(argv=None):
     parser.add_argument("--offset", action="append", default=None, metavar="CYCLE=SECONDS",
                         help="add SECONDS to a cycle's start/end (repeatable) to correct a restart "
                              "recording's time base once measured")
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="playback speed for every emitted clip (default 1.0 = real time); "
+                             "0.25 gives quarter-speed slow motion with no frames dropped")
     args = parser.parse_args(argv)
 
     raw_map = load_raw_map(args.raw_map)
@@ -693,7 +698,8 @@ def main(argv=None):
     all_rows.sort(key=lambda r: (str(r["animal"]), str(r["cycle"]), r["category"], r["rank"]))
 
     write_csv(all_rows, args.csv)
-    n_commands = write_shell_script(all_rows, args.sh, args.out_dir, offsets, args.combined_h5)
+    n_commands = write_shell_script(all_rows, args.sh, args.out_dir, offsets, args.combined_h5,
+                                    args.speed)
 
     n_filmed_rows = sum(1 for r in all_rows if r["filmed"])
     print(f"Wrote {len(all_rows)} regions of interest to {args.csv}.")

@@ -286,6 +286,81 @@ def test_build_arg_parser_parses_required():
     assert args.no_crop is False
 
 
+def test_build_arg_parser_speed_defaults_to_realtime():
+    p = msv.build_arg_parser()
+    args = p.parse_args([
+        "--h5", "r.h5", "--layout", "l.csv",
+        "--start", "5", "--end", "9", "--out", "o.mp4",
+    ])
+    assert args.speed == 1.0
+    assert p.parse_args([
+        "--h5", "r.h5", "--layout", "l.csv",
+        "--start", "5", "--end", "9", "--out", "o.mp4", "--speed", "0.25",
+    ]).speed == 0.25
+
+
+def _render_capturing_writer(monkeypatch, tmp_path, **render_kwargs):
+    """Run render_clip with the animation/writer stubbed out, returning
+    (n_rendered_frames, writer_fps). Everything upstream of the writer is real."""
+    pts_ns = (np.arange(0, 41) * 100_000_000).astype(np.int64)
+    vb = msv.compute_video_base(pts_ns, 2)
+    rec = _synthetic_rec(pts_ns, vb, 0.0, n=50)
+
+    captured = {}
+
+    class FakeWriter:
+        def __init__(self, fps):
+            captured["writer_fps"] = fps
+
+    class FakeAnimation:
+        def __init__(self, fig, update, frames=None, blit=False):
+            captured["n_frames"] = frames
+
+        def save(self, path, writer=None, savefig_kwargs=None):
+            captured["out"] = path
+
+    class StubSource:
+        def __init__(self, path, frame_sess, crop=None):
+            pass
+
+        def get(self, target_session):
+            return np.zeros((4, 4, 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(msv, "subclip_copy", lambda *a, **kw: None)
+    monkeypatch.setattr(msv, "probe_frame_rate", lambda path: 10.0)
+    monkeypatch.setattr(msv, "probe_frame_session_times",
+                        lambda *a, **kw: np.linspace(0.0, 0.3, 5))
+    monkeypatch.setattr(msv, "TrimmedFrameSource", StubSource)
+    monkeypatch.setattr(msv, "FFMpegWriter", FakeWriter)
+    monkeypatch.setattr(msv, "FuncAnimation", FakeAnimation)
+
+    msv.render_clip(rec, 0.0, 1.0, str(tmp_path / "clip.mp4"), fps=20.0,
+                    **render_kwargs)
+    return captured["n_frames"], captured["writer_fps"]
+
+
+def test_render_clip_speed_slows_playback_without_dropping_frames(tmp_path, monkeypatch):
+    """--speed must divide the WRITER's rate only. Sampling stays at the source
+    rate, so every captured frame still appears; the clip just takes longer to
+    play. Dividing the sampling rate instead would drop 3 of every 4 frames at
+    0.25 and leave the duration unchanged -- the bug this pins."""
+    full_frames, full_fps = _render_capturing_writer(monkeypatch, tmp_path)
+    slow_frames, slow_fps = _render_capturing_writer(monkeypatch, tmp_path, speed=0.25)
+
+    assert slow_frames == full_frames  # no frames dropped
+    assert full_fps == pytest.approx(20.0)
+    assert slow_fps == pytest.approx(5.0)  # 4x longer playback
+
+
+@pytest.mark.parametrize("speed", [0.0, -0.25])
+def test_render_clip_rejects_nonpositive_speed(tmp_path, monkeypatch, speed):
+    with pytest.raises(ValueError):
+        _render_capturing_writer(monkeypatch, tmp_path, speed=speed)
+
+
 def test_load_crop_reads_sidecar(tmp_path):
     from video.trimcrop import crop_params_path, write_crop_params
     video = str(tmp_path / "v.mp4")

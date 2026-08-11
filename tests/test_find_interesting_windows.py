@@ -298,6 +298,27 @@ def test_build_command_lick_keeps_crop():
     assert "--no-crop" not in "\n".join(lines)
 
 
+def _lick_row():
+    return {"animal": "A1", "cycle": 0, "category": "lick", "rank": 0,
+            "start": 100.0, "end": 112.0, "restart": False,
+            "raw_h5": "data/raw_07-23.h5", "layout": "data/layout.csv"}
+
+
+def test_build_command_passes_speed_through():
+    # Slow motion is a per-batch choice: every emitted command must carry it, or you
+    # get one slow clip and a directory of real-time ones.
+    lines = build_command(_lick_row(), out_dir="clips", offsets={},
+                          combined_h5="results_combined.h5", speed=0.25)
+    assert "--speed 0.25" in "\n".join(lines)
+
+
+def test_build_command_omits_speed_at_real_time():
+    # Default real time emits no flag, so existing make_clips.sh files are unchanged.
+    lines = build_command(_lick_row(), out_dir="clips", offsets={},
+                          combined_h5="results_combined.h5")
+    assert "--speed" not in "\n".join(lines)
+
+
 def test_is_control():
     assert is_control("Control1") and is_control("Control12")
     assert not is_control("ACG-26-3-5")

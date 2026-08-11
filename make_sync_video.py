@@ -287,7 +287,7 @@ def load_crop(video_path, params_path=None, no_crop=False):
 
 def render_clip(rec, start, end, out_path, fps=None, window=2.5,
                 sync_offset=DEFAULT_SYNC_OFFSET, intermediate_path=None,
-                crop=None):
+                crop=None, speed=1.0):
     """Render the side-by-side clip. First stream-copies the mouse video down to
     the clip window (intermediate file) so we don't decode the whole
     recording, then composites from it: the left panel is the video frame, the
@@ -310,6 +310,14 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
 
     ``fps`` None (default) renders at the footage's real capture rate, so no
     source frames are dropped; pass a number to force a different output rate.
+
+    ``speed`` scales PLAYBACK only: the clip is still sampled at ``fps`` in session
+    time, so every captured frame appears, but the container is written at
+    ``fps * speed``. 0.25 on 120 fps footage gives quarter-speed slow motion at a
+    30 fps container. Lowering ``fps`` instead would drop three of every four
+    frames and leave the duration unchanged -- not slow motion. The trace panel
+    slows with the video for free: it is redrawn per output frame at that frame's
+    session time, so the two cannot drift apart.
     """
     # The clip window's seconds are CONTAINER seconds on the ORIGINAL recording's
     # CFR rate, which is what subclip_copy seeks by -- probe that rate here, not
@@ -328,6 +336,9 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
     framerate = probe_frame_rate(intermediate_path)
     frame_sess = probe_frame_session_times(intermediate_path, rec.clock,
                                            rec.container_pts_ns, framerate)
+
+    if speed <= 0:
+        raise ValueError(f"speed must be > 0 (got {speed})")
 
     if fps is None:
         fps = source_fps(frame_sess)
@@ -403,7 +414,7 @@ def render_clip(rec, start, end, out_path, fps=None, window=2.5,
 
     anim = FuncAnimation(fig, update, frames=len(taus), blit=False)
     try:
-        anim.save(out_path, writer=FFMpegWriter(fps=fps),
+        anim.save(out_path, writer=FFMpegWriter(fps=fps * speed),
                   savefig_kwargs={"facecolor": dark_grey})
     finally:
         plt.close(fig)
@@ -445,6 +456,11 @@ def build_arg_parser():
     p.add_argument("--fps", type=float, default=None,
                    help="output fps (default: the footage's real capture rate, "
                         "so no source frames are dropped)")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="playback speed multiplier (default 1.0 = real time). "
+                        "0.25 writes the container at a quarter of the capture "
+                        "rate -- 120 fps footage becomes 30 fps slow motion with "
+                        "every frame kept. Video and trace slow together.")
     p.add_argument("--window", type=float, default=2.5,
                    help="trace half-window seconds (default 2.5)")
     p.add_argument("--sync-offset", dest="sync_offset", type=float,
@@ -509,7 +525,8 @@ def main(argv=None):
             render_clip(rec, args.start, args.end, args.out,
                         fps=args.fps, window=args.window,
                         sync_offset=args.sync_offset,
-                        intermediate_path=intermediate, crop=crop)
+                        intermediate_path=intermediate, crop=crop,
+                        speed=args.speed)
         finally:
             if not keep and os.path.exists(intermediate):
                 os.remove(intermediate)
