@@ -13,11 +13,14 @@ import numpy as np
 # where pytest is invoked from.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from video.trimcrop import SessionClock, frame_session_times  # noqa: E402
+
 from scripts.find_interesting_windows import (  # noqa: E402
     sliding_variance, center_sample_indices, mask_bout_windows, select_climbing_centers,
     clip_window, count_licks_in_window, build_rois_for_cycle, parse_offsets, build_command,
     is_control,
     parse_dlc_video_stem, read_dlc_windows,
+    frame_window_to_session, clamp_to_trace,
 )
 
 
@@ -377,3 +380,50 @@ def test_read_dlc_windows_empty_tongue_rate_is_zero(tmp_path):
     )
     rows = read_dlc_windows(str(csv_path))
     assert rows[0]["tongue_rate"] == 0.0
+
+
+def _fake_session_times(n_frames=100, latency=1.5, slope=1.002, fps=120.0):
+    """Per-frame session times built the way the renderer builds them: absolute SensorTimestamps
+    through a SessionClock that carries a bookmark latency and a drift slope."""
+    pts_ns = (np.arange(n_frames) / fps * 1e9).astype(np.int64) + 123_456_789
+    clock = SessionClock(pts_start_sec=0.0, latency=latency, slope=slope)
+    return frame_session_times(clock, pts_ns)
+
+
+def test_frame_window_to_session_matches_frame_session_times():
+    # The window must be the session time of the frames DLC scored -- latency and drift included,
+    # not frame/fps. sess[k] is the reference the renderer itself uses to place frame k.
+    sess = _fake_session_times()
+    start, end = frame_window_to_session(sess, 10, 20)
+    assert start == sess[10]
+    # end_frame is EXCLUSIVE in the DLC CSV: the last frame in the window is 19.
+    assert end == sess[19]
+    # And that is emphatically not frame/fps: the clock's latency alone shifts it by 1.5 s.
+    assert start > 10 / 120.0 + 1.0
+
+
+def test_frame_window_to_session_clamps_end_past_sidecar():
+    sess = _fake_session_times(n_frames=50)
+    start, end = frame_window_to_session(sess, 40, 999)
+    assert start == sess[40]
+    assert end == sess[-1]
+
+
+def test_frame_window_to_session_returns_none_when_start_past_sidecar():
+    sess = _fake_session_times(n_frames=50)
+    assert frame_window_to_session(sess, 50, 60) is None
+
+
+def test_clamp_to_trace_clips_partial_overlap():
+    assert clamp_to_trace(95.0, 110.0, 0.0, 100.0) == (95.0, 100.0)
+    assert clamp_to_trace(-5.0, 10.0, 0.0, 100.0) == (0.0, 10.0)
+
+
+def test_clamp_to_trace_returns_none_when_disjoint():
+    assert clamp_to_trace(120.0, 130.0, 0.0, 100.0) is None
+    assert clamp_to_trace(-20.0, -10.0, 0.0, 100.0) is None
+
+
+def test_clamp_to_trace_returns_none_when_clamped_window_is_empty():
+    # Touching the edge leaves no time to render.
+    assert clamp_to_trace(100.0, 110.0, 0.0, 100.0) is None

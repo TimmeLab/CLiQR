@@ -505,6 +505,42 @@ def read_dlc_windows(path):
     return rows
 
 
+def frame_window_to_session(sess, start_frame, end_frame):
+    """Session-time window (start_s, end_s) for a DLC frame range, or None if it starts past the
+    end of the recording's per-frame time array.
+
+    `sess` is `frame_session_times(clock, container_pts_ns)`: the session time of every container
+    frame, latency- and drift-corrected. Indexing it is the whole conversion -- do NOT compute
+    `start_frame / fps`, which is video-file time and drifts against session time by seconds over a
+    long recording (see docs/video-sync-alignment-bugs.md).
+
+    `end_frame` is EXCLUSIVE (the CSV mirrors `Frames2plot=range(start, end)`), so the window ends
+    at frame `end_frame - 1`, clamped to the last frame we have a time for.
+    """
+    sess = np.asarray(sess, dtype=np.float64)
+    if sess.size == 0 or start_frame >= sess.size:
+        return None
+    last = min(int(end_frame) - 1, sess.size - 1)
+    if last < start_frame:
+        return None
+    return float(sess[int(start_frame)]), float(sess[last])
+
+
+def clamp_to_trace(start_s, end_s, first_s, span_s):
+    """Clip a window to the trace's own [first_s, span_s], or None if nothing is left.
+
+    A window can fall outside the trace because the video and the capacitance recording do not
+    start and stop at exactly the same instant. Clipping keeps a partially-overlapping window
+    renderable (make_sync_video rejects an --end past the session), and dropping a disjoint one
+    keeps a clip with no trace to draw out of the shell script.
+    """
+    start_s = max(float(start_s), float(first_s))
+    end_s = min(float(end_s), float(span_s))
+    if end_s <= start_s:
+        return None
+    return start_s, end_s
+
+
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
