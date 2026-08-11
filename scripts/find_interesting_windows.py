@@ -45,6 +45,15 @@ What it produces
    animal; the other animals in the same cycle have no video, so we cannot make a sync clip for
    them (they still appear in the CSV for reference).
 
+3. With `--dlc-windows <csv>`, the script runs in DLC mode instead: it does not search the trace at
+   all. Every window comes from a row of the CSV written by dlc_integration/find_dlc_windows.py --
+   the stretches where DeepLabCut saw the animal confidently at the sipper. The frame ranges in
+   that CSV are converted to session seconds with the same SessionClock and PTS sidecar
+   make_sync_video uses to time frames, so the clip shows exactly the frames DLC scored. The clips
+   are rendered from the ORIGINAL recording, never from a DLC labeled video. Rows whose video is a
+   `_cfr` re-encode are skipped: a re-encode's frame indices are not the original container's
+   ordinals, so they cannot be honestly placed on the session clock.
+
 Time-base caveat (restart recordings)
 --------------------------------------
 For a plain single-cycle recording, the combined-file time base and make_sync_video's `--start`
@@ -54,8 +63,11 @@ a known history of the two references disagreeing by a fixed offset (~280 s was 
 2026-07-22 recording). We do NOT silently shift times to "fix" this, because getting the shift
 subtly wrong would misalign every clip. Instead, for any cycle whose raw file is a restart
 recording, the emitted command is preceded by a loud WARNING comment telling you to verify the
-alignment and, if needed, pass `--offset` to make_sync_video (or re-run this script with
-`--offset <cycle>=<seconds>`), which adds the offset to that cycle's start/end.
+alignment and, if needed, re-run this script with `--offset <cycle>=<seconds>`, which adds the
+offset to that cycle's start/end. In DLC mode the warning says something different, because the
+remedy is different: a DLC window is already expressed in make_sync_video's own anchor reference, so
+`--offset` would slide the clip off the frames DLC selected; there the fix is `--sync-offset` on
+make_sync_video, which moves the trace against the video instead of moving the window.
 
 Provenance
 ----------
@@ -74,6 +86,12 @@ Usage (from the repository root, cliqr-gui environment):
     # Backfilling provenance for an older combined file:
     python scripts/find_interesting_windows.py results_combined_old.h5 \
         --raw-map raw_map.json
+
+    # DLC-selected windows instead of the capacitance search:
+    python scripts/find_interesting_windows.py \
+        "Lickometry Data/results_combined_ACG-26-3_2026-07-22_23_24_27_28_29_basic-algorithm.h5" \
+        --dlc-windows second_iteration_windows_with_tongue.csv \
+        --csv dlc_rois.csv --sh make_dlc_clips.sh --speed 0.25
 """
 
 import argparse
@@ -95,7 +113,10 @@ if _REPO_ROOT not in sys.path:
 
 # These primitives already know how the recordings are laid out; reuse them rather than
 # re-implementing the (fiddly) video-sensor / cycle-suffix logic here.
-from video.trimcrop import find_video_sensor, read_video_anchor, _resolve_cycle  # noqa: E402
+from video.trimcrop import (  # noqa: E402
+    find_video_sensor, read_video_anchor, _resolve_cycle,
+    frame_session_times, resolve_paths, session_clock,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +482,267 @@ def is_restart_recording(raw_h5_path):
 
 
 # ---------------------------------------------------------------------------
+# DLC window mode
+# ---------------------------------------------------------------------------
+# `dlc_integration/find_dlc_windows.py` writes one row per stretch of video where the animal was
+# confidently at the sipper. Those rows are frame ranges into the ORIGINAL recording's container
+# (half-open, `[start_frame, end_frame)`), which is a different time reference from the one
+# make_sync_video takes -- see `frame_window_to_session` for the conversion.
+
+
+def parse_dlc_video_stem(video_path):
+    """(raw_stem, is_cfr) for a DLC CSV `video` path.
+
+    DLC was run on a CFR re-encode for the older sessions (`<stem>_cfr.mp4`) and on the original
+    recording for the newer ones. The raw `.h5` is always named after the stem WITHOUT `_cfr`, so
+    strip it -- but report that we did, because a re-encode's frame indices are NOT guaranteed to be
+    the original container's ordinals (`-fps_mode cfr` drops frames to hit a flat rate), which makes
+    those rows unrenderable rather than merely inconvenient.
+    """
+    stem = os.path.splitext(os.path.basename(str(video_path)))[0]
+    if stem.endswith("_cfr"):
+        return stem[: -len("_cfr")], True
+    return stem, False
+
+
+def read_dlc_windows(path):
+    """Read a find_dlc_windows.py CSV into plain dicts with the fields this script needs.
+
+    Only `label`, `video`, `start_frame`, `end_frame` and `tongue_rate` are used; the rest of the
+    columns (likelihoods, distances, the derived seconds) are diagnostics for a human reading that
+    CSV. `tongue_rate` is blank on a row written before the column existed, which reads as 0.0.
+    """
+    rows = []
+    with open(path, "r", newline="") as f:
+        for record in csv.DictReader(f):
+            rate = (record.get("tongue_rate") or "").strip()
+            rows.append({
+                "label": record.get("label", ""),
+                "video": record.get("video", ""),
+                "start_frame": int(record["start_frame"]),
+                "end_frame": int(record["end_frame"]),
+                "tongue_rate": float(rate) if rate else 0.0,
+            })
+    return rows
+
+
+def frame_window_to_session(sess, start_frame, end_frame):
+    """Session-time window (start_s, end_s) for a DLC frame range, or None if it starts past the
+    end of the recording's per-frame time array.
+
+    `sess` is `frame_session_times(clock, container_pts_ns)`: the session time of every container
+    frame, latency- and drift-corrected. Indexing it is the whole conversion -- do NOT compute
+    `start_frame / fps`, which is video-file time and drifts against session time by seconds over a
+    long recording (see docs/video-sync-alignment-bugs.md).
+
+    `end_frame` is EXCLUSIVE (the CSV mirrors `Frames2plot=range(start, end)`), so the window ends
+    at frame `end_frame - 1`, clamped to the last frame we have a time for.
+
+    A NEGATIVE `start_frame` is rejected for the same reason a too-large one is: `sess[-5]` does not
+    fail, it silently returns a time from the END of the recording, which would emit a clip of a
+    completely different stretch of the session.
+    """
+    sess = np.asarray(sess, dtype=np.float64)
+    if sess.size == 0 or start_frame < 0 or start_frame >= sess.size:
+        return None
+    last = min(int(end_frame) - 1, sess.size - 1)
+    if last < start_frame:
+        return None
+    return float(sess[int(start_frame)]), float(sess[last])
+
+
+def clamp_to_trace(start_s, end_s, first_s, span_s):
+    """Clip a window to the trace's own [first_s, span_s], or None if nothing is left.
+
+    A window can fall outside the trace because the video and the capacitance recording do not
+    start and stop at exactly the same instant. Clipping keeps a partially-overlapping window
+    renderable (make_sync_video rejects an --end past the session), and dropping a disjoint one
+    keeps a clip with no trace to draw out of the shell script.
+    """
+    start_s = max(float(start_s), float(first_s))
+    end_s = min(float(end_s), float(span_s))
+    if end_s <= start_s:
+        return None
+    return start_s, end_s
+
+
+def load_frame_session_times(raw_h5_path):
+    """Session time of every container frame of a recording, or None if we cannot get it.
+
+    This is the same three-step the renderer does: read the video anchor out of the raw .h5, build
+    the SessionClock (bookmark latency + two-bookmark drift slope), and time every frame of the
+    PTS sidecar with it. Returning None -- rather than raising -- for a missing raw file, missing
+    video sensor, or missing sidecar is deliberate: a combined file routinely names recordings that
+    are not on this machine, and those videos simply produce no clips.
+    """
+    if not raw_h5_path or not os.path.exists(raw_h5_path):
+        return None
+    # Lazy: make_sync_video drags in matplotlib/imageio/pandas, which the trace-search mode has no
+    # use for. It owns the "which sidecar times container frames" rule (the Pi's encoded-frame
+    # sidecar when present, else the capture sidecar); reuse it so a window computed here always
+    # selects the frames the renderer will place.
+    from make_sync_video import load_container_pts
+    try:
+        anchor = read_video_anchor(raw_h5_path)
+        _, pts_txt = resolve_paths(raw_h5_path, anchor)
+        if not os.path.exists(pts_txt):
+            return None
+        pts_ns = np.loadtxt(pts_txt, dtype=np.int64)
+        if np.asarray(pts_ns).size < 2:
+            return None
+        clock = session_clock(anchor, pts_ns)
+        return frame_session_times(clock, load_container_pts(pts_txt, pts_ns))
+    except (ValueError, KeyError, OSError, IndexError):
+        return None
+
+
+# Reasons a DLC row can fail to become a clip. Counted rather than printed per-row: a real CSV has
+# hundreds of rows, and the useful summary is "how many, and why", not a wall of warnings.
+DLC_SKIP_REASONS = ("cfr_video", "no_cycle", "no_video_times", "no_trace",
+                    "frame_out_of_range", "outside_trace")
+
+
+def build_dlc_rois(dlc_rows, cycles, sess_loader=None):
+    """Turn DLC window rows into regions of interest, plus a count of what was skipped and why.
+
+    `cycles` maps a recording's stem (`raw_data_YYYY-MM-DD_HH-MM-SS`) to everything we know about
+    that cycle: {cycle, raw_h5, layout, animal (the filmed one, or None), restart, first_s, span_s,
+    lick_times}. See `build_cycles_for_dlc`.
+
+    Rows are grouped by video so the (relatively expensive) per-frame session times are read once
+    per recording rather than once per window. `sess_loader` is injected so this is testable
+    without a recording on disk; it is resolved here rather than in the signature so that patching
+    the module-level `load_frame_session_times` also takes effect.
+
+    Ranks are assigned in CSV order within each video, which is the order find_dlc_windows.py
+    emitted them (ascending start frame).
+    """
+    sess_loader = sess_loader or load_frame_session_times
+    skips = {reason: 0 for reason in DLC_SKIP_REASONS}
+    rows = []
+
+    # Preserve CSV order within each video (dicts keep insertion order).
+    by_video = {}
+    for row in dlc_rows:
+        by_video.setdefault(str(row["video"]), []).append(row)
+
+    for video, video_rows in by_video.items():
+        stem, is_cfr = parse_dlc_video_stem(video)
+        if is_cfr:
+            # A CFR re-encode's frame k is not guaranteed to be the original container's frame k,
+            # so we cannot honestly place it on the session clock.
+            skips["cfr_video"] += len(video_rows)
+            continue
+        cycle = cycles.get(stem)
+        if cycle is None:
+            skips["no_cycle"] += len(video_rows)
+            continue
+        if cycle["span_s"] <= cycle["first_s"]:
+            # The cycle has no trace: `build_cycles_for_dlc` leaves the bounds at 0.0 when the
+            # filmed animal cannot be resolved (so there is no group to read `time_data` from) or
+            # when that group has no usable `time_data`. Every window would then fail the clamp
+            # below, which would report the whole video as "outside the trace" and send the reader
+            # after DLC when the fault is animal/layout resolution. Say what is actually wrong.
+            skips["no_trace"] += len(video_rows)
+            continue
+        sess = sess_loader(cycle["raw_h5"])
+        if sess is None:
+            skips["no_video_times"] += len(video_rows)
+            continue
+
+        rank = 0
+        for row in video_rows:
+            window = frame_window_to_session(sess, row["start_frame"], row["end_frame"])
+            if window is None:
+                skips["frame_out_of_range"] += 1
+                continue
+            window = clamp_to_trace(window[0], window[1], cycle["first_s"], cycle["span_s"])
+            if window is None:
+                skips["outside_trace"] += 1
+                continue
+            start_s, end_s = window
+            animal = cycle["animal"]
+            rows.append({
+                "animal": animal or "",
+                "cycle": cycle["cycle"],
+                "category": "dlc",
+                "rank": rank,
+                "start": start_s,
+                "end": end_s,
+                "center": (start_s + end_s) / 2.0,
+                "score": float(row["tongue_rate"]),
+                "n_licks_in_window": count_licks_in_window(cycle["lick_times"], start_s, end_s),
+                "filmed": animal is not None,
+                "restart": cycle["restart"],
+                "raw_h5": cycle["raw_h5"] or "",
+                "layout": cycle["layout"] or "",
+            })
+            rank += 1
+
+    return rows, skips
+
+
+def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
+    """Everything `build_dlc_rois` needs about each cycle, keyed by the raw recording's stem.
+
+    The DLC CSV names a video, never a raw `.h5`, so the stem is the join key: a cycle's `raw_h5`
+    provenance attribute (or the `--raw-map` fallback) is named after the same recording the video
+    is. Only the FILMED animal matters here -- it is the one with a camera, so it is the only one a
+    sync clip can exist for -- so the trace bounds and lick times come from that animal's group.
+
+    `animals` (from --animals) filters on the resolved filmed animal; a cycle whose filmed animal is
+    not in the list is dropped entirely.
+    """
+    raw_map = raw_map or {}
+    cycles = {}
+    with h5py.File(combined_h5_path, "r") as combined:
+        # Provenance is per-cycle, so visit each cycle once, via whichever animal group carries it.
+        seen_cycles = set()
+        for animal_id in combined.keys():
+            for cycle_key in combined[animal_id].keys():
+                if cycle_key in seen_cycles:
+                    continue
+                raw_h5_path, layout_path = cycle_provenance(combined, animal_id, cycle_key, raw_map)
+                if not raw_h5_path:
+                    continue
+                seen_cycles.add(cycle_key)
+
+                filmed_animal = resolve_filmed_animal(raw_h5_path, layout_path)
+                if animals and filmed_animal not in set(animals):
+                    continue
+
+                first_s, span_s = 0.0, 0.0
+                lick_times = np.array([])
+                if filmed_animal is not None and filmed_animal in combined:
+                    group = combined[filmed_animal].get(cycle_key)
+                    if group is not None and "time_data" in group:
+                        time_data = group["time_data"][:]
+                        if len(time_data) >= 2:
+                            first_s = float(time_data[0])
+                            span_s = float(time_data[-1])
+                        if "lick_times" in group:
+                            lick_times = group["lick_times"][:]
+
+                try:
+                    cycle_value = int(cycle_key)
+                except ValueError:
+                    cycle_value = cycle_key
+
+                stem = os.path.splitext(os.path.basename(raw_h5_path))[0]
+                cycles[stem] = {
+                    "cycle": cycle_value,
+                    "raw_h5": raw_h5_path,
+                    "layout": layout_path,
+                    "animal": filmed_animal,
+                    "restart": is_restart_recording(raw_h5_path),
+                    "first_s": first_s,
+                    "span_s": span_s,
+                    "lick_times": lick_times,
+                }
+    return cycles
+
+
+# ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
 CSV_COLUMNS = [
@@ -506,8 +788,19 @@ def build_command(row, out_dir, offsets, combined_h5, speed=1.0):
                      f"recording;")
         lines.append(f"#   the combined-file time base may be offset from make_sync_video's "
                      f"Start-bookmark reference.")
-        lines.append(f"#   Verify alignment; if off, re-run with --offset {cycle}=<seconds> "
-                     f"(or pass --sync-offset to make_sync_video).")
+        if row["category"] == "dlc":
+            # A DLC window is ALREADY in make_sync_video's anchor reference: it was converted from
+            # container frames with the renderer's own SessionClock. --offset would shift start and
+            # end together, sliding the clip off the frames DLC selected, and would not touch the
+            # trace/video mismatch this warning is about. --sync-offset (which shifts the trace
+            # against the video, not the window) is the only correct remedy here.
+            lines.append(f"#   Verify alignment; if off, pass --sync-offset <seconds> to "
+                         f"make_sync_video. Do NOT use --offset: this window is already in "
+                         f"make_sync_video's reference, so it would move the clip off the DLC "
+                         f"window.")
+        else:
+            lines.append(f"#   Verify alignment; if off, re-run with --offset {cycle}=<seconds> "
+                         f"(or pass --sync-offset to make_sync_video).")
 
     out_name = f"{row['animal']}_c{cycle}_{row['category']}{row['rank']}.mp4"
     out_path = os.path.join(out_dir, out_name)
@@ -573,6 +866,49 @@ def parse_offsets(offset_args):
     return offsets
 
 
+def write_outputs(all_rows, args):
+    """Sort, write the CSV and the shell script, and print the summary. Shared by both modes."""
+    # Sort for a tidy, deterministic CSV: by animal, then cycle, then category, then rank.
+    all_rows.sort(key=lambda r: (str(r["animal"]), str(r["cycle"]), r["category"], r["rank"]))
+
+    offsets = parse_offsets(args.offset)
+    write_csv(all_rows, args.csv)
+    n_commands = write_shell_script(all_rows, args.sh, args.out_dir, offsets, args.combined_h5,
+                                    args.speed)
+
+    n_filmed_rows = sum(1 for r in all_rows if r["filmed"])
+    print(f"Wrote {len(all_rows)} regions of interest to {args.csv}.")
+    print(f"Wrote {n_commands} make_sync_video command(s) to {args.sh} "
+          f"(filmed-animal regions only; {n_filmed_rows} filmed rows found).")
+    if n_commands == 0:
+        print("No commands were emitted. This usually means the combined file has no stored "
+              "raw_h5/layout provenance and no --raw-map was given, or the raw files aren't at the "
+              "stored paths. The CSV is still complete.")
+    return n_commands
+
+
+def print_dlc_skips(skips, n_rows):
+    """Report every DLC row that did not become a region, by reason."""
+    explanations = {
+        "cfr_video": "video is a _cfr re-encode (frame indices are not the original container's; "
+                     "re-run DLC on the original recording)",
+        "no_cycle": "no cycle in the combined file matches the video's recording (or that cycle "
+                    "was filtered out by --animals)",
+        "no_video_times": "the recording's video or PTS sidecar is missing on this machine",
+        "no_trace": "the cycle has no trace for the filmed animal (the layout does not name the "
+                    "video sensor, or that animal's group has no time_data)",
+        "frame_out_of_range": "start_frame is negative or past the end of the PTS sidecar",
+        "outside_trace": "the window falls outside the cycle's trace",
+    }
+    total = sum(skips.values())
+    print(f"DLC mode: read {n_rows} window(s); {n_rows - total} became regions of interest.")
+    for reason, count in skips.items():
+        if count:
+            # .get, not [], so adding a reason to DLC_SKIP_REASONS and forgetting it here degrades
+            # to a terse-but-correct line instead of a KeyError in the middle of the report.
+            print(f"  skipped {count}: {explanations.get(reason, reason)}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -619,10 +955,25 @@ def main(argv=None):
     parser.add_argument("--speed", type=float, default=1.0,
                         help="playback speed for every emitted clip (default 1.0 = real time); "
                              "0.25 gives quarter-speed slow motion with no frames dropped")
+    parser.add_argument("--dlc-windows", dest="dlc_windows", default=None, metavar="CSV",
+                        help="CSV written by dlc_integration/find_dlc_windows.py. Given it, the "
+                             "script runs in DLC mode: the capacitance search is skipped entirely "
+                             "and every emitted window comes from a DLC row. The trace-search "
+                             "options (--n-lick/--n-climb/--roi-seconds/--lick-pad/"
+                             "--climb-skip-edges/--var-window/--min-var/--include-controls) are "
+                             "unused in this mode")
     args = parser.parse_args(argv)
 
     raw_map = load_raw_map(args.raw_map)
-    offsets = parse_offsets(args.offset)
+
+    if args.dlc_windows:
+        cycles = build_cycles_for_dlc(args.combined_h5, raw_map, args.animals)
+        dlc_rows = read_dlc_windows(args.dlc_windows)
+        all_rows, skips = build_dlc_rois(dlc_rows, cycles)
+        write_outputs(all_rows, args)
+        print_dlc_skips(skips, len(dlc_rows))
+        return 0
+
     params = {
         "n_lick": args.n_lick,
         "n_climb": args.n_climb,
@@ -694,21 +1045,7 @@ def main(argv=None):
                     })
                     all_rows.append(roi)
 
-    # Sort for a tidy, deterministic CSV: by animal, then cycle, then category, then rank.
-    all_rows.sort(key=lambda r: (str(r["animal"]), str(r["cycle"]), r["category"], r["rank"]))
-
-    write_csv(all_rows, args.csv)
-    n_commands = write_shell_script(all_rows, args.sh, args.out_dir, offsets, args.combined_h5,
-                                    args.speed)
-
-    n_filmed_rows = sum(1 for r in all_rows if r["filmed"])
-    print(f"Wrote {len(all_rows)} regions of interest to {args.csv}.")
-    print(f"Wrote {n_commands} make_sync_video command(s) to {args.sh} "
-          f"(filmed-animal regions only; {n_filmed_rows} filmed rows found).")
-    if n_commands == 0:
-        print("No commands were emitted. This usually means the combined file has no stored "
-              "raw_h5/layout provenance and no --raw-map was given, or the raw files aren't at the "
-              "stored paths. The CSV is still complete.")
+    write_outputs(all_rows, args)
     return 0
 
 

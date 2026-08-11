@@ -8,15 +8,24 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 # Make the repository root importable so `scripts.find_interesting_windows` resolves regardless of
 # where pytest is invoked from.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from video.trimcrop import SessionClock, frame_session_times  # noqa: E402
+
 from scripts.find_interesting_windows import (  # noqa: E402
     sliding_variance, center_sample_indices, mask_bout_windows, select_climbing_centers,
     clip_window, count_licks_in_window, build_rois_for_cycle, parse_offsets, build_command,
     is_control,
+    parse_dlc_video_stem, read_dlc_windows,
+    frame_window_to_session, clamp_to_trace,
+    load_frame_session_times,
+    build_dlc_rois,
+    build_cycles_for_dlc,
+    print_dlc_skips,
 )
 
 
@@ -265,6 +274,26 @@ def test_build_command_restart_warns_without_offset():
     assert "clips/A1_c0_lick0.mp4" in text
     # The command reads the trace from the combined file (fast path), not by re-running filter_data.
     assert "--combined-h5 results_combined.h5 --cycle 0" in text
+    # A trace-search window is in the COMBINED FILE's time base, so re-running this script with
+    # --offset (which shifts the window itself) is the right remedy. This wording is what the
+    # generated make_clips.sh carries; it must not drift.
+    assert "--offset 0=<seconds>" in text
+
+
+def test_build_command_dlc_restart_warning_recommends_sync_offset():
+    # A DLC window is already expressed in make_sync_video's own anchor reference (it came from the
+    # video clock), so --offset would slide the clip OFF the window DLC selected while doing nothing
+    # about a trace/video mismatch. The only correct remedy in DLC mode is --sync-offset.
+    row = {"animal": "A1", "cycle": 0, "category": "dlc", "rank": 0,
+           "start": 100.0, "end": 112.0, "restart": True,
+           "raw_h5": "data/raw_07-22.h5", "layout": "data/layout.csv"}
+    lines = build_command(row, out_dir="clips", offsets={}, combined_h5="results_combined.h5")
+    text = "\n".join(lines)
+    assert "WARNING" in text
+    assert "--sync-offset" in text
+    assert "--offset 0=" not in text
+    # The window itself is untouched by the warning.
+    assert "--start 100.000 --end 112.000" in text
 
 
 def test_build_command_offset_shifts_and_silences_warning():
@@ -322,3 +351,556 @@ def test_build_command_omits_speed_at_real_time():
 def test_is_control():
     assert is_control("Control1") and is_control("Control12")
     assert not is_control("ACG-26-3-5")
+
+
+# ---------------------------------------------------------------------------
+# DLC window mode
+# ---------------------------------------------------------------------------
+def test_parse_dlc_video_stem_strips_cfr():
+    # DLC ran on a CFR re-encode: the stem the raw .h5 is named after is the one WITHOUT _cfr,
+    # and the caller needs to know it was a re-encode (those rows are not renderable).
+    stem, is_cfr = parse_dlc_video_stem(
+        "/N/lustre/project/proj-530/videos/raw_data_2026-07-13_11-59-47_cfr.mp4")
+    assert stem == "raw_data_2026-07-13_11-59-47"
+    assert is_cfr is True
+
+
+def test_parse_dlc_video_stem_leaves_original_alone():
+    stem, is_cfr = parse_dlc_video_stem("videos/raw_data_2026-07-24_12-02-14.mp4")
+    assert stem == "raw_data_2026-07-24_12-02-14"
+    assert is_cfr is False
+
+
+def test_parse_dlc_video_stem_only_strips_a_trailing_cfr():
+    # "_cfr" in the middle of a name is part of the name, not the re-encode marker.
+    stem, is_cfr = parse_dlc_video_stem("raw_data_cfr_test_2026-07-24.mp4")
+    assert stem == "raw_data_cfr_test_2026-07-24"
+    assert is_cfr is False
+
+
+def test_read_dlc_windows_parses_numbers(tmp_path):
+    csv_path = tmp_path / "windows.csv"
+    csv_path.write_text(
+        "task_id,label,video,h5,scorer,bodypart,start_frame,end_frame,n_frames,"
+        "start_sec,end_sec,duration_sec,frac_above,mean_likelihood,mean_nose_dist,"
+        "min_nose_dist,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,/p.h5,SCORER,nose,"
+        "2606,2799,193,21.717,23.325,1.608,0.1347,0.4471,45.37,20.29,7.119\n"
+    )
+    rows = read_dlc_windows(str(csv_path))
+    assert len(rows) == 1
+    assert rows[0]["label"] == "w000"
+    assert rows[0]["video"] == "/videos/raw_data_2026-07-24_12-02-14.mp4"
+    assert rows[0]["start_frame"] == 2606
+    assert rows[0]["end_frame"] == 2799
+    assert rows[0]["tongue_rate"] == 7.119
+
+
+def test_read_dlc_windows_empty_tongue_rate_is_zero(tmp_path):
+    # tongue_rate is written on every run, but a hand-edited or older CSV may leave it blank.
+    csv_path = tmp_path / "windows.csv"
+    csv_path.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/v.mp4,10,20,\n"
+    )
+    rows = read_dlc_windows(str(csv_path))
+    assert rows[0]["tongue_rate"] == 0.0
+
+
+def _fake_session_times(n_frames=100, latency=1.5, slope=1.002, fps=120.0):
+    """Per-frame session times built the way the renderer builds them: absolute SensorTimestamps
+    through a SessionClock that carries a bookmark latency and a drift slope."""
+    pts_ns = (np.arange(n_frames) / fps * 1e9).astype(np.int64) + 123_456_789
+    clock = SessionClock(pts_start_sec=0.0, latency=latency, slope=slope)
+    return frame_session_times(clock, pts_ns)
+
+
+def test_frame_window_to_session_matches_frame_session_times():
+    # The window must be the session time of the frames DLC scored -- latency and drift included,
+    # not frame/fps. sess[k] is the reference the renderer itself uses to place frame k.
+    sess = _fake_session_times()
+    start, end = frame_window_to_session(sess, 10, 20)
+    assert start == sess[10]
+    # end_frame is EXCLUSIVE in the DLC CSV: the last frame in the window is 19.
+    assert end == sess[19]
+    # And that is emphatically not frame/fps: the clock's latency alone shifts it by 1.5 s.
+    assert start > 10 / 120.0 + 1.0
+
+
+def test_frame_window_to_session_clamps_end_past_sidecar():
+    sess = _fake_session_times(n_frames=50)
+    start, end = frame_window_to_session(sess, 40, 999)
+    assert start == sess[40]
+    assert end == sess[-1]
+
+
+def test_frame_window_to_session_returns_none_when_start_past_sidecar():
+    sess = _fake_session_times(n_frames=50)
+    assert frame_window_to_session(sess, 50, 60) is None
+
+
+def test_frame_window_to_session_returns_none_for_negative_start_frame():
+    # A negative index into `sess` does not fail -- it silently wraps to the END of the recording,
+    # which would emit a clip from a completely different part of the session. Reject it.
+    sess = _fake_session_times(n_frames=50)
+    assert frame_window_to_session(sess, -5, 10) is None
+    assert frame_window_to_session(sess, -1, 0) is None
+
+
+def test_clamp_to_trace_clips_partial_overlap():
+    assert clamp_to_trace(95.0, 110.0, 0.0, 100.0) == (95.0, 100.0)
+    assert clamp_to_trace(-5.0, 10.0, 0.0, 100.0) == (0.0, 10.0)
+
+
+def test_clamp_to_trace_returns_none_when_disjoint():
+    assert clamp_to_trace(120.0, 130.0, 0.0, 100.0) is None
+    assert clamp_to_trace(-20.0, -10.0, 0.0, 100.0) is None
+
+
+def test_clamp_to_trace_returns_none_when_clamped_window_is_empty():
+    # Touching the edge leaves no time to render.
+    assert clamp_to_trace(100.0, 110.0, 0.0, 100.0) is None
+
+
+def test_load_frame_session_times_missing_h5_returns_none():
+    # Provenance pointing at a file that isn't on this machine is the normal case for an older
+    # combined file, so it must degrade to "no commands for this video", never to a traceback.
+    assert load_frame_session_times("/nonexistent/raw_data_2026-01-01_00-00-00.h5") is None
+
+
+def test_load_frame_session_times_none_path_returns_none():
+    assert load_frame_session_times(None) is None
+
+
+def test_load_frame_session_times_no_video_sensor_returns_none(tmp_path):
+    # A raw .h5 with no video sensor at all: read_video_anchor raises, and we swallow it.
+    import h5py
+    h5_path = tmp_path / "raw_data_2026-01-01_00-00-00.h5"
+    with h5py.File(h5_path, "w") as f:
+        f.create_group("board0")
+    assert load_frame_session_times(str(h5_path)) is None
+
+
+def _write_raw_with_video_anchor(tmp_path, video_filename="raw_data_2026-01-02_00-00-00.mp4",
+                                 frame_index=0):
+    """A raw .h5 whose video anchor RESOLVES (video sensor group with the bookmark datasets
+    read_video_anchor needs), so the sidecar lookup downstream of it is what gets exercised."""
+    import h5py
+    h5_path = tmp_path / "raw_data_2026-01-02_00-00-00.h5"
+    with h5py.File(h5_path, "w") as f:
+        group = f.create_group("board0").create_group("sensor_1")
+        group.create_dataset("video_filename", data=np.bytes_(video_filename))
+        group.create_dataset("video_frame_index", data=frame_index)
+        group.create_dataset("time_data", data=np.array([0.0, 1.0]))
+        group.create_dataset("start_time", data=0.0)
+        group.create_dataset("stop_time", data=1.0)
+    return h5_path
+
+
+def test_load_frame_session_times_times_encoded_frames_not_captured_ones(tmp_path):
+    # Container ordinal k -- which is what a DLC frame index IS -- indexes the ENCODED frames. When
+    # the encoder dropped frames, the capture sidecar has more lines than the container has frames,
+    # so timing frames off it would shift every window later and later through the recording. The
+    # renderer's `load_container_pts` owns that choice; this pins that we go through it.
+    h5_path = _write_raw_with_video_anchor(tmp_path, frame_index=1)
+    capture = (np.arange(6) * 100_000_000).astype(np.int64)     # 6 captured frames, 0.1 s apart
+    encoded = capture[[0, 1, 3, 5]]                             # the encoder kept only 4 of them
+    np.savetxt(str(tmp_path / "raw_data_2026-01-02_00-00-00.txt"), capture, fmt="%d")
+    np.savetxt(str(tmp_path / "raw_data_2026-01-02_00-00-00.encpts.txt"), encoded, fmt="%d")
+
+    sess = load_frame_session_times(str(h5_path))
+    assert sess is not None
+    # One time per ENCODED frame, not per captured frame.
+    assert sess.size == encoded.size
+    # Bookmark frame 1 is session zero (0.1 s into the video file), so the encoded frames sit at
+    # -0.1, 0.0, 0.2, 0.4 s.
+    np.testing.assert_allclose(sess, [-0.1, 0.0, 0.2, 0.4], atol=1e-9)
+
+
+def test_load_frame_session_times_missing_pts_sidecar_returns_none(tmp_path):
+    # The anchor resolves, but the recording's <stem>.txt PTS sidecar is not on this machine (the
+    # normal case for a combined file that names recordings kept elsewhere). No sidecar means no
+    # per-frame times, which must degrade to None rather than a traceback.
+    h5_path = _write_raw_with_video_anchor(tmp_path)
+    from video.trimcrop import read_video_anchor, resolve_paths
+    _, pts_txt = resolve_paths(str(h5_path), read_video_anchor(str(h5_path)))
+    assert not os.path.exists(pts_txt)          # the branch under test is reachable
+    assert load_frame_session_times(str(h5_path)) is None
+
+
+# --- Positive path, gated on a real recording being present on this machine ------------------
+# Mirrors tests/test_make_sync_video.py's `needs_reference`: the conversion this whole mode rests
+# on can only be checked end-to-end against a real anchor + PTS sidecar. Without this, every
+# load_frame_session_times test asserts None and a regression that dropped the SessionClock (or
+# read the raw capture sidecar instead of the container PTS) would pass the suite.
+REC_DIR = "Lickometry Data/ACG-26-3"
+DLC_H5 = os.path.join(REC_DIR, "raw_data_2026-07-24_12-02-14.h5")
+DLC_PTS = os.path.join(REC_DIR, "raw_data_2026-07-24_12-02-14.txt")
+
+needs_dlc_reference = pytest.mark.skipif(
+    not all(os.path.exists(p) for p in (DLC_H5, DLC_PTS)),
+    reason="reference recording files not present",
+)
+
+
+@needs_dlc_reference
+def test_load_frame_session_times_matches_the_renderers_own_clock():
+    from make_sync_video import load_container_pts
+    from video.trimcrop import read_video_anchor, resolve_paths, session_clock
+
+    got = load_frame_session_times(DLC_H5)
+    assert got is not None
+
+    anchor = read_video_anchor(DLC_H5)
+    _, pts_txt = resolve_paths(DLC_H5, anchor)
+    pts_ns = np.loadtxt(pts_txt, dtype=np.int64)
+    expected = frame_session_times(session_clock(anchor, pts_ns),
+                                   load_container_pts(pts_txt, pts_ns))
+
+    # Same clock, same sidecar choice, same per-frame times the renderer will place frames with.
+    np.testing.assert_array_equal(got, expected)
+    # One session time per ENCODED container frame, strictly increasing (a frame that did not move
+    # forward in time would make a window's start/end order meaningless).
+    assert got.size == np.asarray(load_container_pts(pts_txt, pts_ns)).size
+    assert np.all(np.diff(got) > 0)
+    # And it is emphatically not frame/fps: the SessionClock shifts frame 0 off video-file zero.
+    assert got[0] != 0.0
+
+
+def _cycle_info(**overrides):
+    info = {
+        "cycle": 2,
+        "raw_h5": "/data/raw_data_2026-07-24_12-02-14.h5",
+        "layout": "/data/layout.csv",
+        "animal": "ACG-26-3-1",
+        "restart": False,
+        "first_s": 0.0,
+        "span_s": 1000.0,
+        "lick_times": np.array([]),
+    }
+    info.update(overrides)
+    return info
+
+
+def _dlc_row(video="/videos/raw_data_2026-07-24_12-02-14.mp4", start_frame=10, end_frame=20,
+             tongue_rate=5.0, label="w000"):
+    return {"label": label, "video": video, "start_frame": start_frame,
+            "end_frame": end_frame, "tongue_rate": tongue_rate, }
+
+
+def test_build_dlc_rois_emits_one_row_per_window():
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # frame k at k/10 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(lick_times=np.array([1.5]))}
+    rows, skips = build_dlc_rois(
+        [_dlc_row(start_frame=10, end_frame=20), _dlc_row(start_frame=30, end_frame=41)],
+        cycles, sess_loader=lambda path: sess)
+
+    assert [r["category"] for r in rows] == ["dlc", "dlc"]
+    assert [r["rank"] for r in rows] == [0, 1]
+    assert rows[0]["start"] == 1.0 and rows[0]["end"] == 1.9
+    assert rows[1]["start"] == 3.0 and rows[1]["end"] == 4.0
+    assert rows[0]["center"] == (1.0 + 1.9) / 2.0
+    assert rows[0]["score"] == 5.0
+    # the lick at 1.5 s falls inside the first window only
+    assert rows[0]["n_licks_in_window"] == 1
+    assert rows[1]["n_licks_in_window"] == 0
+    assert rows[0]["animal"] == "ACG-26-3-1"
+    assert rows[0]["cycle"] == 2
+    assert rows[0]["filmed"] is True
+    assert rows[0]["raw_h5"] == "/data/raw_data_2026-07-24_12-02-14.h5"
+    assert rows[0]["layout"] == "/data/layout.csv"
+    assert sum(skips.values()) == 0
+
+
+def test_build_dlc_rois_skips_cfr_videos():
+    # The _cfr files are re-encodes; their frame indices are not the original container's ordinals,
+    # so a window built from them could be silently misaligned. Never emit one.
+    cycles = {"raw_data_2026-07-13_11-59-47": _cycle_info()}
+    rows, skips = build_dlc_rois(
+        [_dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4")],
+        cycles, sess_loader=lambda path: np.arange(1000, dtype=np.float64) / 10.0)
+    assert rows == []
+    assert skips["cfr_video"] == 1
+
+
+def test_build_dlc_rois_skips_video_with_no_matching_cycle():
+    rows, skips = build_dlc_rois(
+        [_dlc_row(video="/videos/raw_data_1999-01-01_00-00-00.mp4")],
+        {}, sess_loader=lambda path: np.arange(100, dtype=np.float64))
+    assert rows == []
+    assert skips["no_cycle"] == 1
+
+
+def test_build_dlc_rois_skips_video_without_frame_times():
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, skips = build_dlc_rois([_dlc_row(), _dlc_row(label="w001")], cycles,
+                                 sess_loader=lambda path: None)
+    assert rows == []
+    # counted per ROW, so the report says how much output was lost, not how many files were missing
+    assert skips["no_video_times"] == 2
+
+
+def test_build_dlc_rois_loads_frame_times_once_per_video():
+    calls = []
+
+    def loader(path):
+        calls.append(path)
+        return np.arange(1000, dtype=np.float64) / 10.0
+
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, _ = build_dlc_rois([_dlc_row(), _dlc_row(label="w001", start_frame=30, end_frame=40)],
+                             cycles, sess_loader=loader)
+    assert len(rows) == 2
+    assert calls == ["/data/raw_data_2026-07-24_12-02-14.h5"]
+
+
+def test_build_dlc_rois_skips_row_past_end_of_sidecar():
+    sess = np.arange(100, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, skips = build_dlc_rois([_dlc_row(start_frame=500, end_frame=510)], cycles,
+                                 sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["frame_out_of_range"] == 1
+
+
+def test_build_dlc_rois_clamps_and_drops_against_the_trace():
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # 0 .. 99.9 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=50.0)}
+    rows, skips = build_dlc_rois(
+        [_dlc_row(start_frame=495, end_frame=520),   # 49.5 .. 51.9 -> clamped to 50.0
+         _dlc_row(start_frame=700, end_frame=710, label="w001")],  # 70 .. 70.9 -> gone
+        cycles, sess_loader=lambda path: sess)
+    assert len(rows) == 1
+    assert rows[0]["start"] == 49.5
+    assert rows[0]["end"] == 50.0
+    assert skips["outside_trace"] == 1
+
+
+def test_build_dlc_rois_unfilmed_cycle_is_counted_as_no_trace():
+    # This is the state build_cycles_for_dlc actually emits for a cycle whose filmed animal cannot
+    # be resolved: no animal AND no trace bounds, because the bounds are read from the filmed
+    # animal's group. Every window is unrenderable -- there is no trace to draw beside it -- and the
+    # report must say so, not blame DLC by counting them as "outside the trace".
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(animal=None, first_s=0.0, span_s=0.0)}
+    rows, skips = build_dlc_rois([_dlc_row(), _dlc_row(label="w001")], cycles,
+                                 sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["no_trace"] == 2
+    assert skips["outside_trace"] == 0
+
+
+def test_build_dlc_rois_cycle_without_time_data_is_counted_as_no_trace():
+    # Same degenerate span from the other cause: the filmed animal resolved, but its group has no
+    # (or too short a) time_data, so first_s == span_s == 0.0.
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=0.0)}
+    rows, skips = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["no_trace"] == 1
+
+
+def test_build_dlc_rois_skip_counts_and_rows_account_for_every_input_row():
+    # The report is only trustworthy if nothing falls between the cracks: every input row is either
+    # a region or counted under exactly one reason.
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {
+        "raw_data_2026-07-24_12-02-14": _cycle_info(cycle=2, span_s=50.0),
+        "raw_data_2026-07-27_11-56-15": _cycle_info(
+            cycle=3, raw_h5="/data/raw_data_2026-07-27_11-56-15.h5", first_s=0.0, span_s=0.0),
+    }
+    dlc_rows = [
+        _dlc_row(),                                                        # a region
+        _dlc_row(start_frame=900, end_frame=910),                          # outside_trace
+        _dlc_row(start_frame=5000, end_frame=5010),                        # frame_out_of_range
+        _dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4"),     # cfr_video
+        _dlc_row(video="/videos/raw_data_1999-01-01_00-00-00.mp4"),         # no_cycle
+        _dlc_row(video="/videos/raw_data_2026-07-27_11-56-15.mp4"),         # no_trace
+    ]
+    rows, skips = build_dlc_rois(dlc_rows, cycles, sess_loader=lambda path: sess)
+    assert sum(skips.values()) + len(rows) == len(dlc_rows)
+    assert len(rows) == 1
+    assert skips == {"cfr_video": 1, "no_cycle": 1, "no_video_times": 0, "no_trace": 1,
+                     "frame_out_of_range": 1, "outside_trace": 1}
+
+
+def test_build_dlc_rois_negative_start_frame_is_counted_out_of_range():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, skips = build_dlc_rois([_dlc_row(start_frame=-10, end_frame=20)], cycles,
+                                 sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["frame_out_of_range"] == 1
+
+
+def test_print_dlc_skips_explains_every_reason(capsys):
+    import scripts.find_interesting_windows as fiw
+    print_dlc_skips({reason: 1 for reason in fiw.DLC_SKIP_REASONS}, n_rows=len(fiw.DLC_SKIP_REASONS))
+    out = capsys.readouterr().out
+    # Every reason gets a real sentence, never a bare reason key and never a KeyError.
+    for reason in fiw.DLC_SKIP_REASONS:
+        assert f"skipped 1: {reason}\n" not in out
+    assert out.count("skipped 1:") == len(fiw.DLC_SKIP_REASONS)
+
+
+def test_print_dlc_skips_survives_an_unknown_reason(capsys):
+    # The explanations table must not be a second, hand-maintained copy of DLC_SKIP_REASONS that
+    # raises KeyError the day a reason is added to one and not the other.
+    print_dlc_skips({"a_brand_new_reason": 2}, n_rows=5)
+    assert "a_brand_new_reason" in capsys.readouterr().out
+
+
+def test_print_dlc_skips_no_cycle_mentions_animals_filtering(capsys):
+    # --animals drops whole cycles in build_cycles_for_dlc, so their videos land in `no_cycle`. A
+    # message that only blames a missing cycle sends the reader hunting the combined file for a
+    # recording that is in fact there.
+    print_dlc_skips({"no_cycle": 1}, n_rows=1)
+    assert "--animals" in capsys.readouterr().out
+
+
+def test_build_dlc_rois_carries_the_restart_flag():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(restart=True)}
+    rows, _ = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
+    assert rows[0]["restart"] is True
+
+
+def test_build_dlc_rois_ranks_within_each_video():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {
+        "raw_data_2026-07-24_12-02-14": _cycle_info(cycle=2),
+        "raw_data_2026-07-27_11-56-15": _cycle_info(
+            cycle=3, raw_h5="/data/raw_data_2026-07-27_11-56-15.h5"),
+    }
+    rows, _ = build_dlc_rois(
+        [_dlc_row(video="/videos/raw_data_2026-07-24_12-02-14.mp4"),
+         _dlc_row(video="/videos/raw_data_2026-07-27_11-56-15.mp4"),
+         _dlc_row(video="/videos/raw_data_2026-07-27_11-56-15.mp4", start_frame=30, end_frame=40)],
+        cycles, sess_loader=lambda path: sess)
+    ranks = {(r["cycle"], r["rank"]) for r in rows}
+    assert ranks == {(2, 0), (3, 0), (3, 1)}
+
+
+def test_build_dlc_rois_emits_no_lick_or_climb_rows():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, _ = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
+    assert {r["category"] for r in rows} == {"dlc"}
+
+
+def test_dlc_row_builds_a_cropped_command_with_speed():
+    # Only "climb" gets --no-crop; a DLC clip is nose-at-sipper footage, where the crop is what
+    # makes the tongue visible.
+    row = {"animal": "ACG-26-3-1", "cycle": 2, "category": "dlc", "rank": 0,
+           "start": 10.0, "end": 12.0, "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv",
+           "restart": False}
+    lines = build_command(row, "clips", {}, "/data/combined.h5", speed=0.25)
+    assert len(lines) == 1
+    assert "--no-crop" not in lines[0]
+    assert "--speed 0.25" in lines[0]
+    assert "clips/ACG-26-3-1_c2_dlc0.mp4" in lines[0]
+
+
+def _write_combined(tmp_path, raw_h5_path):
+    """A minimal results_combined_*.h5: one animal, one cycle, provenance attrs, and the arrays
+    build_cycles_for_dlc reads."""
+    import h5py
+    combined = tmp_path / "combined.h5"
+    with h5py.File(combined, "w") as f:
+        g = f.create_group("ACG-26-3-1").create_group("0")
+        g.attrs["raw_h5"] = str(raw_h5_path)
+        g.attrs["layout"] = "/data/layout.csv"
+        g.create_dataset("time_data", data=np.linspace(0.0, 100.0, 1001))
+        g.create_dataset("lick_times", data=np.array([5.0, 6.0]))
+    return str(combined)
+
+
+def test_build_cycles_for_dlc_keys_on_raw_stem(tmp_path, monkeypatch):
+    import scripts.find_interesting_windows as fiw
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")  # never opened: both readers below are stubbed
+    combined = _write_combined(tmp_path, raw_h5)
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "ACG-26-3-1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+
+    cycles = build_cycles_for_dlc(combined)
+
+    assert list(cycles) == ["raw_data_2026-07-24_12-02-14"]
+    info = cycles["raw_data_2026-07-24_12-02-14"]
+    assert info["cycle"] == 0
+    assert info["animal"] == "ACG-26-3-1"
+    assert info["layout"] == "/data/layout.csv"
+    assert info["first_s"] == 0.0
+    assert info["span_s"] == 100.0
+    assert info["restart"] is False
+    np.testing.assert_allclose(info["lick_times"], [5.0, 6.0])
+
+
+def test_build_cycles_for_dlc_unfilmed_cycle_has_no_animal(tmp_path, monkeypatch):
+    import scripts.find_interesting_windows as fiw
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")
+    combined = _write_combined(tmp_path, raw_h5)
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: None)
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+
+    info = build_cycles_for_dlc(combined)["raw_data_2026-07-24_12-02-14"]
+    assert info["animal"] is None
+    # No filmed animal means no trace to draw either, so the bounds stay empty rather than
+    # borrowing some other animal's. The degenerate span is the state build_dlc_rois has to
+    # recognise as "no trace" -- pinning it here is what keeps the two ends in agreement.
+    assert info["lick_times"].size == 0
+    assert info["first_s"] == 0.0
+    assert info["span_s"] == 0.0
+
+
+def test_build_cycles_for_dlc_animals_filter_drops_other_cycles(tmp_path, monkeypatch):
+    import scripts.find_interesting_windows as fiw
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")
+    combined = _write_combined(tmp_path, raw_h5)
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "ACG-26-3-1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+
+    assert build_cycles_for_dlc(combined, animals=["SOMEONE-ELSE"]) == {}
+
+
+def test_main_dlc_mode_writes_csv_and_commands(tmp_path, monkeypatch):
+    # End-to-end through main(): a DLC CSV plus a combined file becomes a .sh of make_sync_video
+    # calls, with no lick/climb search anywhere in it.
+    import scripts.find_interesting_windows as fiw
+
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_h5.write_text("")
+    combined = _write_combined(tmp_path, raw_h5)
+    windows = tmp_path / "windows.csv"
+    windows.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,100,200,7.1\n"
+        "2,w001,/videos/raw_data_2026-07-13_11-59-47_cfr.mp4,100,200,7.1\n"
+    )
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "ACG-26-3-1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+    # frame k at k/100 s, so window [100, 200) is 1.0 .. 1.99 s
+    monkeypatch.setattr(fiw, "load_frame_session_times",
+                        lambda path: np.arange(5000, dtype=np.float64) / 100.0)
+
+    out_csv = tmp_path / "dlc_rois.csv"
+    out_sh = tmp_path / "make_dlc_clips.sh"
+    rc = fiw.main([combined, "--dlc-windows", str(windows),
+                   "--csv", str(out_csv), "--sh", str(out_sh),
+                   "--out-dir", str(tmp_path / "clips"), "--speed", "0.25"])
+    assert rc == 0
+
+    csv_text = out_csv.read_text()
+    assert "dlc" in csv_text
+    assert "climb" not in csv_text
+    assert ",lick," not in csv_text
+
+    sh_text = out_sh.read_text()
+    commands = [ln for ln in sh_text.splitlines() if ln.startswith("python make_sync_video.py")]
+    assert len(commands) == 1   # the _cfr row produced nothing
+    assert "--start 1.000 --end 1.990" in sh_text
+    assert "--speed 0.25" in sh_text
+    assert "--no-crop" not in sh_text
+    assert "--cycle 0" in sh_text
