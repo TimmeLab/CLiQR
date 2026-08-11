@@ -574,6 +574,84 @@ def load_frame_session_times(raw_h5_path):
         return None
 
 
+# Reasons a DLC row can fail to become a clip. Counted rather than printed per-row: a real CSV has
+# hundreds of rows, and the useful summary is "how many, and why", not a wall of warnings.
+DLC_SKIP_REASONS = ("cfr_video", "no_cycle", "no_video_times", "frame_out_of_range",
+                    "outside_trace")
+
+
+def build_dlc_rois(dlc_rows, cycles, sess_loader=None):
+    """Turn DLC window rows into regions of interest, plus a count of what was skipped and why.
+
+    `cycles` maps a recording's stem (`raw_data_YYYY-MM-DD_HH-MM-SS`) to everything we know about
+    that cycle: {cycle, raw_h5, layout, animal (the filmed one, or None), restart, first_s, span_s,
+    lick_times}. See `build_cycles_for_dlc`.
+
+    Rows are grouped by video so the (relatively expensive) per-frame session times are read once
+    per recording rather than once per window. `sess_loader` is injected so this is testable
+    without a recording on disk; it is resolved here rather than in the signature so that patching
+    the module-level `load_frame_session_times` also takes effect.
+
+    Ranks are assigned in CSV order within each video, which is the order find_dlc_windows.py
+    emitted them (ascending start frame).
+    """
+    sess_loader = sess_loader or load_frame_session_times
+    skips = {reason: 0 for reason in DLC_SKIP_REASONS}
+    rows = []
+
+    # Preserve CSV order within each video (dicts keep insertion order).
+    by_video = {}
+    for row in dlc_rows:
+        by_video.setdefault(str(row["video"]), []).append(row)
+
+    for video, video_rows in by_video.items():
+        stem, is_cfr = parse_dlc_video_stem(video)
+        if is_cfr:
+            # A CFR re-encode's frame k is not guaranteed to be the original container's frame k,
+            # so we cannot honestly place it on the session clock.
+            skips["cfr_video"] += len(video_rows)
+            continue
+        cycle = cycles.get(stem)
+        if cycle is None:
+            skips["no_cycle"] += len(video_rows)
+            continue
+        sess = sess_loader(cycle["raw_h5"])
+        if sess is None:
+            skips["no_video_times"] += len(video_rows)
+            continue
+
+        rank = 0
+        for row in video_rows:
+            window = frame_window_to_session(sess, row["start_frame"], row["end_frame"])
+            if window is None:
+                skips["frame_out_of_range"] += 1
+                continue
+            window = clamp_to_trace(window[0], window[1], cycle["first_s"], cycle["span_s"])
+            if window is None:
+                skips["outside_trace"] += 1
+                continue
+            start_s, end_s = window
+            animal = cycle["animal"]
+            rows.append({
+                "animal": animal or "",
+                "cycle": cycle["cycle"],
+                "category": "dlc",
+                "rank": rank,
+                "start": start_s,
+                "end": end_s,
+                "center": (start_s + end_s) / 2.0,
+                "score": float(row["tongue_rate"]),
+                "n_licks_in_window": count_licks_in_window(cycle["lick_times"], start_s, end_s),
+                "filmed": animal is not None,
+                "restart": cycle["restart"],
+                "raw_h5": cycle["raw_h5"] or "",
+                "layout": cycle["layout"] or "",
+            })
+            rank += 1
+
+    return rows, skips
+
+
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------

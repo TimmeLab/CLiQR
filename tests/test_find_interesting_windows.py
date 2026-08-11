@@ -22,6 +22,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     parse_dlc_video_stem, read_dlc_windows,
     frame_window_to_session, clamp_to_trace,
     load_frame_session_times,
+    build_dlc_rois,
 )
 
 
@@ -447,3 +448,165 @@ def test_load_frame_session_times_missing_pts_sidecar_returns_none(tmp_path):
     with h5py.File(h5_path, "w") as f:
         f.create_group("board0")
     assert load_frame_session_times(str(h5_path)) is None
+
+
+def _cycle_info(**overrides):
+    info = {
+        "cycle": 2,
+        "raw_h5": "/data/raw_data_2026-07-24_12-02-14.h5",
+        "layout": "/data/layout.csv",
+        "animal": "ACG-26-3-1",
+        "restart": False,
+        "first_s": 0.0,
+        "span_s": 1000.0,
+        "lick_times": np.array([]),
+    }
+    info.update(overrides)
+    return info
+
+
+def _dlc_row(video="/videos/raw_data_2026-07-24_12-02-14.mp4", start_frame=10, end_frame=20,
+             tongue_rate=5.0, label="w000"):
+    return {"label": label, "video": video, "start_frame": start_frame,
+            "end_frame": end_frame, "tongue_rate": tongue_rate, }
+
+
+def test_build_dlc_rois_emits_one_row_per_window():
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # frame k at k/10 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(lick_times=np.array([1.5]))}
+    rows, skips = build_dlc_rois(
+        [_dlc_row(start_frame=10, end_frame=20), _dlc_row(start_frame=30, end_frame=41)],
+        cycles, sess_loader=lambda path: sess)
+
+    assert [r["category"] for r in rows] == ["dlc", "dlc"]
+    assert [r["rank"] for r in rows] == [0, 1]
+    assert rows[0]["start"] == 1.0 and rows[0]["end"] == 1.9
+    assert rows[1]["start"] == 3.0 and rows[1]["end"] == 4.0
+    assert rows[0]["center"] == (1.0 + 1.9) / 2.0
+    assert rows[0]["score"] == 5.0
+    # the lick at 1.5 s falls inside the first window only
+    assert rows[0]["n_licks_in_window"] == 1
+    assert rows[1]["n_licks_in_window"] == 0
+    assert rows[0]["animal"] == "ACG-26-3-1"
+    assert rows[0]["cycle"] == 2
+    assert rows[0]["filmed"] is True
+    assert rows[0]["raw_h5"] == "/data/raw_data_2026-07-24_12-02-14.h5"
+    assert rows[0]["layout"] == "/data/layout.csv"
+    assert sum(skips.values()) == 0
+
+
+def test_build_dlc_rois_skips_cfr_videos():
+    # The _cfr files are re-encodes; their frame indices are not the original container's ordinals,
+    # so a window built from them could be silently misaligned. Never emit one.
+    cycles = {"raw_data_2026-07-13_11-59-47": _cycle_info()}
+    rows, skips = build_dlc_rois(
+        [_dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4")],
+        cycles, sess_loader=lambda path: np.arange(1000, dtype=np.float64) / 10.0)
+    assert rows == []
+    assert skips["cfr_video"] == 1
+
+
+def test_build_dlc_rois_skips_video_with_no_matching_cycle():
+    rows, skips = build_dlc_rois(
+        [_dlc_row(video="/videos/raw_data_1999-01-01_00-00-00.mp4")],
+        {}, sess_loader=lambda path: np.arange(100, dtype=np.float64))
+    assert rows == []
+    assert skips["no_cycle"] == 1
+
+
+def test_build_dlc_rois_skips_video_without_frame_times():
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, skips = build_dlc_rois([_dlc_row(), _dlc_row(label="w001")], cycles,
+                                 sess_loader=lambda path: None)
+    assert rows == []
+    # counted per ROW, so the report says how much output was lost, not how many files were missing
+    assert skips["no_video_times"] == 2
+
+
+def test_build_dlc_rois_loads_frame_times_once_per_video():
+    calls = []
+
+    def loader(path):
+        calls.append(path)
+        return np.arange(1000, dtype=np.float64) / 10.0
+
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, _ = build_dlc_rois([_dlc_row(), _dlc_row(label="w001", start_frame=30, end_frame=40)],
+                             cycles, sess_loader=loader)
+    assert len(rows) == 2
+    assert calls == ["/data/raw_data_2026-07-24_12-02-14.h5"]
+
+
+def test_build_dlc_rois_skips_row_past_end_of_sidecar():
+    sess = np.arange(100, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, skips = build_dlc_rois([_dlc_row(start_frame=500, end_frame=510)], cycles,
+                                 sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["frame_out_of_range"] == 1
+
+
+def test_build_dlc_rois_clamps_and_drops_against_the_trace():
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # 0 .. 99.9 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=50.0)}
+    rows, skips = build_dlc_rois(
+        [_dlc_row(start_frame=495, end_frame=520),   # 49.5 .. 51.9 -> clamped to 50.0
+         _dlc_row(start_frame=700, end_frame=710, label="w001")],  # 70 .. 70.9 -> gone
+        cycles, sess_loader=lambda path: sess)
+    assert len(rows) == 1
+    assert rows[0]["start"] == 49.5
+    assert rows[0]["end"] == 50.0
+    assert skips["outside_trace"] == 1
+
+
+def test_build_dlc_rois_unfilmed_cycle_produces_unfilmed_rows():
+    # No filmed animal (layout doesn't name the video sensor): the row is still reported in the
+    # CSV, but write_shell_script will not emit a command for it.
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(animal=None)}
+    rows, _ = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
+    assert rows[0]["filmed"] is False
+    assert rows[0]["animal"] == ""
+
+
+def test_build_dlc_rois_carries_the_restart_flag():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(restart=True)}
+    rows, _ = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
+    assert rows[0]["restart"] is True
+
+
+def test_build_dlc_rois_ranks_within_each_video():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {
+        "raw_data_2026-07-24_12-02-14": _cycle_info(cycle=2),
+        "raw_data_2026-07-27_11-56-15": _cycle_info(
+            cycle=3, raw_h5="/data/raw_data_2026-07-27_11-56-15.h5"),
+    }
+    rows, _ = build_dlc_rois(
+        [_dlc_row(video="/videos/raw_data_2026-07-24_12-02-14.mp4"),
+         _dlc_row(video="/videos/raw_data_2026-07-27_11-56-15.mp4"),
+         _dlc_row(video="/videos/raw_data_2026-07-27_11-56-15.mp4", start_frame=30, end_frame=40)],
+        cycles, sess_loader=lambda path: sess)
+    ranks = {(r["cycle"], r["rank"]) for r in rows}
+    assert ranks == {(2, 0), (3, 0), (3, 1)}
+
+
+def test_build_dlc_rois_emits_no_lick_or_climb_rows():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, _ = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
+    assert {r["category"] for r in rows} == {"dlc"}
+
+
+def test_dlc_row_builds_a_cropped_command_with_speed():
+    # Only "climb" gets --no-crop; a DLC clip is nose-at-sipper footage, where the crop is what
+    # makes the tongue visible.
+    row = {"animal": "ACG-26-3-1", "cycle": 2, "category": "dlc", "rank": 0,
+           "start": 10.0, "end": 12.0, "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv",
+           "restart": False}
+    lines = build_command(row, "clips", {}, "/data/combined.h5", speed=0.25)
+    assert len(lines) == 1
+    assert "--no-crop" not in lines[0]
+    assert "--speed 0.25" in lines[0]
+    assert "clips/ACG-26-3-1_c2_dlc0.mp4" in lines[0]
