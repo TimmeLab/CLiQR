@@ -21,6 +21,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     is_control,
     parse_dlc_video_stem, read_dlc_windows,
     frame_window_to_session, clamp_to_trace,
+    load_frame_session_times,
 )
 
 
@@ -427,3 +428,22 @@ def test_clamp_to_trace_returns_none_when_disjoint():
 def test_clamp_to_trace_returns_none_when_clamped_window_is_empty():
     # Touching the edge leaves no time to render.
     assert clamp_to_trace(100.0, 110.0, 0.0, 100.0) is None
+
+
+def test_load_frame_session_times_missing_h5_returns_none():
+    # Provenance pointing at a file that isn't on this machine is the normal case for an older
+    # combined file, so it must degrade to "no commands for this video", never to a traceback.
+    assert load_frame_session_times("/nonexistent/raw_data_2026-01-01_00-00-00.h5") is None
+
+
+def test_load_frame_session_times_none_path_returns_none():
+    assert load_frame_session_times(None) is None
+
+
+def test_load_frame_session_times_missing_pts_sidecar_returns_none(tmp_path):
+    # A raw .h5 with no video sensor at all: read_video_anchor raises, and we swallow it.
+    import h5py
+    h5_path = tmp_path / "raw_data_2026-01-01_00-00-00.h5"
+    with h5py.File(h5_path, "w") as f:
+        f.create_group("board0")
+    assert load_frame_session_times(str(h5_path)) is None

@@ -95,7 +95,10 @@ if _REPO_ROOT not in sys.path:
 
 # These primitives already know how the recordings are laid out; reuse them rather than
 # re-implementing the (fiddly) video-sensor / cycle-suffix logic here.
-from video.trimcrop import find_video_sensor, read_video_anchor, _resolve_cycle  # noqa: E402
+from video.trimcrop import (  # noqa: E402
+    find_video_sensor, read_video_anchor, _resolve_cycle,
+    frame_session_times, resolve_paths, session_clock,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +542,36 @@ def clamp_to_trace(start_s, end_s, first_s, span_s):
     if end_s <= start_s:
         return None
     return start_s, end_s
+
+
+def load_frame_session_times(raw_h5_path):
+    """Session time of every container frame of a recording, or None if we cannot get it.
+
+    This is the same three-step the renderer does: read the video anchor out of the raw .h5, build
+    the SessionClock (bookmark latency + two-bookmark drift slope), and time every frame of the
+    PTS sidecar with it. Returning None -- rather than raising -- for a missing raw file, missing
+    video sensor, or missing sidecar is deliberate: a combined file routinely names recordings that
+    are not on this machine, and those videos simply produce no clips.
+    """
+    if not raw_h5_path or not os.path.exists(raw_h5_path):
+        return None
+    # Lazy: make_sync_video drags in matplotlib/imageio/pandas, which the trace-search mode has no
+    # use for. It owns the "which sidecar times container frames" rule (the Pi's encoded-frame
+    # sidecar when present, else the capture sidecar); reuse it so a window computed here always
+    # selects the frames the renderer will place.
+    from make_sync_video import load_container_pts
+    try:
+        anchor = read_video_anchor(raw_h5_path)
+        _, pts_txt = resolve_paths(raw_h5_path, anchor)
+        if not os.path.exists(pts_txt):
+            return None
+        pts_ns = np.loadtxt(pts_txt, dtype=np.int64)
+        if np.asarray(pts_ns).size < 2:
+            return None
+        clock = session_clock(anchor, pts_ns)
+        return frame_session_times(clock, load_container_pts(pts_txt, pts_ns))
+    except (ValueError, KeyError, OSError, IndexError):
+        return None
 
 
 # ---------------------------------------------------------------------------
