@@ -707,7 +707,8 @@ def test_main_dlc_mode_writes_csv_and_commands(tmp_path, monkeypatch):
     assert ",lick," not in csv_text
 
     sh_text = out_sh.read_text()
-    assert sh_text.count("make_sync_video.py") == 1     # the _cfr row produced nothing
+    commands = [ln for ln in sh_text.splitlines() if ln.startswith("python make_sync_video.py")]
+    assert len(commands) == 1   # the _cfr row produced nothing
     assert "--start 1.000 --end 1.990" in sh_text
     assert "--speed 0.25" in sh_text
     assert "--no-crop" not in sh_text
