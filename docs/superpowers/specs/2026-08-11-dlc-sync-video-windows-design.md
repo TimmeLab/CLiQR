@@ -113,10 +113,15 @@ Nothing is silently dropped: every skip is counted by reason and the counts are 
 | window entirely outside the cycle's `time_data` span | single row | Nothing to plot. |
 | window partially outside that span | single row, clamped | Keeps the clip inside the trace, same as the trace-search path's `clip_window`. |
 
-One more group-level skip: if the cycle's filmed animal cannot be resolved (`resolve_filmed_animal`
-returns `None`, e.g. the layout does not name the video sensor), the rows are written to the CSV
-with `filmed` false and an empty `animal`, and get no command -- the existing `write_shell_script`
-rule, which only emits commands for filmed rows with full provenance.
+One more group-level skip, `no_trace`: if the cycle has no trace to draw -- because its filmed
+animal cannot be resolved (`resolve_filmed_animal` returns `None`, e.g. the layout does not name
+the video sensor), or that animal's group has no usable `time_data` -- the whole video's rows are
+skipped under their own reason.
+
+That reason exists to keep the report honest. Such a cycle carries `first_s == span_s == 0.0`, so
+without it every one of its windows would fail the clamp and be counted as "the window falls
+outside the cycle's trace" -- pointing the reader at DeepLabCut when the actual fault is animal or
+layout resolution.
 
 ## Output
 
@@ -142,10 +147,12 @@ want, where the crop is what makes the tongue visible. Only `category == "climb"
 which DLC mode never produces. Output names come from the existing `build_command`:
 `{animal}_c{cycle}_dlc{rank}.mp4`.
 
-The restart-recording WARNING comment and `--offset CYCLE=SECONDS` still apply, unchanged. (A DLC
-window's start/end are derived from the video clock, which is already `make_sync_video`'s
-reference, so the restart offset should not affect the window itself -- but it does affect the
-trace panel read from the combined file, so the warning stays.)
+The restart-recording WARNING comment still fires, but its ADVICE differs by mode. A DLC window's
+start/end are derived from the video clock, which is already `make_sync_video`'s reference, so
+`--offset CYCLE=SECONDS` is the wrong remedy here: it shifts start and end together and would move
+the clip off the DLC window entirely, while doing nothing about a trace/video mismatch. The DLC
+warning therefore points at `make_sync_video --sync-offset` instead. Trace mode's wording is
+untouched.
 
 ## Testing
 
