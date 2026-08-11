@@ -25,6 +25,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     load_frame_session_times,
     build_dlc_rois,
     build_cycles_for_dlc,
+    print_dlc_skips,
 )
 
 
@@ -675,14 +676,86 @@ def test_build_dlc_rois_clamps_and_drops_against_the_trace():
     assert skips["outside_trace"] == 1
 
 
-def test_build_dlc_rois_unfilmed_cycle_produces_unfilmed_rows():
-    # No filmed animal (layout doesn't name the video sensor): the row is still reported in the
-    # CSV, but write_shell_script will not emit a command for it.
+def test_build_dlc_rois_unfilmed_cycle_is_counted_as_no_trace():
+    # This is the state build_cycles_for_dlc actually emits for a cycle whose filmed animal cannot
+    # be resolved: no animal AND no trace bounds, because the bounds are read from the filmed
+    # animal's group. Every window is unrenderable -- there is no trace to draw beside it -- and the
+    # report must say so, not blame DLC by counting them as "outside the trace".
     sess = np.arange(1000, dtype=np.float64) / 10.0
-    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(animal=None)}
-    rows, _ = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
-    assert rows[0]["filmed"] is False
-    assert rows[0]["animal"] == ""
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(animal=None, first_s=0.0, span_s=0.0)}
+    rows, skips = build_dlc_rois([_dlc_row(), _dlc_row(label="w001")], cycles,
+                                 sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["no_trace"] == 2
+    assert skips["outside_trace"] == 0
+
+
+def test_build_dlc_rois_cycle_without_time_data_is_counted_as_no_trace():
+    # Same degenerate span from the other cause: the filmed animal resolved, but its group has no
+    # (or too short a) time_data, so first_s == span_s == 0.0.
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=0.0)}
+    rows, skips = build_dlc_rois([_dlc_row()], cycles, sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["no_trace"] == 1
+
+
+def test_build_dlc_rois_skip_counts_and_rows_account_for_every_input_row():
+    # The report is only trustworthy if nothing falls between the cracks: every input row is either
+    # a region or counted under exactly one reason.
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {
+        "raw_data_2026-07-24_12-02-14": _cycle_info(cycle=2, span_s=50.0),
+        "raw_data_2026-07-27_11-56-15": _cycle_info(
+            cycle=3, raw_h5="/data/raw_data_2026-07-27_11-56-15.h5", first_s=0.0, span_s=0.0),
+    }
+    dlc_rows = [
+        _dlc_row(),                                                        # a region
+        _dlc_row(start_frame=900, end_frame=910),                          # outside_trace
+        _dlc_row(start_frame=5000, end_frame=5010),                        # frame_out_of_range
+        _dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4"),     # cfr_video
+        _dlc_row(video="/videos/raw_data_1999-01-01_00-00-00.mp4"),         # no_cycle
+        _dlc_row(video="/videos/raw_data_2026-07-27_11-56-15.mp4"),         # no_trace
+    ]
+    rows, skips = build_dlc_rois(dlc_rows, cycles, sess_loader=lambda path: sess)
+    assert sum(skips.values()) + len(rows) == len(dlc_rows)
+    assert len(rows) == 1
+    assert skips == {"cfr_video": 1, "no_cycle": 1, "no_video_times": 0, "no_trace": 1,
+                     "frame_out_of_range": 1, "outside_trace": 1}
+
+
+def test_build_dlc_rois_negative_start_frame_is_counted_out_of_range():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    rows, skips = build_dlc_rois([_dlc_row(start_frame=-10, end_frame=20)], cycles,
+                                 sess_loader=lambda path: sess)
+    assert rows == []
+    assert skips["frame_out_of_range"] == 1
+
+
+def test_print_dlc_skips_explains_every_reason(capsys):
+    import scripts.find_interesting_windows as fiw
+    print_dlc_skips({reason: 1 for reason in fiw.DLC_SKIP_REASONS}, n_rows=len(fiw.DLC_SKIP_REASONS))
+    out = capsys.readouterr().out
+    # Every reason gets a real sentence, never a bare reason key and never a KeyError.
+    for reason in fiw.DLC_SKIP_REASONS:
+        assert f"skipped 1: {reason}\n" not in out
+    assert out.count("skipped 1:") == len(fiw.DLC_SKIP_REASONS)
+
+
+def test_print_dlc_skips_survives_an_unknown_reason(capsys):
+    # The explanations table must not be a second, hand-maintained copy of DLC_SKIP_REASONS that
+    # raises KeyError the day a reason is added to one and not the other.
+    print_dlc_skips({"a_brand_new_reason": 2}, n_rows=5)
+    assert "a_brand_new_reason" in capsys.readouterr().out
+
+
+def test_print_dlc_skips_no_cycle_mentions_animals_filtering(capsys):
+    # --animals drops whole cycles in build_cycles_for_dlc, so their videos land in `no_cycle`. A
+    # message that only blames a missing cycle sends the reader hunting the combined file for a
+    # recording that is in fact there.
+    print_dlc_skips({"no_cycle": 1}, n_rows=1)
+    assert "--animals" in capsys.readouterr().out
 
 
 def test_build_dlc_rois_carries_the_restart_flag():
@@ -774,8 +847,11 @@ def test_build_cycles_for_dlc_unfilmed_cycle_has_no_animal(tmp_path, monkeypatch
     info = build_cycles_for_dlc(combined)["raw_data_2026-07-24_12-02-14"]
     assert info["animal"] is None
     # No filmed animal means no trace to draw either, so the bounds stay empty rather than
-    # borrowing some other animal's.
+    # borrowing some other animal's. The degenerate span is the state build_dlc_rois has to
+    # recognise as "no trace" -- pinning it here is what keeps the two ends in agreement.
     assert info["lick_times"].size == 0
+    assert info["first_s"] == 0.0
+    assert info["span_s"] == 0.0
 
 
 def test_build_cycles_for_dlc_animals_filter_drops_other_cycles(tmp_path, monkeypatch):

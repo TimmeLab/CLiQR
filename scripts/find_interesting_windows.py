@@ -598,8 +598,8 @@ def load_frame_session_times(raw_h5_path):
 
 # Reasons a DLC row can fail to become a clip. Counted rather than printed per-row: a real CSV has
 # hundreds of rows, and the useful summary is "how many, and why", not a wall of warnings.
-DLC_SKIP_REASONS = ("cfr_video", "no_cycle", "no_video_times", "frame_out_of_range",
-                    "outside_trace")
+DLC_SKIP_REASONS = ("cfr_video", "no_cycle", "no_video_times", "no_trace",
+                    "frame_out_of_range", "outside_trace")
 
 
 def build_dlc_rois(dlc_rows, cycles, sess_loader=None):
@@ -636,6 +636,14 @@ def build_dlc_rois(dlc_rows, cycles, sess_loader=None):
         cycle = cycles.get(stem)
         if cycle is None:
             skips["no_cycle"] += len(video_rows)
+            continue
+        if cycle["span_s"] <= cycle["first_s"]:
+            # The cycle has no trace: `build_cycles_for_dlc` leaves the bounds at 0.0 when the
+            # filmed animal cannot be resolved (so there is no group to read `time_data` from) or
+            # when that group has no usable `time_data`. Every window would then fail the clamp
+            # below, which would report the whole video as "outside the trace" and send the reader
+            # after DLC when the fault is animal/layout resolution. Say what is actually wrong.
+            skips["no_trace"] += len(video_rows)
             continue
         sess = sess_loader(cycle["raw_h5"])
         if sess is None:
@@ -884,16 +892,21 @@ def print_dlc_skips(skips, n_rows):
     explanations = {
         "cfr_video": "video is a _cfr re-encode (frame indices are not the original container's; "
                      "re-run DLC on the original recording)",
-        "no_cycle": "no cycle in the combined file matches the video's recording",
+        "no_cycle": "no cycle in the combined file matches the video's recording (or that cycle "
+                    "was filtered out by --animals)",
         "no_video_times": "the recording's video or PTS sidecar is missing on this machine",
-        "frame_out_of_range": "start_frame is past the end of the PTS sidecar",
+        "no_trace": "the cycle has no trace for the filmed animal (the layout does not name the "
+                    "video sensor, or that animal's group has no time_data)",
+        "frame_out_of_range": "start_frame is negative or past the end of the PTS sidecar",
         "outside_trace": "the window falls outside the cycle's trace",
     }
     total = sum(skips.values())
     print(f"DLC mode: read {n_rows} window(s); {n_rows - total} became regions of interest.")
     for reason, count in skips.items():
         if count:
-            print(f"  skipped {count}: {explanations[reason]}")
+            # .get, not [], so adding a reason to DLC_SKIP_REASONS and forgetting it here degrades
+            # to a terse-but-correct line instead of a KeyError in the middle of the report.
+            print(f"  skipped {count}: {explanations.get(reason, reason)}")
 
 
 # ---------------------------------------------------------------------------
