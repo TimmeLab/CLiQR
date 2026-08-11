@@ -273,6 +273,26 @@ def test_build_command_restart_warns_without_offset():
     assert "clips/A1_c0_lick0.mp4" in text
     # The command reads the trace from the combined file (fast path), not by re-running filter_data.
     assert "--combined-h5 results_combined.h5 --cycle 0" in text
+    # A trace-search window is in the COMBINED FILE's time base, so re-running this script with
+    # --offset (which shifts the window itself) is the right remedy. This wording is what the
+    # generated make_clips.sh carries; it must not drift.
+    assert "--offset 0=<seconds>" in text
+
+
+def test_build_command_dlc_restart_warning_recommends_sync_offset():
+    # A DLC window is already expressed in make_sync_video's own anchor reference (it came from the
+    # video clock), so --offset would slide the clip OFF the window DLC selected while doing nothing
+    # about a trace/video mismatch. The only correct remedy in DLC mode is --sync-offset.
+    row = {"animal": "A1", "cycle": 0, "category": "dlc", "rank": 0,
+           "start": 100.0, "end": 112.0, "restart": True,
+           "raw_h5": "data/raw_07-22.h5", "layout": "data/layout.csv"}
+    lines = build_command(row, out_dir="clips", offsets={}, combined_h5="results_combined.h5")
+    text = "\n".join(lines)
+    assert "WARNING" in text
+    assert "--sync-offset" in text
+    assert "--offset 0=" not in text
+    # The window itself is untouched by the warning.
+    assert "--start 100.000 --end 112.000" in text
 
 
 def test_build_command_offset_shifts_and_silences_warning():

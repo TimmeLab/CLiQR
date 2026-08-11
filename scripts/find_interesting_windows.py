@@ -63,8 +63,11 @@ a known history of the two references disagreeing by a fixed offset (~280 s was 
 2026-07-22 recording). We do NOT silently shift times to "fix" this, because getting the shift
 subtly wrong would misalign every clip. Instead, for any cycle whose raw file is a restart
 recording, the emitted command is preceded by a loud WARNING comment telling you to verify the
-alignment and, if needed, pass `--offset` to make_sync_video (or re-run this script with
-`--offset <cycle>=<seconds>`), which adds the offset to that cycle's start/end.
+alignment and, if needed, re-run this script with `--offset <cycle>=<seconds>`, which adds the
+offset to that cycle's start/end. In DLC mode the warning says something different, because the
+remedy is different: a DLC window is already expressed in make_sync_video's own anchor reference, so
+`--offset` would slide the clip off the frames DLC selected; there the fix is `--sync-offset` on
+make_sync_video, which moves the trace against the video instead of moving the window.
 
 Provenance
 ----------
@@ -777,8 +780,19 @@ def build_command(row, out_dir, offsets, combined_h5, speed=1.0):
                      f"recording;")
         lines.append(f"#   the combined-file time base may be offset from make_sync_video's "
                      f"Start-bookmark reference.")
-        lines.append(f"#   Verify alignment; if off, re-run with --offset {cycle}=<seconds> "
-                     f"(or pass --sync-offset to make_sync_video).")
+        if row["category"] == "dlc":
+            # A DLC window is ALREADY in make_sync_video's anchor reference: it was converted from
+            # container frames with the renderer's own SessionClock. --offset would shift start and
+            # end together, sliding the clip off the frames DLC selected, and would not touch the
+            # trace/video mismatch this warning is about. --sync-offset (which shifts the trace
+            # against the video, not the window) is the only correct remedy here.
+            lines.append(f"#   Verify alignment; if off, pass --sync-offset <seconds> to "
+                         f"make_sync_video. Do NOT use --offset: this window is already in "
+                         f"make_sync_video's reference, so it would move the clip off the DLC "
+                         f"window.")
+        else:
+            lines.append(f"#   Verify alignment; if off, re-run with --offset {cycle}=<seconds> "
+                         f"(or pass --sync-offset to make_sync_video).")
 
     out_name = f"{row['animal']}_c{cycle}_{row['category']}{row['rank']}.mp4"
     out_path = os.path.join(out_dir, out_name)
