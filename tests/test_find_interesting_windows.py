@@ -4,6 +4,7 @@ The HDF5 reading, provenance resolution, and shell-script writing are exercised 
 recordings; only the deterministic, self-contained helpers (variance, masking, selection, window
 construction, command formatting) are unit-tested here.
 """
+import argparse
 import os
 import sys
 
@@ -28,6 +29,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     print_dlc_skips,
     DLC_EXCLUDE_SKIP_REASONS,
     print_dlc_exclude_skips,
+    run_dlc_exclude_mode,
 )
 
 
@@ -1153,3 +1155,69 @@ def test_print_dlc_exclude_skips_reports_counts(capsys):
     assert "3 cycle(s)" in out
     assert "no DLC windows" in out          # the no_dlc_video explanation
     assert "7" in out                        # bouts DLC agrees about
+
+
+def test_run_dlc_exclude_mode_no_dlc_video_accounting(tmp_path, monkeypatch):
+    # This is the correctness crux the plan calls out: a cycle the CSV never mentions must be
+    # counted no_dlc_video and emit nothing, while a cycle the CSV DOES cover must never be
+    # double-counted under no_dlc_video (a video that fails for some other reason is already
+    # counted for that reason inside dlc_exclusion_spans). Every cycle in the file must land under
+    # exactly one bucket -- either it contributes to n_cycles_used or it is counted as a skip --
+    # never neither, or the report would silently under-count what it searched.
+    import h5py
+    import scripts.find_interesting_windows as fiw
+
+    raw_mentioned = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_unmentioned = tmp_path / "raw_data_2026-07-25_12-02-14.h5"
+
+    combined_path = tmp_path / "combined.h5"
+    time_data = np.arange(0.0, 400.0, 0.01)
+    with h5py.File(combined_path, "w") as f:
+        animal = f.create_group("A1")
+        # Two cycles, two different raw_h5 stems -- one the DLC CSV names, one it never mentions.
+        for cycle_key, raw_h5 in (("0", raw_mentioned), ("1", raw_unmentioned)):
+            g = animal.create_group(cycle_key)
+            g.attrs["raw_h5"] = str(raw_h5)
+            g.attrs["layout"] = "/data/layout.csv"
+            g.create_dataset("time_data", data=time_data)
+            g.create_dataset("cap_data", data=np.zeros_like(time_data))
+            g.create_dataset("bout_start_times", data=np.array([300.0]))
+            g.create_dataset("bout_durations", data=np.array([4.0]))
+            g.create_dataset("bout_lick_counts", data=np.array([20]))
+            g.create_dataset("lick_times", data=np.linspace(300.0, 304.0, 20))
+
+    windows_csv = tmp_path / "windows.csv"
+    windows_csv.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,9900,9910,7.1\n"
+        # raw_data_2026-07-25_12-02-14 is deliberately never mentioned anywhere in the CSV.
+    )
+
+    # Filmed-animal resolution and restart detection both read the raw .h5 off disk (the video
+    # sensor and the layout CSV), and this fixture has no real recording behind raw_mentioned /
+    # raw_unmentioned for them to read. Neither seam is part of the no_dlc_video accounting under
+    # test, so both are stubbed the same way the existing build_cycles_for_dlc tests stub them.
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "A1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+    # frame k at k/100 s. dlc_exclusion_spans resolves load_frame_session_times as a module
+    # attribute at call time (not a default-arg capture), so patching it here takes effect without
+    # needing a real video/PTS sidecar on disk.
+    monkeypatch.setattr(fiw, "load_frame_session_times",
+                        lambda path: np.arange(40000, dtype=np.float64) / 100.0)
+
+    args = argparse.Namespace(
+        combined_h5=str(combined_path), dlc_exclude=str(windows_csv), dlc_guard=1.0,
+        n_lick=3, roi_seconds=12.0, lick_pad=2.0, animals=None,
+    )
+    rows, skips, n_cycles_used = run_dlc_exclude_mode(args, raw_map={})
+
+    # The unmentioned cycle: counted no_dlc_video exactly once, contributes no rows.
+    assert skips["no_dlc_video"] == 1
+    assert all(r["raw_h5"] != str(raw_unmentioned) for r in rows)
+
+    # The mentioned cycle: usable, so NOT counted no_dlc_video, and it did contribute.
+    assert n_cycles_used == 1
+    assert rows and all(r["raw_h5"] == str(raw_mentioned) for r in rows)
+
+    # Every one of the 2 cycles is accounted for -- none vanished under no reason at all.
+    assert n_cycles_used + skips["no_dlc_video"] == 2

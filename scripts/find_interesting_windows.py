@@ -1076,6 +1076,10 @@ def run_dlc_exclude_mode(args, raw_map):
         "dlc_guard": args.dlc_guard,
     }
 
+    # Computed once, not per cycle: every cycle whose entry is None re-checks membership in this
+    # set, and rebuilding it per cycle is O(cycles x rows) where O(rows) suffices.
+    mentioned_stems = {parse_dlc_video_stem(r["video"])[0] for r in dlc_rows}
+
     all_rows = []
     n_cycles_used = 0
     with h5py.File(args.combined_h5, "r") as combined:
@@ -1084,7 +1088,7 @@ def run_dlc_exclude_mode(args, raw_map):
             if entry is None:
                 # Either the video was unusable (already counted by reason) or the CSV never
                 # mentions this recording at all.
-                if stem not in {parse_dlc_video_stem(r["video"])[0] for r in dlc_rows}:
+                if stem not in mentioned_stems:
                     skips["no_dlc_video"] += 1
                 continue
 
