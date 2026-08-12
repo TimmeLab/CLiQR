@@ -1159,23 +1159,29 @@ def test_print_dlc_exclude_skips_reports_counts(capsys):
 
 def test_run_dlc_exclude_mode_no_dlc_video_accounting(tmp_path, monkeypatch):
     # This is the correctness crux the plan calls out: a cycle the CSV never mentions must be
-    # counted no_dlc_video and emit nothing, while a cycle the CSV DOES cover must never be
-    # double-counted under no_dlc_video (a video that fails for some other reason is already
-    # counted for that reason inside dlc_exclusion_spans). Every cycle in the file must land under
-    # exactly one bucket -- either it contributes to n_cycles_used or it is counted as a skip --
-    # never neither, or the report would silently under-count what it searched.
+    # counted no_dlc_video and emit nothing, while a cycle the CSV DOES mention -- but that fails
+    # for some other reason -- must never ALSO be counted no_dlc_video (that reason is already
+    # counted inside dlc_exclusion_spans). Three cycles cover all of it:
+    #   - "mentioned": usable DLC evidence -> contributes rows, not skipped at all.
+    #   - "unmentioned": no CSV row names it -> the guard's true-branch, no_dlc_video.
+    #   - "mentioned_but_cfr": a CSV row DOES name it, but only via a _cfr re-encode, so
+    #     dlc_exclusion_spans counts it cfr_video and it never gets a spans_by_stem entry -- this
+    #     is the guard's FALSE-branch, and the only fixture shape that can catch a guard that has
+    #     been deleted (a fixture without this cycle passes identically whether the guard runs or
+    #     not, because every entry-is-None cycle would then also be a genuinely-unmentioned one).
     import h5py
     import scripts.find_interesting_windows as fiw
 
     raw_mentioned = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
     raw_unmentioned = tmp_path / "raw_data_2026-07-25_12-02-14.h5"
+    raw_cfr = tmp_path / "raw_data_2026-07-26_12-02-14.h5"
 
     combined_path = tmp_path / "combined.h5"
     time_data = np.arange(0.0, 400.0, 0.01)
     with h5py.File(combined_path, "w") as f:
         animal = f.create_group("A1")
-        # Two cycles, two different raw_h5 stems -- one the DLC CSV names, one it never mentions.
-        for cycle_key, raw_h5 in (("0", raw_mentioned), ("1", raw_unmentioned)):
+        for cycle_key, raw_h5 in (("0", raw_mentioned), ("1", raw_unmentioned),
+                                  ("2", raw_cfr)):
             g = animal.create_group(cycle_key)
             g.attrs["raw_h5"] = str(raw_h5)
             g.attrs["layout"] = "/data/layout.csv"
@@ -1190,18 +1196,21 @@ def test_run_dlc_exclude_mode_no_dlc_video_accounting(tmp_path, monkeypatch):
     windows_csv.write_text(
         "task_id,label,video,start_frame,end_frame,tongue_rate\n"
         "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,9900,9910,7.1\n"
+        "2,w001,/videos/raw_data_2026-07-26_12-02-14_cfr.mp4,100,110,7.1\n"
         # raw_data_2026-07-25_12-02-14 is deliberately never mentioned anywhere in the CSV.
     )
 
     # Filmed-animal resolution and restart detection both read the raw .h5 off disk (the video
-    # sensor and the layout CSV), and this fixture has no real recording behind raw_mentioned /
-    # raw_unmentioned for them to read. Neither seam is part of the no_dlc_video accounting under
+    # sensor and the layout CSV), and this fixture has no real recording behind any of the three
+    # raw_h5 paths for them to read. Neither seam is part of the no_dlc_video accounting under
     # test, so both are stubbed the same way the existing build_cycles_for_dlc tests stub them.
     monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "A1")
     monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
     # frame k at k/100 s. dlc_exclusion_spans resolves load_frame_session_times as a module
     # attribute at call time (not a default-arg capture), so patching it here takes effect without
-    # needing a real video/PTS sidecar on disk.
+    # needing a real video/PTS sidecar on disk. The _cfr cycle's rows are rejected on the is_cfr
+    # check before dlc_exclusion_spans ever calls the loader for it, so one stub covers both live
+    # stems.
     monkeypatch.setattr(fiw, "load_frame_session_times",
                         lambda path: np.arange(40000, dtype=np.float64) / 100.0)
 
@@ -1215,9 +1224,17 @@ def test_run_dlc_exclude_mode_no_dlc_video_accounting(tmp_path, monkeypatch):
     assert skips["no_dlc_video"] == 1
     assert all(r["raw_h5"] != str(raw_unmentioned) for r in rows)
 
-    # The mentioned cycle: usable, so NOT counted no_dlc_video, and it did contribute.
+    # The mentioned-but-cfr cycle: counted under its OWN upstream reason, never no_dlc_video, and
+    # contributes no rows. This is the case a deleted guard would get wrong.
+    assert skips["cfr_video"] == 1
+    assert all(r["raw_h5"] != str(raw_cfr) for r in rows)
+
+    # The mentioned-and-usable cycle: NOT counted no_dlc_video, and it did contribute.
     assert n_cycles_used == 1
     assert rows and all(r["raw_h5"] == str(raw_mentioned) for r in rows)
 
-    # Every one of the 2 cycles is accounted for -- none vanished under no reason at all.
-    assert n_cycles_used + skips["no_dlc_video"] == 2
+    # skips["no_dlc_video"] must still be exactly 1 -- the cfr cycle must not have leaked into it.
+    assert skips["no_dlc_video"] == 1
+
+    # All 3 cycles accounted for -- none vanished under no reason at all, none double-counted.
+    assert n_cycles_used + skips["no_dlc_video"] + skips["cfr_video"] == 3
