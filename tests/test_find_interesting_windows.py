@@ -1037,6 +1037,54 @@ def test_bouts_outside_dlc_keeps_bouts_no_window_touches():
     assert skips["outside_video"] == 0
 
 
+def test_main_rejects_dlc_exclude_together_with_dlc_windows(tmp_path):
+    from scripts.find_interesting_windows import main
+    combined = tmp_path / "combined.h5"
+    combined.write_bytes(b"")
+    with pytest.raises(SystemExit) as excinfo:
+        main([str(combined), "--dlc-windows", "a.csv", "--dlc-exclude", "b.csv"])
+    assert excinfo.value.code != 0
+
+
+def test_main_dlc_exclude_writes_outputs(tmp_path, monkeypatch):
+    from scripts import find_interesting_windows as fiw
+
+    captured = {}
+
+    def fake_run(args, raw_map):
+        captured["dlc_exclude"] = args.dlc_exclude
+        captured["dlc_guard"] = args.dlc_guard
+        row = {"animal": "A1", "cycle": 0, "category": "no_dlc", "rank": 0,
+               "start": 10.0, "end": 22.0, "center": 16.0, "score": 30.0,
+               "n_licks_in_window": 30, "filmed": True, "restart": False,
+               "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv"}
+        return [row], {reason: 0 for reason in fiw.DLC_EXCLUDE_SKIP_REASONS}, 1
+
+    monkeypatch.setattr(fiw, "run_dlc_exclude_mode", fake_run)
+
+    # main() re-reads the DLC CSV a second time purely to report its row count (see the comment
+    # above run_dlc_exclude_mode's dispatch in main()), even though run_dlc_exclude_mode itself is
+    # mocked above -- so a real file has to exist at args.dlc_exclude. chdir into tmp_path so the
+    # relative "windows.csv" passed below (kept relative/literal so the args-capture assertion
+    # stays a plain string comparison) resolves there.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "windows.csv").write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,100,200,7.1\n"
+    )
+
+    csv_path = tmp_path / "fp_rois.csv"
+    sh_path = tmp_path / "make_fp_clips.sh"
+    rc = fiw.main([str(tmp_path / "combined.h5"), "--dlc-exclude", "windows.csv",
+                   "--csv", str(csv_path), "--sh", str(sh_path)])
+
+    assert rc == 0
+    assert captured["dlc_exclude"] == "windows.csv"
+    assert captured["dlc_guard"] == 1.0          # default
+    assert "no_dlc" in csv_path.read_text()
+    assert "--no-crop" in sh_path.read_text()
+
+
 def test_bouts_outside_dlc_guard_band_disqualifies_near_misses():
     # Bout ends at 20.0; the DLC window opens at 20.5. Half a second apart is inside the ragged
     # edge a merge-gap/pad window has, so the guard must reject it -- and accept it when off.

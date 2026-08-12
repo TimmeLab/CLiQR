@@ -54,6 +54,14 @@ What it produces
    `_cfr` re-encode are skipped: a re-encode's frame indices are not the original container's
    ordinals, so they cannot be honestly placed on the session clock.
 
+4. `--dlc-exclude` runs the opposite selection to `--dlc-windows`: it keeps the busiest detected
+   licking bouts that touch NO DLC window (each grown by `--dlc-guard` seconds, because a window's
+   edges are merge-gap/pad artefacts) and that lie entirely inside the video's coverage. Those are
+   the stretches where the capacitance detector reported licking and DeepLabCut says the animal was
+   not at the sipper -- the false-positive candidates. A cycle with no rows in the DLC CSV is
+   SKIPPED and reported, never reported wholesale as licks-without-the-animal: "DLC found nothing
+   here" and "DLC never ran on this video" are indistinguishable from the CSV.
+
 Time-base caveat (restart recordings)
 --------------------------------------
 For a plain single-cycle recording, the combined-file time base and make_sync_video's `--start`
@@ -92,6 +100,11 @@ Usage (from the repository root, cliqr-gui environment):
         "Lickometry Data/results_combined_ACG-26-3_2026-07-22_23_24_27_28_29_basic-algorithm.h5" \
         --dlc-windows second_iteration_windows_with_tongue.csv \
         --csv dlc_rois.csv --sh make_dlc_clips.sh --speed 0.25
+
+    # the licks DeepLabCut never saw: false-positive candidates
+    python scripts/find_interesting_windows.py results_combined.h5 \
+        --dlc-exclude second_iteration_windows_with_tongue.csv \
+        --csv fp_rois.csv --sh make_fp_clips.sh --speed 0.25
 """
 
 import argparse
@@ -1207,7 +1220,24 @@ def main(argv=None):
                              "options (--n-lick/--n-climb/--roi-seconds/--lick-pad/"
                              "--climb-skip-edges/--var-window/--min-var/--include-controls) are "
                              "unused in this mode")
+    parser.add_argument("--dlc-exclude", dest="dlc_exclude", default=None, metavar="CSV",
+                        help="CSV written by dlc_integration/find_dlc_windows.py. Given it, the "
+                             "script emits the busiest detected licking bouts that fall in NO DLC "
+                             "window -- the capacitance detector's false-positive candidates. A "
+                             "cycle absent from the CSV is skipped, never treated as 'the animal "
+                             "was never at the sipper'. Cannot be combined with --dlc-windows. "
+                             "The climbing options (--n-climb/--var-window/--min-var/"
+                             "--climb-skip-edges) and --include-controls are unused in this mode")
+    parser.add_argument("--dlc-guard", type=float, default=1.0, metavar="SECONDS",
+                        help="with --dlc-exclude, grow every DLC window by this many seconds on "
+                             "each side before testing a bout against it (default 1.0; 0 "
+                             "disables). DLC window edges are merge-gap/pad artefacts, so a bout "
+                             "that starts just before a window opens is usually a real lick")
     args = parser.parse_args(argv)
+
+    if args.dlc_windows and args.dlc_exclude:
+        parser.error("--dlc-windows and --dlc-exclude select windows by opposite criteria; "
+                     "pass only one")
 
     raw_map = load_raw_map(args.raw_map)
 
@@ -1217,6 +1247,12 @@ def main(argv=None):
         all_rows, skips = build_dlc_rois(dlc_rows, cycles)
         write_outputs(all_rows, args)
         print_dlc_skips(skips, len(dlc_rows))
+        return 0
+
+    if args.dlc_exclude:
+        all_rows, skips, n_cycles_used = run_dlc_exclude_mode(args, raw_map)
+        write_outputs(all_rows, args)
+        print_dlc_exclude_skips(skips, len(read_dlc_windows(args.dlc_exclude)), n_cycles_used)
         return 0
 
     params = {
