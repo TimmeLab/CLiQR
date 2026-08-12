@@ -26,6 +26,8 @@ from scripts.find_interesting_windows import (  # noqa: E402
     build_dlc_rois, dlc_exclusion_spans, bouts_outside_dlc, build_no_dlc_rois_for_cycle,
     build_cycles_for_dlc,
     print_dlc_skips,
+    DLC_EXCLUDE_SKIP_REASONS,
+    print_dlc_exclude_skips,
 )
 
 
@@ -1122,3 +1124,32 @@ def test_build_no_dlc_rois_for_cycle_emits_nothing_when_every_bout_is_seen():
 
     assert rois == []
     assert skips["in_dlc_window"] == 1
+
+
+def test_build_cycles_for_dlc_keeps_the_raw_group_key(tmp_path):
+    # run_dlc_exclude_mode has to re-open the filmed animal's group, so the literal HDF5 key must
+    # survive: int("07") == 7 would not find a group named "07".
+    import h5py
+    path = tmp_path / "combined.h5"
+    with h5py.File(path, "w") as f:
+        group = f.create_group("A1/0")
+        group.create_dataset("time_data", data=np.arange(10, dtype=np.float64))
+        group.attrs["raw_h5"] = "/data/raw_data_2026-07-24_12-02-14.h5"
+        group.attrs["layout"] = "/data/layout.csv"
+
+    cycles = build_cycles_for_dlc(str(path))
+    entry = cycles["raw_data_2026-07-24_12-02-14"]
+    assert entry["cycle_key"] == "0"
+    assert entry["cycle"] == 0
+
+
+def test_print_dlc_exclude_skips_reports_counts(capsys):
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    skips["no_dlc_video"] = 2
+    skips["in_dlc_window"] = 7
+    print_dlc_exclude_skips(skips, n_rows=12, n_cycles_used=3)
+    out = capsys.readouterr().out
+    assert "12 DLC window(s)" in out
+    assert "3 cycle(s)" in out
+    assert "no DLC windows" in out          # the no_dlc_video explanation
+    assert "7" in out                        # bouts DLC agrees about

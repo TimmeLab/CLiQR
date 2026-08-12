@@ -877,6 +877,9 @@ def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
                 stem = os.path.splitext(os.path.basename(raw_h5_path))[0]
                 cycles[stem] = {
                     "cycle": cycle_value,
+                    # The HDF5 key verbatim: --dlc-exclude re-opens this group to read the bouts,
+                    # and int("07") would not find a group named "07".
+                    "cycle_key": cycle_key,
                     "raw_h5": raw_h5_path,
                     "layout": layout_path,
                     "animal": filmed_animal,
@@ -1051,6 +1054,99 @@ def print_dlc_skips(skips, n_rows):
         if count:
             # .get, not [], so adding a reason to DLC_SKIP_REASONS and forgetting it here degrades
             # to a terse-but-correct line instead of a KeyError in the middle of the report.
+            print(f"  skipped {count}: {explanations.get(reason, reason)}")
+
+
+def run_dlc_exclude_mode(args, raw_map):
+    """--dlc-exclude: regions for the licking bouts that fall in no DLC at-sipper window.
+
+    Returns (rows, skips, n_cycles_used). Only cycles with usable DLC evidence contribute: a cycle
+    the CSV never mentions is counted `no_dlc_video` and emits nothing, because "DLC found no
+    windows here" and "DLC never ran on this video" look identical from the CSV, and treating the
+    second as the first would report a whole session's bouts as false positives.
+    """
+    cycles = build_cycles_for_dlc(args.combined_h5, raw_map, args.animals)
+    dlc_rows = read_dlc_windows(args.dlc_exclude)
+    spans_by_stem, skips = dlc_exclusion_spans(dlc_rows, cycles)
+
+    params = {
+        "n_lick": args.n_lick,
+        "roi_seconds": args.roi_seconds,
+        "lick_pad": args.lick_pad,
+        "dlc_guard": args.dlc_guard,
+    }
+
+    all_rows = []
+    n_cycles_used = 0
+    with h5py.File(args.combined_h5, "r") as combined:
+        for stem, cycle in cycles.items():
+            entry = spans_by_stem.get(stem)
+            if entry is None:
+                # Either the video was unusable (already counted by reason) or the CSV never
+                # mentions this recording at all.
+                if stem not in {parse_dlc_video_stem(r["video"])[0] for r in dlc_rows}:
+                    skips["no_dlc_video"] += 1
+                continue
+
+            animal = cycle["animal"]
+            group = combined.get(animal, {}).get(cycle["cycle_key"]) if animal else None
+            required = ("cap_data", "time_data", "bout_start_times", "bout_durations",
+                        "bout_lick_counts", "lick_times")
+            if group is None or not all(name in group for name in required):
+                skips["no_trace"] += 1
+                continue
+
+            time_data = group["time_data"][:]
+            if len(time_data) < 2:
+                skips["no_trace"] += 1
+                continue
+
+            rois, bout_skips = build_no_dlc_rois_for_cycle(
+                group["cap_data"][:], time_data,
+                group["bout_start_times"][:], group["bout_durations"][:],
+                group["bout_lick_counts"][:], group["lick_times"][:],
+                entry, params,
+            )
+            for reason, count in bout_skips.items():
+                skips[reason] += count
+            n_cycles_used += 1
+
+            for roi in rois:
+                roi.update({
+                    "animal": animal,
+                    "cycle": cycle["cycle"],
+                    "filmed": True,          # by construction: only the filmed animal is read
+                    "restart": cycle["restart"],
+                    "raw_h5": cycle["raw_h5"] or "",
+                    "layout": cycle["layout"] or "",
+                })
+                all_rows.append(roi)
+
+    return all_rows, skips, n_cycles_used
+
+
+def print_dlc_exclude_skips(skips, n_rows, n_cycles_used):
+    """Report what --dlc-exclude read and what it refused to draw conclusions from."""
+    explanations = {
+        "cfr_video": "video(s) are _cfr re-encodes (frame indices are not the original "
+                     "container's; re-run DLC on the original recording)",
+        "no_cycle": "video(s) match no cycle in the combined file (or were filtered out by "
+                    "--animals)",
+        "no_video_times": "video(s) whose recording or PTS sidecar is missing on this machine",
+        "no_trace": "cycle(s) with no usable trace for the filmed animal",
+        "frame_out_of_range": "DLC window(s) whose start_frame is negative or past the end of "
+                              "the PTS sidecar",
+        "no_dlc_video": "cycle(s) with no DLC windows in the CSV at all -- SKIPPED, not treated "
+                        "as 'the animal was never at the sipper'. Run find_dlc_windows.py on "
+                        "these recordings before trusting their absence here",
+        "outside_video": "bout(s) outside the video's coverage, so DLC never observed them",
+        "in_dlc_window": "bout(s) inside a DLC window (with the guard band) -- DLC agrees the "
+                         "animal was at the sipper",
+    }
+    print(f"DLC-exclude mode: read {n_rows} DLC window(s); searched {n_cycles_used} cycle(s).")
+    for reason in DLC_EXCLUDE_SKIP_REASONS:
+        count = skips.get(reason, 0)
+        if count:
             print(f"  skipped {count}: {explanations.get(reason, reason)}")
 
 
