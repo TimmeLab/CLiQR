@@ -342,6 +342,29 @@ def test_build_command_lick_keeps_crop():
     assert "--no-crop" not in "\n".join(lines)
 
 
+def test_build_command_no_dlc_renders_full_frame():
+    # The crop box is framed on the sipper tip. A no_dlc clip exists precisely to show where the
+    # animal WAS instead, which is outside that box -- cropping would hide the evidence.
+    row = {"animal": "A1", "cycle": 3, "category": "no_dlc", "rank": 0,
+           "start": 10.0, "end": 22.0, "restart": False,
+           "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv"}
+    lines = build_command(row, "clips", {}, "/data/combined.h5")
+    assert "--no-crop" in lines[-1]
+    assert "clips/A1_c3_no_dlc0.mp4" in lines[-1]
+
+
+def test_build_command_no_dlc_restart_warning_recommends_offset():
+    # A no_dlc window comes from the TRACE (bout times), not from DLC frames, so --offset is the
+    # right remedy for a restart recording -- the opposite of the advice a "dlc" row gets.
+    row = {"animal": "A1", "cycle": 0, "category": "no_dlc", "rank": 1,
+           "start": 10.0, "end": 22.0, "restart": True,
+           "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv"}
+    lines = build_command(row, "clips", {}, "/data/combined.h5")
+    warning = "\n".join(lines[:-1])
+    assert "--offset 0=<seconds>" in warning
+    assert "Do NOT use --offset" not in warning
+
+
 def _lick_row():
     return {"animal": "A1", "cycle": 0, "category": "lick", "rank": 0,
             "start": 100.0, "end": 112.0, "restart": False,

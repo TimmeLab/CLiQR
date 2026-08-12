@@ -950,11 +950,10 @@ def build_command(row, out_dir, offsets, combined_h5, speed=1.0):
 
     out_name = f"{row['animal']}_c{cycle}_{row['category']}{row['rank']}.mp4"
     out_path = os.path.join(out_dir, out_name)
-    # The crop box (crop_video.py's sidecar) is framed tightly on the sipper tip so the tongue is
-    # visible during licking. A CLIMBING clip needs the opposite: the animal is on/around the sipper
-    # and the cage, mostly OUTSIDE that box, so cropping hides the very behaviour we are reviewing.
-    # Render climbing clips full-frame.
-    crop_flag = " --no-crop" if row["category"] == "climb" else ""
+    # Both of these show the animal AWAY from the sipper tip the crop box is framed on: a climbing
+    # clip by definition, and a no_dlc clip because DeepLabCut placed the animal nowhere near the
+    # sipper. Cropping would hide the very thing the clip exists to show.
+    crop_flag = " --no-crop" if row["category"] in ("climb", "no_dlc") else ""
     speed_flag = f" --speed {speed:g}" if speed != 1.0 else ""
     lines.append(
         f"python make_sync_video.py --h5 {shquote(row['raw_h5'])} "

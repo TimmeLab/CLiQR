@@ -153,6 +153,11 @@ The existing `CSV_COLUMNS`, with:
 Clips are named `<animal>_c<cycle>_no_dlc<rank>.mp4` by the existing `build_command`. Restart-cycle
 WARNING comments are emitted unchanged.
 
+`no_dlc` clips are rendered with `--no-crop`, showing the full frame. The crop box is framed tightly
+on the sipper tip to make the tongue visible during licking; a `no_dlc` clip exists precisely to
+show where the animal WAS instead, which is outside that box, so cropping would hide the very
+evidence the clip exists to demonstrate.
+
 ## Testing
 
 All in `tests/test_find_interesting_windows.py`, with an injected `sess_loader`, so no recording or
