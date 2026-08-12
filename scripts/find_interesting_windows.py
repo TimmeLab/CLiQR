@@ -682,6 +682,75 @@ def build_dlc_rois(dlc_rows, cycles, sess_loader=None):
     return rows, skips
 
 
+# Reasons a cycle or a bout produces no clip in --dlc-exclude mode. The first five mirror
+# DLC_SKIP_REASONS (a video we cannot place on the session clock is unusable in either mode);
+# the last three are specific to hunting licks that DLC never saw.
+DLC_EXCLUDE_SKIP_REASONS = ("cfr_video", "no_cycle", "no_video_times", "no_trace",
+                            "frame_out_of_range", "no_dlc_video", "outside_video",
+                            "in_dlc_window")
+
+
+def dlc_exclusion_spans(dlc_rows, cycles, sess_loader=None):
+    """Session-second spans of every DLC at-sipper window, keyed by recording stem.
+
+    Returns ({stem: {"spans": [(start_s, end_s), ...], "coverage": (first_s, last_s)}}, skips).
+
+    `coverage` is the session time of the FIRST and LAST frame of the video. Outside it DLC
+    observed nothing, so the absence of a span there is not evidence that the animal was away --
+    the caller must drop bouts that fall outside it rather than reporting them.
+
+    Unlike `build_dlc_rois`, spans are NOT clamped to the cycle's trace. Clamping is a rendering
+    concern (make_sync_video cannot draw a trace that isn't there); a window past the end of the
+    trace is still proof that the animal was at the sipper, and dropping it here would let the
+    bouts under it through as false-positive candidates.
+
+    Whole-video failures are counted ONCE per video (the unusable unit is the recording), not once
+    per row as in `build_dlc_rois`, because here a video's rows are not clips-in-waiting -- they
+    are evidence about one cycle, and the cycle either has usable evidence or it does not.
+
+    `sess_loader` is injected for testing; it defaults to the module-level
+    `load_frame_session_times` (resolved here so patching the module attribute takes effect).
+    """
+    sess_loader = sess_loader or load_frame_session_times
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    by_stem = {}
+
+    by_video = {}
+    for row in dlc_rows:
+        by_video.setdefault(str(row["video"]), []).append(row)
+
+    for video, video_rows in by_video.items():
+        stem, is_cfr = parse_dlc_video_stem(video)
+        if is_cfr:
+            skips["cfr_video"] += 1
+            continue
+        cycle = cycles.get(stem)
+        if cycle is None:
+            skips["no_cycle"] += 1
+            continue
+        if cycle["span_s"] <= cycle["first_s"]:
+            skips["no_trace"] += 1
+            continue
+        sess = sess_loader(cycle["raw_h5"])
+        if sess is None:
+            skips["no_video_times"] += 1
+            continue
+
+        spans = []
+        for row in video_rows:
+            window = frame_window_to_session(sess, row["start_frame"], row["end_frame"])
+            if window is None:
+                skips["frame_out_of_range"] += 1
+                continue
+            spans.append(window)
+
+        sess = np.asarray(sess, dtype=np.float64)
+        by_stem[stem] = {"spans": spans,
+                         "coverage": (float(sess[0]), float(sess[-1]))}
+
+    return by_stem, skips
+
+
 def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
     """Everything `build_dlc_rois` needs about each cycle, keyed by the raw recording's stem.
 

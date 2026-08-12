@@ -23,7 +23,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     parse_dlc_video_stem, read_dlc_windows,
     frame_window_to_session, clamp_to_trace,
     load_frame_session_times,
-    build_dlc_rois,
+    build_dlc_rois, dlc_exclusion_spans,
     build_cycles_for_dlc,
     print_dlc_skips,
 )
@@ -813,6 +813,85 @@ def _write_combined(tmp_path, raw_h5_path):
         g.create_dataset("time_data", data=np.linspace(0.0, 100.0, 1001))
         g.create_dataset("lick_times", data=np.array([5.0, 6.0]))
     return str(combined)
+
+
+def test_dlc_exclusion_spans_converts_frames_and_reports_coverage():
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # frame k at k/10 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(start_frame=10, end_frame=20),
+         _dlc_row(start_frame=30, end_frame=41, label="w001")],
+        cycles, sess_loader=lambda path: sess)
+
+    entry = by_stem["raw_data_2026-07-24_12-02-14"]
+    assert entry["spans"] == [(1.0, 1.9), (3.0, 4.0)]
+    assert entry["coverage"] == (0.0, 99.9)
+    assert sum(skips.values()) == 0
+
+
+def test_dlc_exclusion_spans_does_not_clamp_to_the_trace():
+    # A window past the end of the capacitance trace is still proof the animal was at the sipper,
+    # so it must stay in the exclusion set at full width. Clamping it (as the RENDERING path does)
+    # would let a bout in that stretch through as a false-positive candidate.
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # 0 .. 99.9 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=50.0)}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(start_frame=700, end_frame=710)], cycles, sess_loader=lambda path: sess)
+
+    assert by_stem["raw_data_2026-07-24_12-02-14"]["spans"] == [(70.0, 70.9)]
+    assert sum(skips.values()) == 0
+
+
+def test_dlc_exclusion_spans_counts_whole_video_skips_once_each():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {
+        "raw_data_2026-07-13_11-59-47": _cycle_info(),
+        "raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=0.0),
+    }
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4"),
+         _dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4", label="w001"),
+         _dlc_row(video="/videos/raw_data_1999-01-01_00-00-00.mp4"),
+         _dlc_row()],
+        cycles, sess_loader=lambda path: sess)
+
+    assert by_stem == {}
+    # counted per VIDEO, not per row: the unit that is unusable here is the whole recording
+    assert skips["cfr_video"] == 1
+    assert skips["no_cycle"] == 1
+    assert skips["no_trace"] == 1
+
+
+def test_dlc_exclusion_spans_counts_missing_frame_times():
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans([_dlc_row()], cycles, sess_loader=lambda path: None)
+    assert by_stem == {}
+    assert skips["no_video_times"] == 1
+
+
+def test_dlc_exclusion_spans_counts_out_of_range_rows_per_row():
+    sess = np.arange(100, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(start_frame=500, end_frame=510),
+         _dlc_row(start_frame=10, end_frame=20, label="w001")],
+        cycles, sess_loader=lambda path: sess)
+
+    assert by_stem["raw_data_2026-07-24_12-02-14"]["spans"] == [(1.0, 1.9)]
+    assert skips["frame_out_of_range"] == 1
+
+
+def test_dlc_exclusion_spans_loads_frame_times_once_per_video():
+    calls = []
+
+    def loader(path):
+        calls.append(path)
+        return np.arange(1000, dtype=np.float64) / 10.0
+
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    dlc_exclusion_spans([_dlc_row(), _dlc_row(label="w001", start_frame=30, end_frame=40)],
+                        cycles, sess_loader=loader)
+    assert calls == ["/data/raw_data_2026-07-24_12-02-14.h5"]
 
 
 def test_build_cycles_for_dlc_keys_on_raw_stem(tmp_path, monkeypatch):
