@@ -4,6 +4,7 @@ The HDF5 reading, provenance resolution, and shell-script writing are exercised 
 recordings; only the deterministic, self-contained helpers (variance, masking, selection, window
 construction, command formatting) are unit-tested here.
 """
+import argparse
 import os
 import sys
 
@@ -23,9 +24,12 @@ from scripts.find_interesting_windows import (  # noqa: E402
     parse_dlc_video_stem, read_dlc_windows,
     frame_window_to_session, clamp_to_trace,
     load_frame_session_times,
-    build_dlc_rois,
+    build_dlc_rois, dlc_exclusion_spans, bouts_outside_dlc, build_no_dlc_rois_for_cycle,
     build_cycles_for_dlc,
     print_dlc_skips,
+    DLC_EXCLUDE_SKIP_REASONS,
+    print_dlc_exclude_skips,
+    run_dlc_exclude_mode,
 )
 
 
@@ -257,6 +261,21 @@ def test_build_rois_climbing_skip_edges_does_not_touch_licking():
     assert len(licks) == 1 and licks[0]["n_licks_in_window"] == 20
 
 
+def test_build_rois_for_cycle_emits_no_climbing_when_n_climb_is_zero():
+    # select_climbing_centers appends its first candidate before testing the count, so a caller
+    # asking for zero climbing windows used to get one anyway. Licking-only callers depend on this.
+    time_data = np.arange(0.0, 200.0, 0.01)
+    cap_data = np.random.RandomState(0).normal(size=time_data.size)
+    rois = build_rois_for_cycle(
+        cap_data, time_data,
+        bout_start_times=np.array([50.0]), bout_durations=np.array([3.0]),
+        bout_lick_counts=np.array([30]), lick_times=np.array([50.5]),
+        params={"n_lick": 3, "n_climb": 0, "roi_seconds": 12.0, "lick_pad": 2.0,
+                "var_window": 1.0, "min_var": 0.0, "climb_skip_edges": 0.0},
+    )
+    assert [r["category"] for r in rois] == ["lick"]
+
+
 def test_parse_offsets():
     assert parse_offsets(["0=280", "3=-1.5"]) == {0: 280.0, 3: -1.5}
     assert parse_offsets(None) == {}
@@ -325,6 +344,29 @@ def test_build_command_lick_keeps_crop():
            "raw_h5": "data/raw_07-23.h5", "layout": "data/layout.csv"}
     lines = build_command(row, out_dir="clips", offsets={}, combined_h5="results_combined.h5")
     assert "--no-crop" not in "\n".join(lines)
+
+
+def test_build_command_no_dlc_renders_full_frame():
+    # The crop box is framed on the sipper tip. A no_dlc clip exists precisely to show where the
+    # animal WAS instead, which is outside that box -- cropping would hide the evidence.
+    row = {"animal": "A1", "cycle": 3, "category": "no_dlc", "rank": 0,
+           "start": 10.0, "end": 22.0, "restart": False,
+           "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv"}
+    lines = build_command(row, "clips", {}, "/data/combined.h5")
+    assert "--no-crop" in lines[-1]
+    assert "clips/A1_c3_no_dlc0.mp4" in lines[-1]
+
+
+def test_build_command_no_dlc_restart_warning_recommends_offset():
+    # A no_dlc window comes from the TRACE (bout times), not from DLC frames, so --offset is the
+    # right remedy for a restart recording -- the opposite of the advice a "dlc" row gets.
+    row = {"animal": "A1", "cycle": 0, "category": "no_dlc", "rank": 1,
+           "start": 10.0, "end": 22.0, "restart": True,
+           "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv"}
+    lines = build_command(row, "clips", {}, "/data/combined.h5")
+    warning = "\n".join(lines[:-1])
+    assert "--offset 0=<seconds>" in warning
+    assert "Do NOT use --offset" not in warning
 
 
 def _lick_row():
@@ -815,6 +857,127 @@ def _write_combined(tmp_path, raw_h5_path):
     return str(combined)
 
 
+def test_dlc_exclusion_spans_converts_frames_and_reports_coverage():
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # frame k at k/10 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(start_frame=10, end_frame=20),
+         _dlc_row(start_frame=30, end_frame=41, label="w001")],
+        cycles, sess_loader=lambda path: sess)
+
+    entry = by_stem["raw_data_2026-07-24_12-02-14"]
+    assert entry["spans"] == [(1.0, 1.9), (3.0, 4.0)]
+    assert entry["coverage"] == (0.0, 99.9)
+    assert sum(skips.values()) == 0
+
+
+def test_dlc_exclusion_spans_does_not_clamp_to_the_trace():
+    # A window past the end of the capacitance trace is still proof the animal was at the sipper,
+    # so it must stay in the exclusion set at full width. Clamping it (as the RENDERING path does)
+    # would let a bout in that stretch through as a false-positive candidate.
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # 0 .. 99.9 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=50.0)}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(start_frame=700, end_frame=710)], cycles, sess_loader=lambda path: sess)
+
+    assert by_stem["raw_data_2026-07-24_12-02-14"]["spans"] == [(70.0, 70.9)]
+    assert sum(skips.values()) == 0
+
+
+def test_dlc_exclusion_spans_counts_whole_video_skips_once_each():
+    sess = np.arange(1000, dtype=np.float64) / 10.0
+    cycles = {
+        "raw_data_2026-07-13_11-59-47": _cycle_info(),
+        "raw_data_2026-07-24_12-02-14": _cycle_info(first_s=0.0, span_s=0.0),
+    }
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4"),
+         _dlc_row(video="/videos/raw_data_2026-07-13_11-59-47_cfr.mp4", label="w001"),
+         _dlc_row(video="/videos/raw_data_1999-01-01_00-00-00.mp4"),
+         _dlc_row()],
+        cycles, sess_loader=lambda path: sess)
+
+    assert by_stem == {}
+    # counted per VIDEO, not per row: the unit that is unusable here is the whole recording
+    assert skips["cfr_video"] == 1
+    assert skips["no_cycle"] == 1
+    assert skips["no_trace"] == 1
+
+
+def test_dlc_exclusion_spans_counts_missing_frame_times():
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans([_dlc_row()], cycles, sess_loader=lambda path: None)
+    assert by_stem == {}
+    assert skips["no_video_times"] == 1
+
+
+def test_dlc_exclusion_spans_counts_out_of_range_rows_per_row():
+    sess = np.arange(100, dtype=np.float64) / 10.0
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(start_frame=500, end_frame=510),
+         _dlc_row(start_frame=10, end_frame=20, label="w001")],
+        cycles, sess_loader=lambda path: sess)
+
+    assert by_stem["raw_data_2026-07-24_12-02-14"]["spans"] == [(1.0, 1.9)]
+    assert skips["frame_out_of_range"] == 1
+
+
+def test_dlc_exclusion_spans_all_rows_out_of_range_produces_no_entry():
+    # Regression: a video the CSV names, whose every row nonetheless fails to convert (e.g. a
+    # PTS-sidecar/video mismatch), must NOT get a spans=[] entry. An empty-but-present entry would
+    # make run_dlc_exclude_mode search the cycle's bouts against zero exclusion spans and report
+    # every one of them as a false-positive candidate -- exactly the outcome the no_dlc_video guard
+    # exists to prevent, reached through a different door. find_dlc_windows.py never writes a row
+    # for a window it did not find, so spans == [] for a video with rows always means "every row
+    # failed", never "DLC legitimately found nothing" (that case has no rows at all).
+    sess = np.arange(100, dtype=np.float64) / 10.0  # 0 .. 9.9 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(start_frame=500, end_frame=510),
+         _dlc_row(start_frame=600, end_frame=610, label="w001")],
+        cycles, sess_loader=lambda path: sess)
+
+    assert "raw_data_2026-07-24_12-02-14" not in by_stem
+    assert skips["frame_out_of_range"] == 2
+    # Counted under the same reason as a video the CSV never mentions: from the caller's side,
+    # zero usable spans and zero rows are indistinguishable in what they mean for the cycle.
+    assert skips["no_dlc_video"] == 1
+
+
+def test_dlc_exclusion_spans_accumulates_spans_across_videos_sharing_a_stem():
+    # Two different video path strings can resolve to the same recording stem (e.g. concatenated
+    # DLC CSVs written before and after files were moved). Both name the same cycle, so their spans
+    # must be pooled, not have the second video's entry silently overwrite the first's -- an
+    # overwrite would drop real DLC evidence and leak the first video's bouts as false positives.
+    sess = np.arange(1000, dtype=np.float64) / 10.0  # frame k at k/10 s
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    by_stem, skips = dlc_exclusion_spans(
+        [_dlc_row(video="/old/path/raw_data_2026-07-24_12-02-14.mp4",
+                  start_frame=10, end_frame=20),
+         _dlc_row(video="/new/path/raw_data_2026-07-24_12-02-14.mp4",
+                  start_frame=30, end_frame=41, label="w001")],
+        cycles, sess_loader=lambda path: sess)
+
+    entry = by_stem["raw_data_2026-07-24_12-02-14"]
+    assert sorted(entry["spans"]) == [(1.0, 1.9), (3.0, 4.0)]
+    assert entry["coverage"] == (0.0, 99.9)
+    assert sum(skips.values()) == 0
+
+
+def test_dlc_exclusion_spans_loads_frame_times_once_per_video():
+    calls = []
+
+    def loader(path):
+        calls.append(path)
+        return np.arange(1000, dtype=np.float64) / 10.0
+
+    cycles = {"raw_data_2026-07-24_12-02-14": _cycle_info()}
+    dlc_exclusion_spans([_dlc_row(), _dlc_row(label="w001", start_frame=30, end_frame=40)],
+                        cycles, sess_loader=loader)
+    assert calls == ["/data/raw_data_2026-07-24_12-02-14.h5"]
+
+
 def test_build_cycles_for_dlc_keys_on_raw_stem(tmp_path, monkeypatch):
     import scripts.find_interesting_windows as fiw
     raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
@@ -904,3 +1067,427 @@ def test_main_dlc_mode_writes_csv_and_commands(tmp_path, monkeypatch):
     assert "--speed 0.25" in sh_text
     assert "--no-crop" not in sh_text
     assert "--cycle 0" in sh_text
+
+
+def test_bouts_outside_dlc_keeps_bouts_no_window_touches():
+    starts = np.array([10.0, 100.0])
+    durations = np.array([5.0, 5.0])
+    keep, skips = bouts_outside_dlc(starts, durations, spans=[(95.0, 110.0)],
+                                    coverage=(0.0, 500.0), guard_s=1.0)
+    assert list(keep) == [True, False]
+    assert skips["in_dlc_window"] == 1
+    assert skips["outside_video"] == 0
+
+
+def test_main_rejects_dlc_exclude_together_with_dlc_windows(tmp_path):
+    from scripts.find_interesting_windows import main
+    combined = tmp_path / "combined.h5"
+    combined.write_bytes(b"")
+    with pytest.raises(SystemExit) as excinfo:
+        main([str(combined), "--dlc-windows", "a.csv", "--dlc-exclude", "b.csv"])
+    assert excinfo.value.code != 0
+
+
+def test_main_dlc_exclude_writes_outputs(tmp_path, monkeypatch):
+    from scripts import find_interesting_windows as fiw
+
+    captured = {}
+
+    def fake_run(args, raw_map):
+        captured["dlc_exclude"] = args.dlc_exclude
+        captured["dlc_guard"] = args.dlc_guard
+        row = {"animal": "A1", "cycle": 0, "category": "no_dlc", "rank": 0,
+               "start": 10.0, "end": 22.0, "center": 16.0, "score": 30.0,
+               "n_licks_in_window": 30, "filmed": True, "restart": False,
+               "raw_h5": "/data/raw.h5", "layout": "/data/layout.csv"}
+        cycle_reports = [{"animal": "A1", "cycle": 0, "restart": False,
+                         "n_spans": 5, "n_bouts": 10, "n_kept": 1}]
+        return [row], {reason: 0 for reason in fiw.DLC_EXCLUDE_SKIP_REASONS}, 1, cycle_reports
+
+    monkeypatch.setattr(fiw, "run_dlc_exclude_mode", fake_run)
+
+    # main() re-reads the DLC CSV a second time purely to report its row count (see the comment
+    # above run_dlc_exclude_mode's dispatch in main()), even though run_dlc_exclude_mode itself is
+    # mocked above -- so a real file has to exist at args.dlc_exclude. chdir into tmp_path so the
+    # relative "windows.csv" passed below (kept relative/literal so the args-capture assertion
+    # stays a plain string comparison) resolves there.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "windows.csv").write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,100,200,7.1\n"
+    )
+
+    csv_path = tmp_path / "fp_rois.csv"
+    sh_path = tmp_path / "make_fp_clips.sh"
+    rc = fiw.main([str(tmp_path / "combined.h5"), "--dlc-exclude", "windows.csv",
+                   "--csv", str(csv_path), "--sh", str(sh_path)])
+
+    assert rc == 0
+    assert captured["dlc_exclude"] == "windows.csv"
+    assert captured["dlc_guard"] == 1.0          # default
+    assert "no_dlc" in csv_path.read_text()
+    assert "--no-crop" in sh_path.read_text()
+
+
+def test_bouts_outside_dlc_guard_band_disqualifies_near_misses():
+    # Bout ends at 20.0; the DLC window opens at 20.5. Half a second apart is inside the ragged
+    # edge a merge-gap/pad window has, so the guard must reject it -- and accept it when off.
+    starts = np.array([15.0])
+    durations = np.array([5.0])
+    guarded, _ = bouts_outside_dlc(starts, durations, spans=[(20.5, 25.0)],
+                                   coverage=(0.0, 500.0), guard_s=1.0)
+    unguarded, _ = bouts_outside_dlc(starts, durations, spans=[(20.5, 25.0)],
+                                     coverage=(0.0, 500.0), guard_s=0.0)
+    assert list(guarded) == [False]
+    assert list(unguarded) == [True]
+
+
+def test_bouts_outside_dlc_drops_bouts_outside_video_coverage():
+    # Before the camera started and after it stopped, DLC saw nothing, so "no window here" is not
+    # evidence the animal was away.
+    starts = np.array([5.0, 50.0, 900.0])
+    durations = np.array([2.0, 2.0, 2.0])
+    keep, skips = bouts_outside_dlc(starts, durations, spans=[], coverage=(10.0, 800.0),
+                                    guard_s=1.0)
+    assert list(keep) == [False, True, False]
+    assert skips["outside_video"] == 2
+    assert skips["in_dlc_window"] == 0
+
+
+def test_bouts_outside_dlc_requires_the_whole_bout_inside_coverage():
+    # Bout straddles the end of the video: DLC could not have scored its tail.
+    keep, skips = bouts_outside_dlc(np.array([790.0]), np.array([20.0]), spans=[],
+                                    coverage=(10.0, 800.0), guard_s=1.0)
+    assert list(keep) == [False]
+    assert skips["outside_video"] == 1
+
+
+def test_bouts_outside_dlc_handles_no_bouts():
+    keep, skips = bouts_outside_dlc(np.array([]), np.array([]), spans=[(1.0, 2.0)],
+                                    coverage=(0.0, 10.0), guard_s=1.0)
+    assert keep.size == 0
+    assert sum(skips.values()) == 0
+
+
+def test_build_no_dlc_rois_for_cycle_keeps_only_unseen_bouts():
+    time_data = np.arange(0.0, 400.0, 0.01)
+    cap_data = np.zeros(time_data.size)
+    # Bout 0 (busiest) sits inside a DLC window; bout 1 does not.
+    starts = np.array([100.0, 300.0])
+    durations = np.array([4.0, 4.0])
+    counts = np.array([90, 20])
+    licks = np.concatenate([np.linspace(100.0, 104.0, 90), np.linspace(300.0, 304.0, 20)])
+    entry = {"spans": [(99.0, 106.0)], "coverage": (0.0, 400.0)}
+    rois, skips = build_no_dlc_rois_for_cycle(
+        cap_data, time_data, starts, durations, counts, licks, entry,
+        params={"n_lick": 3, "roi_seconds": 12.0, "lick_pad": 2.0, "dlc_guard": 1.0})
+
+    assert [r["category"] for r in rois] == ["no_dlc"]
+    assert [r["rank"] for r in rois] == [0]
+    assert rois[0]["score"] == 20.0
+    # Padded width (4 s bout + 2*2 s lick_pad = 8 s) is narrower than roi_seconds (12 s), so
+    # bout_window widens it to the 12 s minimum, centered on the bout center (302.0).
+    assert rois[0]["start"] == 296.0 and rois[0]["end"] == 308.0
+    assert rois[0]["n_licks_in_window"] == 20
+    assert skips["in_dlc_window"] == 1
+
+
+def test_build_no_dlc_rois_for_cycle_ranks_busiest_first():
+    time_data = np.arange(0.0, 500.0, 0.01)
+    cap_data = np.zeros(time_data.size)
+    starts = np.array([100.0, 300.0])
+    durations = np.array([4.0, 4.0])
+    counts = np.array([10, 40])
+    entry = {"spans": [], "coverage": (0.0, 500.0)}
+    rois, _ = build_no_dlc_rois_for_cycle(
+        cap_data, time_data, starts, durations, counts, np.array([]), entry,
+        params={"n_lick": 3, "roi_seconds": 12.0, "lick_pad": 2.0, "dlc_guard": 1.0})
+
+    assert [r["score"] for r in rois] == [40.0, 10.0]
+    assert [r["rank"] for r in rois] == [0, 1]
+
+
+def test_build_no_dlc_rois_for_cycle_emits_nothing_when_every_bout_is_seen():
+    time_data = np.arange(0.0, 200.0, 0.01)
+    cap_data = np.zeros(time_data.size)
+    entry = {"spans": [(90.0, 120.0)], "coverage": (0.0, 200.0)}
+    rois, skips = build_no_dlc_rois_for_cycle(
+        cap_data, time_data, np.array([100.0]), np.array([4.0]), np.array([30]),
+        np.array([]), entry,
+        params={"n_lick": 3, "roi_seconds": 12.0, "lick_pad": 2.0, "dlc_guard": 1.0})
+
+    assert rois == []
+    assert skips["in_dlc_window"] == 1
+
+
+def test_build_cycles_for_dlc_keeps_the_raw_group_key(tmp_path):
+    # run_dlc_exclude_mode has to re-open the filmed animal's group, so the literal HDF5 key must
+    # survive: int("07") == 7 would not find a group named "07".
+    import h5py
+    path = tmp_path / "combined.h5"
+    with h5py.File(path, "w") as f:
+        group = f.create_group("A1/0")
+        group.create_dataset("time_data", data=np.arange(10, dtype=np.float64))
+        group.attrs["raw_h5"] = "/data/raw_data_2026-07-24_12-02-14.h5"
+        group.attrs["layout"] = "/data/layout.csv"
+
+    cycles = build_cycles_for_dlc(str(path))
+    entry = cycles["raw_data_2026-07-24_12-02-14"]
+    assert entry["cycle_key"] == "0"
+    assert entry["cycle"] == 0
+
+
+def test_print_dlc_exclude_skips_reports_counts(capsys):
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    skips["no_dlc_video"] = 2
+    skips["in_dlc_window"] = 7
+    print_dlc_exclude_skips(skips, n_rows=12, n_cycles_used=3)
+    out = capsys.readouterr().out
+    assert "12 DLC window(s)" in out
+    assert "3 cycle(s)" in out
+    assert "no DLC windows" in out          # the no_dlc_video explanation
+    assert "7" in out                        # bouts DLC agrees about
+
+
+def test_print_dlc_exclude_skips_prints_per_cycle_line(capsys):
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    cycle_reports = [{"animal": "ACG-26-3-1", "cycle": 4, "restart": False,
+                      "n_spans": 3, "n_bouts": 12, "n_kept": 10}]
+    print_dlc_exclude_skips(skips, n_rows=3, n_cycles_used=1, cycle_reports=cycle_reports)
+    out = capsys.readouterr().out
+    assert "cycle 4 (ACG-26-3-1): 3 DLC window(s), 10/12 bout(s) kept" in out
+
+
+def test_print_dlc_exclude_skips_flags_thin_evidence(capsys):
+    # cycle 1's real-data profile that motivated this finding: DLC produced exactly one window
+    # over the whole cycle, and every single bout survived -- almost certainly a DLC coverage gap,
+    # not 18 genuine false positives.
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    cycle_reports = [{"animal": "ACG-26-3-7", "cycle": 1, "restart": False,
+                      "n_spans": 1, "n_bouts": 18, "n_kept": 18}]
+    print_dlc_exclude_skips(skips, n_rows=1, n_cycles_used=1, cycle_reports=cycle_reports)
+    out = capsys.readouterr().out
+    assert "cycle 1 (ACG-26-3-7): 1 DLC window(s), 18/18 bout(s) kept" in out
+    assert "WARNING" in out
+    assert "thin DLC evidence" in out
+
+
+def test_print_dlc_exclude_skips_does_not_flag_cycles_with_real_evidence(capsys):
+    # Same near-1.0 kept fraction, but backed by plenty of DLC windows: this is a real
+    # false-positive signal (DLC had good coverage and still disagrees with almost none of the
+    # detector's busiest bouts), so it must NOT be flagged as thin.
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    cycle_reports = [{"animal": "ACG-26-3-2", "cycle": 5, "restart": False,
+                      "n_spans": 13, "n_bouts": 14, "n_kept": 13}]
+    print_dlc_exclude_skips(skips, n_rows=13, n_cycles_used=1, cycle_reports=cycle_reports)
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+
+    # And a cycle with few spans but a LOW kept fraction (DLC's few windows still did real work)
+    # must not be flagged either.
+    cycle_reports = [{"animal": "ACG-26-3-2", "cycle": 5, "restart": False,
+                      "n_spans": 2, "n_bouts": 14, "n_kept": 3}]
+    print_dlc_exclude_skips(skips, n_rows=2, n_cycles_used=1, cycle_reports=cycle_reports)
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+
+
+def test_print_dlc_exclude_skips_marks_restart_cycles(capsys):
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    cycle_reports = [{"animal": "ACG-26-3-5", "cycle": 0, "restart": True,
+                      "n_spans": 9, "n_bouts": 17, "n_kept": 8}]
+    print_dlc_exclude_skips(skips, n_rows=9, n_cycles_used=1, cycle_reports=cycle_reports)
+    out = capsys.readouterr().out
+    assert "restart recording" in out
+
+
+def test_run_dlc_exclude_mode_cycle_reports_count_kept_before_n_lick_ranking(tmp_path, monkeypatch):
+    # n_kept must reflect every bout that survived the DLC filter, not just the top --n-lick that
+    # got emitted as rows -- otherwise a thin-evidence cycle like the real cycle 1 (1 DLC window,
+    # 18 bouts kept, but only the busiest 3 emitted with the default --n-lick) would silently
+    # undercount "how many bouts this cycle's false-positive read actually rests on".
+    import h5py
+    import scripts.find_interesting_windows as fiw
+
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    combined_path = tmp_path / "combined.h5"
+    time_data = np.arange(0.0, 500.0, 0.01)
+    n_bouts = 5
+    starts = np.array([50.0 + 40.0 * i for i in range(n_bouts)])
+    with h5py.File(combined_path, "w") as f:
+        g = f.create_group("A1").create_group("0")
+        g.attrs["raw_h5"] = str(raw_h5)
+        g.attrs["layout"] = "/data/layout.csv"
+        g.create_dataset("time_data", data=time_data)
+        g.create_dataset("cap_data", data=np.zeros_like(time_data))
+        g.create_dataset("bout_start_times", data=starts)
+        g.create_dataset("bout_durations", data=np.full(n_bouts, 4.0))
+        # Distinct counts so ranking is unambiguous; none of these bouts fall in any DLC window.
+        g.create_dataset("bout_lick_counts", data=np.array([10, 20, 30, 40, 50]))
+        g.create_dataset("lick_times", data=np.array([]))
+
+    windows_csv = tmp_path / "windows.csv"
+    # One DLC window, far from every bout -- the real cycle 1 shape: thin evidence, everything kept.
+    windows_csv.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,0,10,7.1\n"
+    )
+
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "A1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+    monkeypatch.setattr(fiw, "load_frame_session_times",
+                        lambda path: np.arange(50000, dtype=np.float64) / 100.0)
+
+    args = argparse.Namespace(
+        combined_h5=str(combined_path), dlc_exclude=str(windows_csv), dlc_guard=1.0,
+        n_lick=3, roi_seconds=12.0, lick_pad=2.0, animals=None,   # n_lick=3 < n_bouts=5
+    )
+    rows, skips, n_cycles_used, cycle_reports = run_dlc_exclude_mode(args, raw_map={})
+
+    assert len(rows) == 3                      # ranking still truncates the emitted rows
+    assert len(cycle_reports) == 1
+    report = cycle_reports[0]
+    assert report["n_spans"] == 1
+    assert report["n_bouts"] == 5
+    assert report["n_kept"] == 5               # but the report counts ALL surviving bouts
+
+
+def test_run_dlc_exclude_mode_no_dlc_video_accounting(tmp_path, monkeypatch):
+    # This is the correctness crux the plan calls out: a cycle the CSV never mentions must be
+    # counted no_dlc_video and emit nothing, while a cycle the CSV DOES mention -- but that fails
+    # for some other reason -- must never ALSO be counted no_dlc_video (that reason is already
+    # counted inside dlc_exclusion_spans). Three cycles cover all of it:
+    #   - "mentioned": usable DLC evidence -> contributes rows, not skipped at all.
+    #   - "unmentioned": no CSV row names it -> the guard's true-branch, no_dlc_video.
+    #   - "mentioned_but_cfr": a CSV row DOES name it, but only via a _cfr re-encode, so
+    #     dlc_exclusion_spans counts it cfr_video and it never gets a spans_by_stem entry -- this
+    #     is the guard's FALSE-branch, and the only fixture shape that can catch a guard that has
+    #     been deleted (a fixture without this cycle passes identically whether the guard runs or
+    #     not, because every entry-is-None cycle would then also be a genuinely-unmentioned one).
+    import h5py
+    import scripts.find_interesting_windows as fiw
+
+    raw_mentioned = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    raw_unmentioned = tmp_path / "raw_data_2026-07-25_12-02-14.h5"
+    raw_cfr = tmp_path / "raw_data_2026-07-26_12-02-14.h5"
+
+    combined_path = tmp_path / "combined.h5"
+    time_data = np.arange(0.0, 400.0, 0.01)
+    with h5py.File(combined_path, "w") as f:
+        animal = f.create_group("A1")
+        for cycle_key, raw_h5 in (("0", raw_mentioned), ("1", raw_unmentioned),
+                                  ("2", raw_cfr)):
+            g = animal.create_group(cycle_key)
+            g.attrs["raw_h5"] = str(raw_h5)
+            g.attrs["layout"] = "/data/layout.csv"
+            g.create_dataset("time_data", data=time_data)
+            g.create_dataset("cap_data", data=np.zeros_like(time_data))
+            g.create_dataset("bout_start_times", data=np.array([300.0]))
+            g.create_dataset("bout_durations", data=np.array([4.0]))
+            g.create_dataset("bout_lick_counts", data=np.array([20]))
+            g.create_dataset("lick_times", data=np.linspace(300.0, 304.0, 20))
+
+    windows_csv = tmp_path / "windows.csv"
+    windows_csv.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,9900,9910,7.1\n"
+        "2,w001,/videos/raw_data_2026-07-26_12-02-14_cfr.mp4,100,110,7.1\n"
+        # raw_data_2026-07-25_12-02-14 is deliberately never mentioned anywhere in the CSV.
+    )
+
+    # Filmed-animal resolution and restart detection both read the raw .h5 off disk (the video
+    # sensor and the layout CSV), and this fixture has no real recording behind any of the three
+    # raw_h5 paths for them to read. Neither seam is part of the no_dlc_video accounting under
+    # test, so both are stubbed the same way the existing build_cycles_for_dlc tests stub them.
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "A1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+    # frame k at k/100 s. dlc_exclusion_spans resolves load_frame_session_times as a module
+    # attribute at call time (not a default-arg capture), so patching it here takes effect without
+    # needing a real video/PTS sidecar on disk. The _cfr cycle's rows are rejected on the is_cfr
+    # check before dlc_exclusion_spans ever calls the loader for it, so one stub covers both live
+    # stems.
+    monkeypatch.setattr(fiw, "load_frame_session_times",
+                        lambda path: np.arange(40000, dtype=np.float64) / 100.0)
+
+    args = argparse.Namespace(
+        combined_h5=str(combined_path), dlc_exclude=str(windows_csv), dlc_guard=1.0,
+        n_lick=3, roi_seconds=12.0, lick_pad=2.0, animals=None,
+    )
+    rows, skips, n_cycles_used, cycle_reports = run_dlc_exclude_mode(args, raw_map={})
+
+    # The one usable cycle's per-cycle accounting is exercised by the dedicated
+    # test_run_dlc_exclude_mode_cycle_reports_* tests below; here just check it lines up.
+    assert len(cycle_reports) == n_cycles_used
+
+    # The unmentioned cycle: counted no_dlc_video exactly once, contributes no rows.
+    assert skips["no_dlc_video"] == 1
+    assert all(r["raw_h5"] != str(raw_unmentioned) for r in rows)
+
+    # The mentioned-but-cfr cycle: counted under its OWN upstream reason, never no_dlc_video, and
+    # contributes no rows. This is the case a deleted guard would get wrong.
+    assert skips["cfr_video"] == 1
+    assert all(r["raw_h5"] != str(raw_cfr) for r in rows)
+
+    # The mentioned-and-usable cycle: NOT counted no_dlc_video, and it did contribute.
+    assert n_cycles_used == 1
+    assert rows and all(r["raw_h5"] == str(raw_mentioned) for r in rows)
+
+    # skips["no_dlc_video"] must still be exactly 1 -- the cfr cycle must not have leaked into it.
+    assert skips["no_dlc_video"] == 1
+
+    # All 3 cycles accounted for -- none vanished under no reason at all, none double-counted.
+    assert n_cycles_used + skips["no_dlc_video"] + skips["cfr_video"] == 3
+
+
+def test_run_dlc_exclude_mode_skips_cycle_whose_dlc_rows_all_fail_conversion(tmp_path, monkeypatch):
+    # End-to-end regression for the bug the reviewer found: dlc_exclusion_spans used to store a
+    # spans=[] entry for a video whose rows all failed conversion, and run_dlc_exclude_mode treated
+    # "entry is not None" as "usable evidence" -- so the cycle's bouts were searched against an
+    # EMPTY exclusion set and every single one came back "outside all DLC windows", i.e. reported
+    # wholesale as false positives. This is the exact outcome the no_dlc_video guard exists to
+    # prevent, reached through a different door (a video the CSV names but cannot place on the
+    # session clock, rather than a video the CSV never names at all).
+    import h5py
+    import scripts.find_interesting_windows as fiw
+
+    raw_h5 = tmp_path / "raw_data_2026-07-24_12-02-14.h5"
+    combined_path = tmp_path / "combined.h5"
+    time_data = np.arange(0.0, 400.0, 0.01)
+    with h5py.File(combined_path, "w") as f:
+        g = f.create_group("A1").create_group("0")
+        g.attrs["raw_h5"] = str(raw_h5)
+        g.attrs["layout"] = "/data/layout.csv"
+        g.create_dataset("time_data", data=time_data)
+        g.create_dataset("cap_data", data=np.zeros_like(time_data))
+        g.create_dataset("bout_start_times", data=np.array([300.0]))
+        g.create_dataset("bout_durations", data=np.array([4.0]))
+        g.create_dataset("bout_lick_counts", data=np.array([20]))
+        g.create_dataset("lick_times", data=np.linspace(300.0, 304.0, 20))
+
+    windows_csv = tmp_path / "windows.csv"
+    # The PTS sidecar stubbed below only covers frames 0..99 (0 .. 9.9 s); both rows' frames are
+    # far past that, so BOTH fail conversion (frame_out_of_range), leaving zero usable spans for a
+    # video the CSV nonetheless names.
+    windows_csv.write_text(
+        "task_id,label,video,start_frame,end_frame,tongue_rate\n"
+        "1,w000,/videos/raw_data_2026-07-24_12-02-14.mp4,99000,99010,7.1\n"
+        "2,w001,/videos/raw_data_2026-07-24_12-02-14.mp4,99100,99110,7.1\n"
+    )
+
+    monkeypatch.setattr(fiw, "resolve_filmed_animal", lambda h5, layout: "A1")
+    monkeypatch.setattr(fiw, "is_restart_recording", lambda h5: False)
+    monkeypatch.setattr(fiw, "load_frame_session_times",
+                        lambda path: np.arange(100, dtype=np.float64) / 10.0)
+
+    args = argparse.Namespace(
+        combined_h5=str(combined_path), dlc_exclude=str(windows_csv), dlc_guard=1.0,
+        n_lick=3, roi_seconds=12.0, lick_pad=2.0, animals=None,
+    )
+    rows, skips, n_cycles_used, cycle_reports = run_dlc_exclude_mode(args, raw_map={})
+
+    # The whole point: the cycle's one bout must NOT come back as a "no_dlc" false-positive row.
+    assert rows == []
+    assert n_cycles_used == 0
+    assert cycle_reports == []
+    assert skips["frame_out_of_range"] == 2
+    assert skips["no_dlc_video"] == 1

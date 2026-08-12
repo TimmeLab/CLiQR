@@ -54,6 +54,15 @@ What it produces
    `_cfr` re-encode are skipped: a re-encode's frame indices are not the original container's
    ordinals, so they cannot be honestly placed on the session clock.
 
+4. `--dlc-exclude` runs the opposite selection to `--dlc-windows`: it keeps the busiest detected
+   licking bouts that touch NO DLC window (each grown by `--dlc-guard` seconds, because a window's
+   edges are merge-gap/pad artefacts) and that lie entirely inside the video's coverage. Those are
+   the stretches where the capacitance detector reported licking and DeepLabCut says the animal was
+   not at the sipper -- the false-positive candidates. A cycle with no rows in the DLC CSV -- or
+   whose rows are all unusable (e.g. every one fails frame conversion) -- is SKIPPED and reported,
+   never reported wholesale as licks-without-the-animal: "DLC found nothing here" and "DLC never
+   ran on this video" are indistinguishable from the CSV.
+
 Time-base caveat (restart recordings)
 --------------------------------------
 For a plain single-cycle recording, the combined-file time base and make_sync_video's `--start`
@@ -92,6 +101,11 @@ Usage (from the repository root, cliqr-gui environment):
         "Lickometry Data/results_combined_ACG-26-3_2026-07-22_23_24_27_28_29_basic-algorithm.h5" \
         --dlc-windows second_iteration_windows_with_tongue.csv \
         --csv dlc_rois.csv --sh make_dlc_clips.sh --speed 0.25
+
+    # the licks DeepLabCut never saw: false-positive candidates
+    python scripts/find_interesting_windows.py results_combined.h5 \
+        --dlc-exclude second_iteration_windows_with_tongue.csv \
+        --csv fp_rois.csv --sh make_fp_clips.sh --speed 0.25
 """
 
 import argparse
@@ -351,58 +365,61 @@ def build_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
     # ----------------------------------------------------------------------
     # CLIMBING regions: high-variance windows that avoid the detected bouts.
     # ----------------------------------------------------------------------
-    variance_window_samples = (max(1, int(round(params["var_window"] / median_dt_s)))
-                               if median_dt_s > 0 else 1)
-    window_variance = sliding_variance(cap_data, variance_window_samples)
-    if window_variance.size > 0 and median_dt_s > 0:
-        centers = center_sample_indices(window_variance.size, variance_window_samples)
-        # Read each window's time from the trace's own time base. Converting a sample index with an
-        # average rate silently assumes uniform sampling; on a real recording that drifts by tens of
-        # SECONDS by the end (the stalls above), which both mis-times the emitted clip and makes the
-        # bout mask below disqualify the wrong stretches.
-        center_times_s = time_data[centers]
+    if params["n_climb"] > 0:
+        variance_window_samples = (max(1, int(round(params["var_window"] / median_dt_s)))
+                                   if median_dt_s > 0 else 1)
+        window_variance = sliding_variance(cap_data, variance_window_samples)
+        if window_variance.size > 0 and median_dt_s > 0:
+            centers = center_sample_indices(window_variance.size, variance_window_samples)
+            # Read each window's time from the trace's own time base. Converting a sample index
+            # with an average rate silently assumes uniform sampling; on a real recording that
+            # drifts by tens of SECONDS by the end (the stalls above), which both mis-times the
+            # emitted clip and makes the bout mask below disqualify the wrong stretches.
+            center_times_s = time_data[centers]
 
-        # Disqualify windows on/near any detected bout. Guard by `roi_seconds + lick_pad`: that is
-        # at least the half-width of the bout's own licking window plus the half-width of a climbing
-        # window, so a surviving climbing window overlaps neither the bout nor its licking clip.
-        guard_seconds = params["roi_seconds"] + lick_pad_s
-        mask_bout_windows(window_variance, center_times_s, bout_start_times, bout_durations,
-                          guard_seconds)
+            # Disqualify windows on/near any detected bout. Guard by `roi_seconds + lick_pad`:
+            # that is at least the half-width of the bout's own licking window plus the
+            # half-width of a climbing window, so a surviving climbing window overlaps neither
+            # the bout nor its licking clip.
+            guard_seconds = params["roi_seconds"] + lick_pad_s
+            mask_bout_windows(window_variance, center_times_s, bout_start_times, bout_durations,
+                              guard_seconds)
 
-        # Disqualify the start and end of the session. Both edges are dominated by transients that
-        # have nothing to do with the animal climbing -- the operator handling the cage, inserting
-        # the sipper, the sensor settling at the start, and the reverse at the end -- and those
-        # transients are usually the LOUDEST excursions in the whole recording, so without this they
-        # crowd out the real climbing. The whole window (not just its center) must clear the edge,
-        # hence the extra half-window. Licking is untouched: a real bout near an edge is real.
-        skip_edges_s = float(params.get("climb_skip_edges", 300.0))
-        if skip_edges_s > 0.0:
-            half_window_s = params["roi_seconds"] / 2.0
-            too_early = center_times_s < first_s + skip_edges_s + half_window_s
-            too_late = center_times_s > span_s - skip_edges_s - half_window_s
-            window_variance[too_early | too_late] = -np.inf
+            # Disqualify the start and end of the session. Both edges are dominated by
+            # transients that have nothing to do with the animal climbing -- the operator
+            # handling the cage, inserting the sipper, the sensor settling at the start, and the
+            # reverse at the end -- and those transients are usually the LOUDEST excursions in
+            # the whole recording, so without this they crowd out the real climbing. The whole
+            # window (not just its center) must clear the edge, hence the extra half-window.
+            # Licking is untouched: a real bout near an edge is real.
+            skip_edges_s = float(params.get("climb_skip_edges", 300.0))
+            if skip_edges_s > 0.0:
+                half_window_s = params["roi_seconds"] / 2.0
+                too_early = center_times_s < first_s + skip_edges_s + half_window_s
+                too_late = center_times_s > span_s - skip_edges_s - half_window_s
+                window_variance[too_early | too_late] = -np.inf
 
-        # Optional variance floor: ignore windows below this, so we don't dredge up flat-signal
-        # "climbing" on a quiet recording. 0.0 (the default) disables the floor.
-        if params["min_var"] > 0.0:
-            window_variance[window_variance < params["min_var"]] = -np.inf
+            # Optional variance floor: ignore windows below this, so we don't dredge up
+            # flat-signal "climbing" on a quiet recording. 0.0 (the default) disables the floor.
+            if params["min_var"] > 0.0:
+                window_variance[window_variance < params["min_var"]] = -np.inf
 
-        picks = select_climbing_centers(
-            window_variance, center_times_s,
-            n_wanted=params["n_climb"],
-            min_separation_s=params["roi_seconds"],
-        )
-        for rank, (center_time, variance) in enumerate(picks):
-            start_s, end_s = clip_window(center_time, params["roi_seconds"], span_s, first_s)
-            rois.append({
-                "category": "climb",
-                "rank": rank,
-                "start": start_s,
-                "end": end_s,
-                "center": center_time,
-                "score": variance,
-                "n_licks_in_window": count_licks_in_window(lick_times, start_s, end_s),
-            })
+            picks = select_climbing_centers(
+                window_variance, center_times_s,
+                n_wanted=params["n_climb"],
+                min_separation_s=params["roi_seconds"],
+            )
+            for rank, (center_time, variance) in enumerate(picks):
+                start_s, end_s = clip_window(center_time, params["roi_seconds"], span_s, first_s)
+                rois.append({
+                    "category": "climb",
+                    "rank": rank,
+                    "start": start_s,
+                    "end": end_s,
+                    "center": center_time,
+                    "score": variance,
+                    "n_licks_in_window": count_licks_in_window(lick_times, start_s, end_s),
+                })
 
     return rois
 
@@ -682,6 +699,169 @@ def build_dlc_rois(dlc_rows, cycles, sess_loader=None):
     return rows, skips
 
 
+# Reasons a cycle or a bout produces no clip in --dlc-exclude mode. The first five mirror
+# DLC_SKIP_REASONS (a video we cannot place on the session clock is unusable in either mode);
+# the last three are specific to hunting licks that DLC never saw.
+DLC_EXCLUDE_SKIP_REASONS = ("cfr_video", "no_cycle", "no_video_times", "no_trace",
+                            "frame_out_of_range", "no_dlc_video", "outside_video",
+                            "in_dlc_window")
+
+
+def dlc_exclusion_spans(dlc_rows, cycles, sess_loader=None):
+    """Session-second spans of every DLC at-sipper window, keyed by recording stem.
+
+    Returns ({stem: {"spans": [(start_s, end_s), ...], "coverage": (first_s, last_s)}}, skips).
+
+    `coverage` is the session time of the FIRST and LAST frame of the video. Outside it DLC
+    observed nothing, so the absence of a span there is not evidence that the animal was away --
+    the caller must drop bouts that fall outside it rather than reporting them.
+
+    Unlike `build_dlc_rois`, spans are NOT clamped to the cycle's trace. Clamping is a rendering
+    concern (make_sync_video cannot draw a trace that isn't there); a window past the end of the
+    trace is still proof that the animal was at the sipper, and dropping it here would let the
+    bouts under it through as false-positive candidates.
+
+    Whole-video failures are counted ONCE per video (the unusable unit is the recording), not once
+    per row as in `build_dlc_rois`, because here a video's rows are not clips-in-waiting -- they
+    are evidence about one cycle, and the cycle either has usable evidence or it does not.
+
+    `sess_loader` is injected for testing; it defaults to the module-level
+    `load_frame_session_times` (resolved here so patching the module attribute takes effect).
+    """
+    sess_loader = sess_loader or load_frame_session_times
+    skips = {reason: 0 for reason in DLC_EXCLUDE_SKIP_REASONS}
+    by_stem = {}
+
+    by_video = {}
+    for row in dlc_rows:
+        by_video.setdefault(str(row["video"]), []).append(row)
+
+    for video, video_rows in by_video.items():
+        stem, is_cfr = parse_dlc_video_stem(video)
+        if is_cfr:
+            skips["cfr_video"] += 1
+            continue
+        cycle = cycles.get(stem)
+        if cycle is None:
+            skips["no_cycle"] += 1
+            continue
+        if cycle["span_s"] <= cycle["first_s"]:
+            skips["no_trace"] += 1
+            continue
+        sess = sess_loader(cycle["raw_h5"])
+        if sess is None:
+            skips["no_video_times"] += 1
+            continue
+
+        spans = []
+        for row in video_rows:
+            window = frame_window_to_session(sess, row["start_frame"], row["end_frame"])
+            if window is None:
+                skips["frame_out_of_range"] += 1
+                continue
+            spans.append(window)
+
+        if not spans:
+            # This video HAD rows (video_rows is non-empty, or we would not be here at all -- see
+            # by_video above) and every single one failed to convert (already counted per-row as
+            # frame_out_of_range). find_dlc_windows.py never writes a row for a window it did not
+            # find, so this is never "DLC legitimately found nothing" -- that case has no rows and
+            # never reaches this branch. It IS indistinguishable from "DLC never ran on this video"
+            # once we're this far, so it is counted under the same reason (no_dlc_video) rather than
+            # given a spans=[] entry: an empty-but-present entry would make the caller search the
+            # cycle's bouts against zero exclusion spans and report all of them as false positives.
+            skips["no_dlc_video"] += 1
+            continue
+
+        sess_arr = np.asarray(sess, dtype=np.float64)
+        coverage = (float(sess_arr[0]), float(sess_arr[-1]))
+        # Two different video path strings can resolve to the same stem (e.g. DLC CSVs written
+        # before and after the recordings were moved, then concatenated); accumulate rather than
+        # overwrite so the earlier video's spans are not silently dropped -- an overwrite would
+        # leak its bouts through as false-positive candidates. `coverage` is derived from the same
+        # cycle's raw_h5 (hence the same sess) for every video sharing a stem, so it is identical
+        # across accumulations, not something that needs merging.
+        entry = by_stem.setdefault(stem, {"spans": [], "coverage": coverage})
+        entry["spans"].extend(spans)
+        entry["coverage"] = coverage
+
+    return by_stem, skips
+
+
+def bouts_outside_dlc(bout_start_times, bout_durations, spans, coverage, guard_s):
+    """Which detected bouts DLC never saw: (keep_mask, skips).
+
+    A bout is kept only if BOTH hold:
+
+    * it lies entirely within `coverage`, the video's session-time extent. A bout that starts
+      before the camera or runs past it was partly unobserved, and "DLC reported no window" says
+      nothing about an interval DLC never looked at;
+    * it intersects no span in `spans` after each span is grown by `guard_s` on both sides.
+
+    The guard band matters because a DLC window's edges are artefacts of `--merge-gap`,
+    `--min-frames` and `--pad` in find_dlc_windows.py, not the moment the animal arrived or left;
+    without it, bouts that start a few hundred milliseconds before a window opens survive and are
+    almost all real licks.
+
+    The test is applied to the BOUT, not to the padded clip window: the clip is deliberately wider
+    (`--lick-pad` of context), and showing the edge of a DLC window is useful context, not grounds
+    for disqualification.
+    """
+    starts = np.asarray(bout_start_times, dtype=np.float64)
+    durations = np.asarray(bout_durations, dtype=np.float64)
+    skips = {"outside_video": 0, "in_dlc_window": 0}
+    if starts.size == 0:
+        return np.zeros(0, dtype=bool), skips
+
+    ends = starts + durations
+    first_s, last_s = float(coverage[0]), float(coverage[1])
+
+    keep = np.ones(starts.size, dtype=bool)
+    outside = (starts < first_s) | (ends > last_s)
+    keep &= ~outside
+    skips["outside_video"] = int(np.count_nonzero(outside))
+
+    inside_window = np.zeros(starts.size, dtype=bool)
+    for span_start, span_end in spans:
+        guarded_start = float(span_start) - guard_s
+        guarded_end = float(span_end) + guard_s
+        inside_window |= (starts <= guarded_end) & (ends >= guarded_start)
+    # Count only bouts disqualified by DLC alone, so the two reasons never double-count one bout.
+    skips["in_dlc_window"] = int(np.count_nonzero(inside_window & ~outside))
+    keep &= ~inside_window
+
+    return keep, skips
+
+
+def build_no_dlc_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
+                                bout_lick_counts, lick_times, entry, params):
+    """Regions for the busiest bouts of one cycle that DLC never saw: (rois, skips).
+
+    `entry` is one value from `dlc_exclusion_spans`. The surviving bouts go through the SAME
+    window construction as the trace search (`build_rois_for_cycle` with `n_climb=0`), so a clip
+    here is framed exactly like a licking clip there -- whole bout plus `--lick-pad` of context --
+    and only the selection differs. The category is renamed so the CSV, the clip filenames and the
+    crop decision can tell the two apart.
+    """
+    keep, skips = bouts_outside_dlc(bout_start_times, bout_durations, entry["spans"],
+                                    entry["coverage"], params["dlc_guard"])
+    if not np.any(keep):
+        return [], skips
+
+    rois = build_rois_for_cycle(
+        cap_data, time_data,
+        np.asarray(bout_start_times, dtype=np.float64)[keep],
+        np.asarray(bout_durations, dtype=np.float64)[keep],
+        np.asarray(bout_lick_counts)[keep],
+        lick_times,
+        {"n_lick": params["n_lick"], "n_climb": 0,
+         "roi_seconds": params["roi_seconds"], "lick_pad": params["lick_pad"]},
+    )
+    for roi in rois:
+        roi["category"] = "no_dlc"
+    return rois, skips
+
+
 def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
     """Everything `build_dlc_rois` needs about each cycle, keyed by the raw recording's stem.
 
@@ -731,6 +911,9 @@ def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
                 stem = os.path.splitext(os.path.basename(raw_h5_path))[0]
                 cycles[stem] = {
                     "cycle": cycle_value,
+                    # The HDF5 key verbatim: --dlc-exclude re-opens this group to read the bouts,
+                    # and int("07") would not find a group named "07".
+                    "cycle_key": cycle_key,
                     "raw_h5": raw_h5_path,
                     "layout": layout_path,
                     "animal": filmed_animal,
@@ -804,11 +987,10 @@ def build_command(row, out_dir, offsets, combined_h5, speed=1.0):
 
     out_name = f"{row['animal']}_c{cycle}_{row['category']}{row['rank']}.mp4"
     out_path = os.path.join(out_dir, out_name)
-    # The crop box (crop_video.py's sidecar) is framed tightly on the sipper tip so the tongue is
-    # visible during licking. A CLIMBING clip needs the opposite: the animal is on/around the sipper
-    # and the cage, mostly OUTSIDE that box, so cropping hides the very behaviour we are reviewing.
-    # Render climbing clips full-frame.
-    crop_flag = " --no-crop" if row["category"] == "climb" else ""
+    # Both of these show the animal AWAY from the sipper tip the crop box is framed on: a climbing
+    # clip by definition, and a no_dlc clip because DeepLabCut placed the animal nowhere near the
+    # sipper. Cropping would hide the very thing the clip exists to show.
+    crop_flag = " --no-crop" if row["category"] in ("climb", "no_dlc") else ""
     speed_flag = f" --speed {speed:g}" if speed != 1.0 else ""
     lines.append(
         f"python make_sync_video.py --h5 {shquote(row['raw_h5'])} "
@@ -909,6 +1091,210 @@ def print_dlc_skips(skips, n_rows):
             print(f"  skipped {count}: {explanations.get(reason, reason)}")
 
 
+def run_dlc_exclude_mode(args, raw_map):
+    """--dlc-exclude: regions for the licking bouts that fall in no DLC at-sipper window.
+
+    Returns (rows, skips, n_cycles_used, cycle_reports). Only cycles with usable DLC evidence
+    contribute: a cycle the CSV never mentions is counted `no_dlc_video` and emits nothing, because
+    "DLC found no windows here" and "DLC never ran on this video" look identical from the CSV, and
+    treating the second as the first would report a whole session's bouts as false positives. A
+    cycle whose video IS named but every one of whose rows fails to convert lands under the same
+    `no_dlc_video` reason, one level down inside `dlc_exclusion_spans` -- see its docstring.
+
+    `cycle_reports` is one dict per searched (i.e. `entry is not None` and traced) cycle:
+    `{"animal", "cycle", "restart", "n_spans", "n_bouts", "n_kept"}`. `n_kept` is the count BEFORE
+    `--n-lick` ranking truncates the output, i.e. how many of the cycle's bouts actually survived
+    the DLC filter, not how many were emitted as rows. This is what lets the caller flag a cycle
+    whose "false positives" are mostly a DLC-coverage gap rather than detector error -- see
+    `print_dlc_exclude_skips`.
+
+    Clock assumption for restart recordings
+    ----------------------------------------
+    DLC spans are on the session clock (`load_frame_session_times` / `SessionClock`, anchored via
+    the recording's own PTS sidecar); bout times are on the combined file's clock (`filter_data`'s
+    per-cycle rebasing). For a plain single-cycle recording these agree. For a RESTART recording
+    (operator stopped and restarted within one raw file) the two have been observed to disagree by
+    a fixed offset (~280 s for the 2026-07-22 recording) -- see the module docstring's "Time-base
+    caveat". Unlike `--dlc-windows`, where a DLC window IS the renderer's own reference and so does
+    not care whether the two clocks agree, THIS mode compares the two clocks directly (spans vs.
+    bout times), so a silent offset here would convert real drinking into a reported "false
+    positive" and hide genuine ones -- and it would do so invisibly: `coverage` is derived from the
+    PTS sidecar and is typically far wider than the trace (e.g. observed (-604.5, 7682.8) against a
+    (0, 7200) trace), so the `outside_video` guard cannot catch a shift of a few hundred seconds the
+    way it would catch a shift of hours.
+
+    We do not correct for this automatically (same reasoning as the module docstring: getting a
+    silent correction subtly wrong is worse than not correcting at all). The cheap check: a
+    restart cycle's spans should contain MOST of its lick_times, since DLC and the detector are
+    both looking at the same drinking. Checked once by hand for the current dataset's one restart
+    cycle (2026-07-22, cycle 0): 663/922 licks fall inside spans at shift 0, and 0/922 at either
+    +-280.33 s (the known combined-file/renderer offset), so the two clocks resolve this cycle the
+    same way and no correction is needed today. This is not re-verified automatically per run; if a
+    future restart recording's `--dlc-exclude` output looks suspicious, re-run this check by hand
+    before trusting it. `cycle_reports` marks restart cycles (`"restart": True`) so the printed
+    report can flag them for a second look without a separate mechanism.
+    """
+    cycles = build_cycles_for_dlc(args.combined_h5, raw_map, args.animals)
+    dlc_rows = read_dlc_windows(args.dlc_exclude)
+    spans_by_stem, skips = dlc_exclusion_spans(dlc_rows, cycles)
+
+    params = {
+        "n_lick": args.n_lick,
+        "roi_seconds": args.roi_seconds,
+        "lick_pad": args.lick_pad,
+        "dlc_guard": args.dlc_guard,
+    }
+
+    # Computed once, not per cycle: every cycle whose entry is None re-checks membership in this
+    # set, and rebuilding it per cycle is O(cycles x rows) where O(rows) suffices. Deliberately
+    # built from EVERY row, including `_cfr` ones: a stem that appears only via a _cfr row must
+    # still count as "mentioned" here, because dlc_exclusion_spans already counted it under
+    # cfr_video and this set exists only to keep that from being double-counted as no_dlc_video too.
+    # If this set were narrowed to "rows that produced usable spans", a cfr-only cycle would look
+    # unmentioned and get double-counted.
+    mentioned_stems = {parse_dlc_video_stem(r["video"])[0] for r in dlc_rows}
+
+    all_rows = []
+    n_cycles_used = 0
+    cycle_reports = []
+    with h5py.File(args.combined_h5, "r") as combined:
+        for stem, cycle in cycles.items():
+            entry = spans_by_stem.get(stem)
+            if entry is None:
+                # Either the video was unusable (already counted by reason, including a video whose
+                # rows all failed conversion -- see dlc_exclusion_spans) or the CSV never mentions
+                # this recording at all.
+                if stem not in mentioned_stems:
+                    skips["no_dlc_video"] += 1
+                continue
+
+            animal = cycle["animal"]
+            group = combined.get(animal, {}).get(cycle["cycle_key"]) if animal else None
+            required = ("cap_data", "time_data", "bout_start_times", "bout_durations",
+                        "bout_lick_counts", "lick_times")
+            if group is None or not all(name in group for name in required):
+                # Two different causes share this reason: the filmed animal/layout could not be
+                # resolved (group is None), OR the group exists but predates the bout-array outputs
+                # (an older analysis pipeline never wrote bout_start_times/bout_durations/
+                # bout_lick_counts). print_dlc_exclude_skips' explanation text covers both so a
+                # reader hunting a resolution problem is not misled when the real cause is a stale
+                # combined file.
+                skips["no_trace"] += 1
+                continue
+
+            time_data = group["time_data"][:]
+            if len(time_data) < 2:
+                skips["no_trace"] += 1
+                continue
+
+            bout_start_times = group["bout_start_times"][:]
+            rois, bout_skips = build_no_dlc_rois_for_cycle(
+                group["cap_data"][:], time_data,
+                bout_start_times, group["bout_durations"][:],
+                group["bout_lick_counts"][:], group["lick_times"][:],
+                entry, params,
+            )
+            for reason, count in bout_skips.items():
+                skips[reason] += count
+            n_cycles_used += 1
+
+            n_bouts = int(bout_start_times.size)
+            cycle_reports.append({
+                "animal": animal,
+                "cycle": cycle["cycle"],
+                "restart": cycle["restart"],
+                "n_spans": len(entry["spans"]),
+                "n_bouts": n_bouts,
+                # Bouts NOT disqualified by either DLC reason; bouts_outside_dlc's own accounting
+                # guarantees outside_video and in_dlc_window never double-count the same bout, so a
+                # plain subtraction is exact -- no need to re-run the mask here.
+                "n_kept": n_bouts - bout_skips["outside_video"] - bout_skips["in_dlc_window"],
+            })
+
+            for roi in rois:
+                roi.update({
+                    "animal": animal,
+                    "cycle": cycle["cycle"],
+                    "filmed": True,          # by construction: only the filmed animal is read
+                    "restart": cycle["restart"],
+                    "raw_h5": cycle["raw_h5"] or "",
+                    "layout": cycle["layout"] or "",
+                })
+                all_rows.append(roi)
+
+    return all_rows, skips, n_cycles_used, cycle_reports
+
+
+# A cycle's DLC evidence is "thin" when DLC placed very few windows in the WHOLE cycle and the
+# guard nonetheless disqualified almost none of its bouts. Both numbers matter, not just the kept
+# fraction: a cycle with MANY spans and a high kept fraction is a real signal (DLC had good
+# coverage and still agrees the detector's busiest bouts are false positives); a cycle with FEW
+# spans is a coverage gap, where a high kept fraction just reflects that there was barely anything
+# for the guard to disqualify bouts WITH. The two thresholds are arbitrary but defensible: 2 or
+# fewer windows across an entire (typically ~2 h) session means DLC essentially never confirmed the
+# animal at the sipper, so its absence elsewhere is weak evidence; 90% kept means the guard rejected
+# fewer than 1 in 10 bouts, far short of what real DLC coverage of a mostly-false-positive session
+# would be expected to catch.
+DLC_EXCLUDE_THIN_EVIDENCE_MAX_SPANS = 2
+DLC_EXCLUDE_THIN_EVIDENCE_MIN_KEPT_FRACTION = 0.9
+
+
+def print_dlc_exclude_skips(skips, n_rows, n_cycles_used, cycle_reports=()):
+    """Report what --dlc-exclude read, what it refused to draw conclusions from, and -- per
+    searched cycle -- how much DLC evidence actually backs its "false positive" rows.
+
+    `cycle_reports` (see `run_dlc_exclude_mode`) is printed one line per searched cycle so a reader
+    can see, without opening the CSV, when a cycle's survivors are mostly a DLC-coverage gap rather
+    than detector error -- see DLC_EXCLUDE_THIN_EVIDENCE_MAX_SPANS above. A restart cycle is
+    flagged in the same line (see the clock-assumption note in `run_dlc_exclude_mode`'s docstring)
+    rather than through a second mechanism, since the per-cycle line already exists.
+    """
+    explanations = {
+        "cfr_video": "video(s) are _cfr re-encodes (frame indices are not the original "
+                     "container's; re-run DLC on the original recording)",
+        "no_cycle": "video(s) match no cycle in the combined file (or were filtered out by "
+                    "--animals)",
+        "no_video_times": "video(s) whose recording or PTS sidecar is missing on this machine",
+        "no_trace": "cycle(s) with no usable trace for the filmed animal -- either the filmed "
+                    "animal/layout could not be resolved, or the cycle's group predates the "
+                    "bout-array outputs (an older analysis pipeline never wrote "
+                    "bout_start_times/bout_durations/bout_lick_counts, e.g. a combined file "
+                    "produced before that data was saved)",
+        "frame_out_of_range": "DLC window(s) whose start_frame is negative or past the end of "
+                              "the PTS sidecar",
+        "no_dlc_video": "cycle(s) with no usable DLC evidence -- either no DLC windows in the CSV "
+                        "name the recording at all, or every one that does failed to convert to a "
+                        "session span (see frame_out_of_range above) -- SKIPPED, not treated as "
+                        "'the animal was never at the sipper'. Run find_dlc_windows.py on these "
+                        "recordings (or check the PTS sidecar) before trusting their absence here",
+        "outside_video": "bout(s) outside the video's coverage, so DLC never observed them",
+        "in_dlc_window": "bout(s) inside a DLC window (with the guard band) -- DLC agrees the "
+                         "animal was at the sipper",
+    }
+    print(f"DLC-exclude mode: read {n_rows} DLC window(s); searched {n_cycles_used} cycle(s).")
+    for reason in DLC_EXCLUDE_SKIP_REASONS:
+        count = skips.get(reason, 0)
+        if count:
+            print(f"  skipped {count}: {explanations.get(reason, reason)}")
+
+    for report in cycle_reports:
+        restart_note = ""
+        if report["restart"]:
+            restart_note = (" [restart recording -- DLC spans and bout times come from different "
+                            "clocks that are only KNOWN to agree for the 2026-07-22 cycle checked "
+                            "by hand; see run_dlc_exclude_mode's docstring before trusting this "
+                            "cycle's rows]")
+        print(f"  cycle {report['cycle']} ({report['animal']}): {report['n_spans']} DLC "
+              f"window(s), {report['n_kept']}/{report['n_bouts']} bout(s) kept{restart_note}")
+        kept_fraction = report["n_kept"] / report["n_bouts"] if report["n_bouts"] else 0.0
+        if (report["n_spans"] <= DLC_EXCLUDE_THIN_EVIDENCE_MAX_SPANS
+                and kept_fraction >= DLC_EXCLUDE_THIN_EVIDENCE_MIN_KEPT_FRACTION):
+            print(f"    WARNING: thin DLC evidence ({report['n_spans']} window(s) over the whole "
+                  f"cycle, {kept_fraction:.0%} of bouts kept) -- most of this cycle's "
+                  f"false-positive candidates may just be stretches DLC never looked at, not "
+                  f"detector error")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -962,7 +1348,24 @@ def main(argv=None):
                              "options (--n-lick/--n-climb/--roi-seconds/--lick-pad/"
                              "--climb-skip-edges/--var-window/--min-var/--include-controls) are "
                              "unused in this mode")
+    parser.add_argument("--dlc-exclude", dest="dlc_exclude", default=None, metavar="CSV",
+                        help="CSV written by dlc_integration/find_dlc_windows.py. Given it, the "
+                             "script emits the busiest detected licking bouts that fall in NO DLC "
+                             "window -- the capacitance detector's false-positive candidates. A "
+                             "cycle absent from the CSV is skipped, never treated as 'the animal "
+                             "was never at the sipper'. Cannot be combined with --dlc-windows. "
+                             "The climbing options (--n-climb/--var-window/--min-var/"
+                             "--climb-skip-edges) and --include-controls are unused in this mode")
+    parser.add_argument("--dlc-guard", type=float, default=1.0, metavar="SECONDS",
+                        help="with --dlc-exclude, grow every DLC window by this many seconds on "
+                             "each side before testing a bout against it (default 1.0; 0 "
+                             "disables). DLC window edges are merge-gap/pad artefacts, so a bout "
+                             "that starts just before a window opens is usually a real lick")
     args = parser.parse_args(argv)
+
+    if args.dlc_windows and args.dlc_exclude:
+        parser.error("--dlc-windows and --dlc-exclude select windows by opposite criteria; "
+                     "pass only one")
 
     raw_map = load_raw_map(args.raw_map)
 
@@ -972,6 +1375,18 @@ def main(argv=None):
         all_rows, skips = build_dlc_rois(dlc_rows, cycles)
         write_outputs(all_rows, args)
         print_dlc_skips(skips, len(dlc_rows))
+        return 0
+
+    if args.dlc_exclude:
+        all_rows, skips, n_cycles_used, cycle_reports = run_dlc_exclude_mode(args, raw_map)
+        write_outputs(all_rows, args)
+        # Re-reads the DLC CSV a second time here purely to get its row count for the summary line
+        # ("read N DLC window(s)"); run_dlc_exclude_mode already read it once internally to build
+        # spans_by_stem. Keeping run_dlc_exclude_mode's return value to (rows, skips, n_cycles_used,
+        # cycle_reports) -- without also threading the row count back out -- was judged simpler than
+        # growing its signature further for one integer a second read gets for free.
+        print_dlc_exclude_skips(skips, len(read_dlc_windows(args.dlc_exclude)), n_cycles_used,
+                                cycle_reports)
         return 0
 
     params = {
