@@ -166,6 +166,21 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
     return missing_data
 
 
+def _record_zero_licks(data, animal, logfile, reason):
+    """Mark a channel as having zero detectable licks (instead of dropping it).
+
+    A trace with too few discrete capacitance levels cannot hold a dip deep
+    enough to count as a lick, so zero licks is the correct answer for it -- and
+    the channel's volume/trace still belong in the output. Silently skipping such
+    channels used to make control cages vanish from some sessions.
+    """
+    data['lick_times'] = np.array([])
+    data['lick_indices'] = np.array([], dtype=int)
+    data['num_licks'] = 0
+    with open(logfile, 'a') as lf:
+        lf.write(f"No licks detectable for {animal}: {reason}; recorded 0 licks\n")
+
+
 def basic_algorithm(data_by_animal, filtered_h5f, logfile):
     """Detect licks by scanning every possible amplitude threshold.
 
@@ -228,22 +243,28 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
 
         peak_info = {}
 
+        # A peak must cross a threshold this many levels lower to count as a
+        # real lick (see depth check below). The threshold loop MUST start at
+        # depth_back so that i_thr - depth_back is never negative; a negative
+        # index would silently wrap to a HIGH threshold, disabling the depth
+        # filter and inflating counts (and IndexError on channels with <
+        # depth_back levels).
+        depth_back = 20
+
         # Because the capacitance values are discretized, we can focus only
         # on the thresholds between the discrete values
         unique_vals = np.unique(trace)
-        if len(unique_vals) > 3: # We need at least 3 different values for the algorithm
+        # The scan needs more thresholds than depth_back, otherwise the loop
+        # below never runs. A channel that flat cannot contain a dip deep enough
+        # to be a lick, so it is a ZERO-LICK channel, not a missing one -- we
+        # still save it (control cages sit here: no animal means a nearly flat
+        # trace, and their evaporation volume has to reach the combined file).
+        if len(unique_vals) - 1 > depth_back:
             # Get thresholds between each unique capacitance value
             thresholds = (unique_vals[:-1] + unique_vals[1:]) / 2.0
 
             n_peaks = np.full((len(thresholds),), np.nan)
             peak_bins = [None] * len(thresholds)
-
-            # A peak must cross a threshold this many levels lower to count as a
-            # real lick (see depth check below). The loop MUST start at depth_back
-            # so that i_thr - depth_back is never negative; a negative index would
-            # silently wrap to a HIGH threshold, disabling the depth filter and
-            # inflating counts (and IndexError on channels with < depth_back levels).
-            depth_back = 20
 
             for i_thr in range(depth_back, len(thresholds)):
                 thr = thresholds[i_thr]
@@ -326,6 +347,13 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
 
             peaks_row = peak_info[animal]['thr_and_peaks'][1, :]
             if np.all(np.isnan(peaks_row)):
+                # No threshold was ever evaluated -- same zero-lick case as a
+                # too-flat channel above. Save it rather than dropping it.
+                _record_zero_licks(data, animal, logfile,
+                                   f"no thresholds evaluated ({len(unique_vals)} capacitance levels)")
+                missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
+                if missing_data:
+                    del filtered_h5f[animal]
                 continue
             max_peaks = np.nanmax(peaks_row)
             i_thr = int(np.where(peaks_row == max_peaks)[0][0])
@@ -359,8 +387,11 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
                 data['lick_indices'] = np.array([], dtype=int)
             data['num_licks'] = int(len(data['lick_times']))
         else:
-            # Didn't have more than 3 separate capacitance values, so probably nothing was recorded
-            continue
+            # Too few capacitance levels for the threshold scan: a dip cannot be
+            # depth_back levels deep, so there are no licks to find here.
+            _record_zero_licks(data, animal, logfile,
+                               f"only {len(unique_vals)} capacitance levels, "
+                               f"need > {depth_back + 1} for the threshold scan")
         print(f"Animal {animal} had {data['num_licks']} licks detected")
         missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
         if missing_data:
