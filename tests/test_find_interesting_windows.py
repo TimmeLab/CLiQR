@@ -23,7 +23,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     parse_dlc_video_stem, read_dlc_windows,
     frame_window_to_session, clamp_to_trace,
     load_frame_session_times,
-    build_dlc_rois, dlc_exclusion_spans, bouts_outside_dlc,
+    build_dlc_rois, dlc_exclusion_spans, bouts_outside_dlc, build_no_dlc_rois_for_cycle,
     build_cycles_for_dlc,
     print_dlc_skips,
 )
@@ -255,6 +255,21 @@ def test_build_rois_climbing_skip_edges_does_not_touch_licking():
     rois = build_rois_for_cycle(cap, t, [30.0], [3.0], [20], lick_times, params)
     licks = [r for r in rois if r["category"] == "lick"]
     assert len(licks) == 1 and licks[0]["n_licks_in_window"] == 20
+
+
+def test_build_rois_for_cycle_emits_no_climbing_when_n_climb_is_zero():
+    # select_climbing_centers appends its first candidate before testing the count, so a caller
+    # asking for zero climbing windows used to get one anyway. Licking-only callers depend on this.
+    time_data = np.arange(0.0, 200.0, 0.01)
+    cap_data = np.random.RandomState(0).normal(size=time_data.size)
+    rois = build_rois_for_cycle(
+        cap_data, time_data,
+        bout_start_times=np.array([50.0]), bout_durations=np.array([3.0]),
+        bout_lick_counts=np.array([30]), lick_times=np.array([50.5]),
+        params={"n_lick": 3, "n_climb": 0, "roi_seconds": 12.0, "lick_pad": 2.0,
+                "var_window": 1.0, "min_var": 0.0, "climb_skip_edges": 0.0},
+    )
+    assert [r["category"] for r in rois] == ["lick"]
 
 
 def test_parse_offsets():
@@ -1033,3 +1048,54 @@ def test_bouts_outside_dlc_handles_no_bouts():
                                     coverage=(0.0, 10.0), guard_s=1.0)
     assert keep.size == 0
     assert sum(skips.values()) == 0
+
+
+def test_build_no_dlc_rois_for_cycle_keeps_only_unseen_bouts():
+    time_data = np.arange(0.0, 400.0, 0.01)
+    cap_data = np.zeros(time_data.size)
+    # Bout 0 (busiest) sits inside a DLC window; bout 1 does not.
+    starts = np.array([100.0, 300.0])
+    durations = np.array([4.0, 4.0])
+    counts = np.array([90, 20])
+    licks = np.concatenate([np.linspace(100.0, 104.0, 90), np.linspace(300.0, 304.0, 20)])
+    entry = {"spans": [(99.0, 106.0)], "coverage": (0.0, 400.0)}
+    rois, skips = build_no_dlc_rois_for_cycle(
+        cap_data, time_data, starts, durations, counts, licks, entry,
+        params={"n_lick": 3, "roi_seconds": 12.0, "lick_pad": 2.0, "dlc_guard": 1.0})
+
+    assert [r["category"] for r in rois] == ["no_dlc"]
+    assert [r["rank"] for r in rois] == [0]
+    assert rois[0]["score"] == 20.0
+    # Padded width (4 s bout + 2*2 s lick_pad = 8 s) is narrower than roi_seconds (12 s), so
+    # bout_window widens it to the 12 s minimum, centered on the bout center (302.0).
+    assert rois[0]["start"] == 296.0 and rois[0]["end"] == 308.0
+    assert rois[0]["n_licks_in_window"] == 20
+    assert skips["in_dlc_window"] == 1
+
+
+def test_build_no_dlc_rois_for_cycle_ranks_busiest_first():
+    time_data = np.arange(0.0, 500.0, 0.01)
+    cap_data = np.zeros(time_data.size)
+    starts = np.array([100.0, 300.0])
+    durations = np.array([4.0, 4.0])
+    counts = np.array([10, 40])
+    entry = {"spans": [], "coverage": (0.0, 500.0)}
+    rois, _ = build_no_dlc_rois_for_cycle(
+        cap_data, time_data, starts, durations, counts, np.array([]), entry,
+        params={"n_lick": 3, "roi_seconds": 12.0, "lick_pad": 2.0, "dlc_guard": 1.0})
+
+    assert [r["score"] for r in rois] == [40.0, 10.0]
+    assert [r["rank"] for r in rois] == [0, 1]
+
+
+def test_build_no_dlc_rois_for_cycle_emits_nothing_when_every_bout_is_seen():
+    time_data = np.arange(0.0, 200.0, 0.01)
+    cap_data = np.zeros(time_data.size)
+    entry = {"spans": [(90.0, 120.0)], "coverage": (0.0, 200.0)}
+    rois, skips = build_no_dlc_rois_for_cycle(
+        cap_data, time_data, np.array([100.0]), np.array([4.0]), np.array([30]),
+        np.array([]), entry,
+        params={"n_lick": 3, "roi_seconds": 12.0, "lick_pad": 2.0, "dlc_guard": 1.0})
+
+    assert rois == []
+    assert skips["in_dlc_window"] == 1

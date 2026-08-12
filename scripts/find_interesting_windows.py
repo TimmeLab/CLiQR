@@ -351,58 +351,61 @@ def build_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
     # ----------------------------------------------------------------------
     # CLIMBING regions: high-variance windows that avoid the detected bouts.
     # ----------------------------------------------------------------------
-    variance_window_samples = (max(1, int(round(params["var_window"] / median_dt_s)))
-                               if median_dt_s > 0 else 1)
-    window_variance = sliding_variance(cap_data, variance_window_samples)
-    if window_variance.size > 0 and median_dt_s > 0:
-        centers = center_sample_indices(window_variance.size, variance_window_samples)
-        # Read each window's time from the trace's own time base. Converting a sample index with an
-        # average rate silently assumes uniform sampling; on a real recording that drifts by tens of
-        # SECONDS by the end (the stalls above), which both mis-times the emitted clip and makes the
-        # bout mask below disqualify the wrong stretches.
-        center_times_s = time_data[centers]
+    if params["n_climb"] > 0:
+        variance_window_samples = (max(1, int(round(params["var_window"] / median_dt_s)))
+                                   if median_dt_s > 0 else 1)
+        window_variance = sliding_variance(cap_data, variance_window_samples)
+        if window_variance.size > 0 and median_dt_s > 0:
+            centers = center_sample_indices(window_variance.size, variance_window_samples)
+            # Read each window's time from the trace's own time base. Converting a sample index
+            # with an average rate silently assumes uniform sampling; on a real recording that
+            # drifts by tens of SECONDS by the end (the stalls above), which both mis-times the
+            # emitted clip and makes the bout mask below disqualify the wrong stretches.
+            center_times_s = time_data[centers]
 
-        # Disqualify windows on/near any detected bout. Guard by `roi_seconds + lick_pad`: that is
-        # at least the half-width of the bout's own licking window plus the half-width of a climbing
-        # window, so a surviving climbing window overlaps neither the bout nor its licking clip.
-        guard_seconds = params["roi_seconds"] + lick_pad_s
-        mask_bout_windows(window_variance, center_times_s, bout_start_times, bout_durations,
-                          guard_seconds)
+            # Disqualify windows on/near any detected bout. Guard by `roi_seconds + lick_pad`:
+            # that is at least the half-width of the bout's own licking window plus the
+            # half-width of a climbing window, so a surviving climbing window overlaps neither
+            # the bout nor its licking clip.
+            guard_seconds = params["roi_seconds"] + lick_pad_s
+            mask_bout_windows(window_variance, center_times_s, bout_start_times, bout_durations,
+                              guard_seconds)
 
-        # Disqualify the start and end of the session. Both edges are dominated by transients that
-        # have nothing to do with the animal climbing -- the operator handling the cage, inserting
-        # the sipper, the sensor settling at the start, and the reverse at the end -- and those
-        # transients are usually the LOUDEST excursions in the whole recording, so without this they
-        # crowd out the real climbing. The whole window (not just its center) must clear the edge,
-        # hence the extra half-window. Licking is untouched: a real bout near an edge is real.
-        skip_edges_s = float(params.get("climb_skip_edges", 300.0))
-        if skip_edges_s > 0.0:
-            half_window_s = params["roi_seconds"] / 2.0
-            too_early = center_times_s < first_s + skip_edges_s + half_window_s
-            too_late = center_times_s > span_s - skip_edges_s - half_window_s
-            window_variance[too_early | too_late] = -np.inf
+            # Disqualify the start and end of the session. Both edges are dominated by
+            # transients that have nothing to do with the animal climbing -- the operator
+            # handling the cage, inserting the sipper, the sensor settling at the start, and the
+            # reverse at the end -- and those transients are usually the LOUDEST excursions in
+            # the whole recording, so without this they crowd out the real climbing. The whole
+            # window (not just its center) must clear the edge, hence the extra half-window.
+            # Licking is untouched: a real bout near an edge is real.
+            skip_edges_s = float(params.get("climb_skip_edges", 300.0))
+            if skip_edges_s > 0.0:
+                half_window_s = params["roi_seconds"] / 2.0
+                too_early = center_times_s < first_s + skip_edges_s + half_window_s
+                too_late = center_times_s > span_s - skip_edges_s - half_window_s
+                window_variance[too_early | too_late] = -np.inf
 
-        # Optional variance floor: ignore windows below this, so we don't dredge up flat-signal
-        # "climbing" on a quiet recording. 0.0 (the default) disables the floor.
-        if params["min_var"] > 0.0:
-            window_variance[window_variance < params["min_var"]] = -np.inf
+            # Optional variance floor: ignore windows below this, so we don't dredge up
+            # flat-signal "climbing" on a quiet recording. 0.0 (the default) disables the floor.
+            if params["min_var"] > 0.0:
+                window_variance[window_variance < params["min_var"]] = -np.inf
 
-        picks = select_climbing_centers(
-            window_variance, center_times_s,
-            n_wanted=params["n_climb"],
-            min_separation_s=params["roi_seconds"],
-        )
-        for rank, (center_time, variance) in enumerate(picks):
-            start_s, end_s = clip_window(center_time, params["roi_seconds"], span_s, first_s)
-            rois.append({
-                "category": "climb",
-                "rank": rank,
-                "start": start_s,
-                "end": end_s,
-                "center": center_time,
-                "score": variance,
-                "n_licks_in_window": count_licks_in_window(lick_times, start_s, end_s),
-            })
+            picks = select_climbing_centers(
+                window_variance, center_times_s,
+                n_wanted=params["n_climb"],
+                min_separation_s=params["roi_seconds"],
+            )
+            for rank, (center_time, variance) in enumerate(picks):
+                start_s, end_s = clip_window(center_time, params["roi_seconds"], span_s, first_s)
+                rois.append({
+                    "category": "climb",
+                    "rank": rank,
+                    "start": start_s,
+                    "end": end_s,
+                    "center": center_time,
+                    "score": variance,
+                    "n_licks_in_window": count_licks_in_window(lick_times, start_s, end_s),
+                })
 
     return rois
 
@@ -794,6 +797,35 @@ def bouts_outside_dlc(bout_start_times, bout_durations, spans, coverage, guard_s
     keep &= ~inside_window
 
     return keep, skips
+
+
+def build_no_dlc_rois_for_cycle(cap_data, time_data, bout_start_times, bout_durations,
+                                bout_lick_counts, lick_times, entry, params):
+    """Regions for the busiest bouts of one cycle that DLC never saw: (rois, skips).
+
+    `entry` is one value from `dlc_exclusion_spans`. The surviving bouts go through the SAME
+    window construction as the trace search (`build_rois_for_cycle` with `n_climb=0`), so a clip
+    here is framed exactly like a licking clip there -- whole bout plus `--lick-pad` of context --
+    and only the selection differs. The category is renamed so the CSV, the clip filenames and the
+    crop decision can tell the two apart.
+    """
+    keep, skips = bouts_outside_dlc(bout_start_times, bout_durations, entry["spans"],
+                                    entry["coverage"], params["dlc_guard"])
+    if not np.any(keep):
+        return [], skips
+
+    rois = build_rois_for_cycle(
+        cap_data, time_data,
+        np.asarray(bout_start_times, dtype=np.float64)[keep],
+        np.asarray(bout_durations, dtype=np.float64)[keep],
+        np.asarray(bout_lick_counts)[keep],
+        lick_times,
+        {"n_lick": params["n_lick"], "n_climb": 0,
+         "roi_seconds": params["roi_seconds"], "lick_pad": params["lick_pad"]},
+    )
+    for roi in rois:
+        roi["category"] = "no_dlc"
+    return rois, skips
 
 
 def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
