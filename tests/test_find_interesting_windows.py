@@ -23,7 +23,7 @@ from scripts.find_interesting_windows import (  # noqa: E402
     parse_dlc_video_stem, read_dlc_windows,
     frame_window_to_session, clamp_to_trace,
     load_frame_session_times,
-    build_dlc_rois, dlc_exclusion_spans,
+    build_dlc_rois, dlc_exclusion_spans, bouts_outside_dlc,
     build_cycles_for_dlc,
     print_dlc_skips,
 )
@@ -983,3 +983,53 @@ def test_main_dlc_mode_writes_csv_and_commands(tmp_path, monkeypatch):
     assert "--speed 0.25" in sh_text
     assert "--no-crop" not in sh_text
     assert "--cycle 0" in sh_text
+
+
+def test_bouts_outside_dlc_keeps_bouts_no_window_touches():
+    starts = np.array([10.0, 100.0])
+    durations = np.array([5.0, 5.0])
+    keep, skips = bouts_outside_dlc(starts, durations, spans=[(95.0, 110.0)],
+                                    coverage=(0.0, 500.0), guard_s=1.0)
+    assert list(keep) == [True, False]
+    assert skips["in_dlc_window"] == 1
+    assert skips["outside_video"] == 0
+
+
+def test_bouts_outside_dlc_guard_band_disqualifies_near_misses():
+    # Bout ends at 20.0; the DLC window opens at 20.5. Half a second apart is inside the ragged
+    # edge a merge-gap/pad window has, so the guard must reject it -- and accept it when off.
+    starts = np.array([15.0])
+    durations = np.array([5.0])
+    guarded, _ = bouts_outside_dlc(starts, durations, spans=[(20.5, 25.0)],
+                                   coverage=(0.0, 500.0), guard_s=1.0)
+    unguarded, _ = bouts_outside_dlc(starts, durations, spans=[(20.5, 25.0)],
+                                     coverage=(0.0, 500.0), guard_s=0.0)
+    assert list(guarded) == [False]
+    assert list(unguarded) == [True]
+
+
+def test_bouts_outside_dlc_drops_bouts_outside_video_coverage():
+    # Before the camera started and after it stopped, DLC saw nothing, so "no window here" is not
+    # evidence the animal was away.
+    starts = np.array([5.0, 50.0, 900.0])
+    durations = np.array([2.0, 2.0, 2.0])
+    keep, skips = bouts_outside_dlc(starts, durations, spans=[], coverage=(10.0, 800.0),
+                                    guard_s=1.0)
+    assert list(keep) == [False, True, False]
+    assert skips["outside_video"] == 2
+    assert skips["in_dlc_window"] == 0
+
+
+def test_bouts_outside_dlc_requires_the_whole_bout_inside_coverage():
+    # Bout straddles the end of the video: DLC could not have scored its tail.
+    keep, skips = bouts_outside_dlc(np.array([790.0]), np.array([20.0]), spans=[],
+                                    coverage=(10.0, 800.0), guard_s=1.0)
+    assert list(keep) == [False]
+    assert skips["outside_video"] == 1
+
+
+def test_bouts_outside_dlc_handles_no_bouts():
+    keep, skips = bouts_outside_dlc(np.array([]), np.array([]), spans=[(1.0, 2.0)],
+                                    coverage=(0.0, 10.0), guard_s=1.0)
+    assert keep.size == 0
+    assert sum(skips.values()) == 0

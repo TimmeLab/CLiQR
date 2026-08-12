@@ -751,6 +751,51 @@ def dlc_exclusion_spans(dlc_rows, cycles, sess_loader=None):
     return by_stem, skips
 
 
+def bouts_outside_dlc(bout_start_times, bout_durations, spans, coverage, guard_s):
+    """Which detected bouts DLC never saw: (keep_mask, skips).
+
+    A bout is kept only if BOTH hold:
+
+    * it lies entirely within `coverage`, the video's session-time extent. A bout that starts
+      before the camera or runs past it was partly unobserved, and "DLC reported no window" says
+      nothing about an interval DLC never looked at;
+    * it intersects no span in `spans` after each span is grown by `guard_s` on both sides.
+
+    The guard band matters because a DLC window's edges are artefacts of `--merge-gap`,
+    `--min-frames` and `--pad` in find_dlc_windows.py, not the moment the animal arrived or left;
+    without it, bouts that start a few hundred milliseconds before a window opens survive and are
+    almost all real licks.
+
+    The test is applied to the BOUT, not to the padded clip window: the clip is deliberately wider
+    (`--lick-pad` of context), and showing the edge of a DLC window is useful context, not grounds
+    for disqualification.
+    """
+    starts = np.asarray(bout_start_times, dtype=np.float64)
+    durations = np.asarray(bout_durations, dtype=np.float64)
+    skips = {"outside_video": 0, "in_dlc_window": 0}
+    if starts.size == 0:
+        return np.zeros(0, dtype=bool), skips
+
+    ends = starts + durations
+    first_s, last_s = float(coverage[0]), float(coverage[1])
+
+    keep = np.ones(starts.size, dtype=bool)
+    outside = (starts < first_s) | (ends > last_s)
+    keep &= ~outside
+    skips["outside_video"] = int(np.count_nonzero(outside))
+
+    inside_window = np.zeros(starts.size, dtype=bool)
+    for span_start, span_end in spans:
+        guarded_start = float(span_start) - guard_s
+        guarded_end = float(span_end) + guard_s
+        inside_window |= (starts <= guarded_end) & (ends >= guarded_start)
+    # Count only bouts disqualified by DLC alone, so the two reasons never double-count one bout.
+    skips["in_dlc_window"] = int(np.count_nonzero(inside_window & ~outside))
+    keep &= ~inside_window
+
+    return keep, skips
+
+
 def build_cycles_for_dlc(combined_h5_path, raw_map=None, animals=None):
     """Everything `build_dlc_rois` needs about each cycle, keyed by the raw recording's stem.
 
