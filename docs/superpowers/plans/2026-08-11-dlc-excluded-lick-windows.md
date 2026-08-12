@@ -402,7 +402,9 @@ def test_build_no_dlc_rois_for_cycle_keeps_only_unseen_bouts():
     assert [r["category"] for r in rois] == ["no_dlc"]
     assert [r["rank"] for r in rois] == [0]
     assert rois[0]["score"] == 20.0
-    assert rois[0]["start"] == 298.0 and rois[0]["end"] == 306.0
+    # Padded width (4 s bout + 2*2 s lick_pad = 8 s) is narrower than roi_seconds (12 s), so
+    # bout_window widens it to the 12 s minimum, centered on the bout center (302.0).
+    assert rois[0]["start"] == 296.0 and rois[0]["end"] == 308.0
     assert rois[0]["n_licks_in_window"] == 20
     assert skips["in_dlc_window"] == 1
 
