@@ -92,7 +92,6 @@ Key functions:
 | `filter_data()` | Top-level: loads raw HDF5, trims to start/stop, runs algorithm |
 | `basic_algorithm()` | Threshold-based peak detection. Scans all inter-value thresholds, picks one maximizing peak count. Requires 2-threshold depth. |
 | `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. |
-| `_run_optimal_threshold()` | Grid-search threshold fraction maximizing R² vs. volume. Runs as comparison baseline. |
 | `compute_bout_structure()` | ILIs, bout lick counts, bout durations. Default params: `ibi_threshold=0.25, min_licks=3`. Call sites in notebook use `ibi_threshold=1.0, min_licks=2`. |
 | `save_filtered_data()` | Writes per-animal HDF5 group. |
 
@@ -102,7 +101,7 @@ Notebook pipeline:
 3. File selector GUI → pick raw HDF5 files per cohort
 4. Run `filter_data()` → `filtered_*.h5` per file
 5. Combine into `results_combined_*.h5` by animal ID
-6. Algorithm comparison (CLiQR vs. optimal threshold)
+6. Detection summary: per-session lick counts, lick-count vs. volume fit
 7. Behavioral metrics: ILI distribution, licks/bout, bout duration
 8. Temporal dynamics: 5-min bins across 2-hour session
 9. Correlation: OLS + RLM (HC3-robust), MAD-based outlier detection

@@ -157,7 +157,6 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
 
     # Flag to track if we had any animals without necessary data recorded
     missing_data = False
-    _run_optimal_threshold(data_by_animal)
     if algorithm == 'basic_threshold':
         missing_data = basic_algorithm(data_by_animal, filtered_h5f, logfile)
     elif algorithm == 'hilbert':
@@ -364,7 +363,11 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
             continue
         print(f"Animal {animal} had {data['num_licks']} licks detected")
         missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
-        if missing_data: return True
+        if missing_data:
+            # Rather than doing a return here to fully skip the file, we can
+            # just delete the group for the animal with missing data and continue
+            del filtered_h5f[animal]
+            continue
     return False # no missing data
 
 
@@ -486,7 +489,11 @@ def hilbert_algorithm(data_by_animal, filtered_h5f, logfile):
         data['num_licks'] = num_licks
         print(f"Animal {animal} had {num_licks} licks detected")
         missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
-        if missing_data: return missing_data
+        if missing_data:
+            # Rather than doing a return here to fully skip the file, we can
+            # just delete the group for the animal with missing data and continue
+            del filtered_h5f[animal]
+            continue
     return False # no data missing
 
 
@@ -534,7 +541,9 @@ def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None):
             data["lick_times"] = np.array([]); data["lick_indices"] = np.array([], dtype=int)
             data["num_licks"] = 0
             missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
-            if missing_data: return missing_data
+            if missing_data:
+                del filtered_h5f[animal]
+                continue
             continue
         lick_times = np.asarray(detect_licks(t, cap, bout_net, point_net))
         # Map lick TIMES back to indices in the (trimmed) original trace: np.searchsorted returns
@@ -548,59 +557,6 @@ def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None):
         missing_data = save_filtered_data(data, animal, filtered_h5f, logfile)
         if missing_data: return missing_data
     return False
-
-
-def _optimize_simple_threshold(data_by_animal, n_steps=200):
-    """Grid-search threshold fraction f ∈ [0, 1] of each animal's dynamic range
-    that maximizes R² between per-animal lick count and volume consumed."""
-    # Control cages have a sipper (so consumed_vol IS recorded) but no animal.
-    # Their "consumed" volume is evaporation/leak, not licking, and their trace
-    # is noise. Including them in this lick-count-vs-volume fit would let a
-    # noise-inflated count paired with a near-zero real intake bias the chosen
-    # threshold fraction. Every other stage of the pipeline holds controls out
-    # (see all_animal_ids in the notebook), so exclude them here too.
-    animals = [a for a in data_by_animal
-               if 'consumed_vol' in data_by_animal[a]
-               and len(data_by_animal[a].get('cap_data', [])) > 0
-               and not is_control(a)]
-    if len(animals) < 3:
-        return 0.5  # not enough data; fall back to midpoint
-
-    vols = np.array([data_by_animal[a]['consumed_vol'] for a in animals])
-    traces = [data_by_animal[a]['cap_data'] for a in animals]
-
-    fractions = np.linspace(0.01, 0.99, n_steps)
-    r2_vals = np.full(n_steps, np.nan)
-
-    for k, frac in enumerate(fractions):
-        counts = np.zeros(len(animals))
-        for j, trace in enumerate(traces):
-            thr = trace.min() + frac * (trace.max() - trace.min())
-            below = (trace < thr).astype(np.int8)
-            counts[j] = np.sum(np.diff(below) == 1)
-        if np.std(counts) == 0 or np.std(vols) == 0:
-            continue
-        r2_vals[k] = np.corrcoef(counts, vols)[0, 1] ** 2
-
-    best_k = int(np.nanargmax(r2_vals))
-    return fractions[best_k]
-
-
-def _run_optimal_threshold(data_by_animal):
-    """Add optimal threshold lick detection to each animal's data dict.
-    Threshold fraction (of each animal's dynamic range) is optimized to maximize
-    R² between lick count and volume consumed. Every downward crossing counts as one lick."""
-    opt_frac = _optimize_simple_threshold(data_by_animal)
-    print(f"Optimal threshold: fraction = {opt_frac:.3f} of each animal's dynamic range")
-
-    for animal, data in data_by_animal.items():
-        trace = data['cap_data']
-        times = data['time_data']
-        thr = float(trace.min() + opt_frac * (trace.max() - trace.min()))
-        below = (trace < thr).astype(np.int8)
-        lick_starts = np.where(np.diff(below) == 1)[0] + 1
-        data['optimal_lick_times'] = times[lick_starts]
-        data['optimal_lick_indices'] = lick_starts
 
 
 def compute_bout_structure(lick_times, ibi_threshold=0.25, min_licks=3):
@@ -648,22 +604,15 @@ def save_filtered_data(data, animal, filtered_h5f, logfile):
         grp.create_dataset('used_stop_idx', data=data['used_stop_idx'])
     except KeyError as e:
         with open(logfile, 'a') as lf:
-            lf.write(f"Caught KeyError {e}, volumes not recorded for {animal}\n")
+            lf.write(f"Caught KeyError {e}, no licks recorded for {animal}\n")
         print(f'Caught KeyError {e}, no licks recorded for {animal}')
         missing_data = True
     try:
-        grp.create_dataset('optimal_lick_times', data=data.get('optimal_lick_times', np.array([])))
-        grp.create_dataset('optimal_lick_indices', data=data.get('optimal_lick_indices', np.array([], dtype=int)))
         metrics = compute_bout_structure(data['lick_times'], ibi_threshold=1., min_licks=2)
         grp.create_dataset('ILIs', data=metrics['ILIs'])
         grp.create_dataset('bout_lick_counts', data=metrics['bout_lick_counts'])
         grp.create_dataset('bout_durations', data=metrics['bout_durations'])
         grp.create_dataset('bout_start_times', data=metrics['bout_start_times'])
-        opt_metrics = compute_bout_structure(data.get('optimal_lick_times', np.array([])), ibi_threshold=1., min_licks=2)
-        grp.create_dataset('optimal_ILIs', data=opt_metrics['ILIs'])
-        grp.create_dataset('optimal_bout_lick_counts', data=opt_metrics['bout_lick_counts'])
-        grp.create_dataset('optimal_bout_durations', data=opt_metrics['bout_durations'])
-        grp.create_dataset('optimal_bout_start_times', data=opt_metrics['bout_start_times'])
     except Exception as e:
         with open(logfile, 'a') as lf:
             lf.write(f"Warning: could not save supplementary metrics for {animal}: {e}\n")

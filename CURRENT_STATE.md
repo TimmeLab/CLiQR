@@ -37,7 +37,6 @@ Entry point: `recording_gui.py` (Solara web app, `localhost:8765`)
 | `filter_data()` | Top-level: loads raw HDF5, trims to start/stop times, calls algorithm |
 | `basic_algorithm()` | Threshold-based peak detection. Scans all inter-value thresholds, picks the one maximizing peak count. Requires 2-threshold depth. |
 | `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. Experimental (manuscript uses `basic_algorithm()`). Applies 2 high-pass + 2 low-pass filtfilt passes (see corrected Known Issue #2). |
-| `_run_optimal_threshold()` | Grid-search threshold fraction maximizing R² vs. volume. Comparison baseline. |
 | `compute_bout_structure()` | ILIs, bout lick counts, bout durations. |
 | `save_filtered_data()` | Writes per-animal HDF5 group. |
 
@@ -46,7 +45,7 @@ Entry point: `recording_gui.py` (Solara web app, `localhost:8765`)
 Multi-cohort batch analysis with Panel widgets. Includes:
 - File selector GUI for raw HDF5 files per cohort
 - Lick detection via `filter_data()`
-- Algorithm comparison (CLiQR vs. optimal threshold)
+- Detection summary: per-session lick counts, lick-count vs. volume fit
 - Behavioral metrics: ILI distribution, licks/bout, bout duration
 - Temporal dynamics: 5-min bins across 2-hour session
 - Correlation analysis: OLS + RLM (HC3-robust), MAD-based outlier detection
@@ -62,7 +61,6 @@ Recently updated to include outlier handling and additional analyses requested b
 - `cliqr_cumulative_licks.csv`, `cliqr_cumulative_licks_outliers_removed.csv`
 - `cliqr_cumulative_bouts.csv`, `cliqr_cumulative_bouts_outliers_removed.csv`
 - `nLicksVsVol_outliers_removed.csv`
-- `optimal_threshold_lick_counts_and_volume.csv`
 
 ---
 
