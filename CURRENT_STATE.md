@@ -1,10 +1,10 @@
-# CLiQR — Current State (as of 2026-05-28)
+# CLiQR — Current State (as of 2026-08-13)
 
 ## System Summary
 
-CLiQR (Capacitive Lick Quantification in Rodents) records rodent licking behavior via MPR121 capacitive touch sensors on FT232H USB-to-I2C boards. Two primary subsystems: **recording GUI** (complete, in production) and **data analysis pipeline** (functional, actively maintained for manuscript). A third subsystem, **false positive analysis**, has been implemented and run on the ACG-26-3 cohort.
+CLiQR (Capacitive Lick Quantification in Rodents) records rodent licking behavior via MPR121 capacitive touch sensors on FT232H USB-to-I2C boards. Two primary subsystems: **recording GUI** (complete) and **data analysis pipeline** (functional, actively maintained for manuscript). A third subsystem, **false positive analysis**, has been implemented and run on the ACG-26-3 cohort.
 
-Hardware: 4 FT232H boards × 1 MPR121 each × 6 channels = 24 sensors. Sampling ~56 Hz. Data stored as HDF5.
+Hardware: 4 FT232H boards × 1 MPR121 each × 6 channels = 24 sensors. Sampling ~110 Hz. Data stored as HDF5.
 
 ---
 
@@ -36,7 +36,7 @@ Entry point: `recording_gui.py` (Solara web app, `localhost:8765`)
 |---|---|
 | `filter_data()` | Top-level: loads raw HDF5, trims to start/stop times, calls algorithm |
 | `basic_algorithm()` | Threshold-based peak detection. Scans all inter-value thresholds, picks the one maximizing peak count. Requires 2-threshold depth. |
-| `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. Experimental (manuscript uses `basic_algorithm()`). Applies 2 high-pass + 2 low-pass filtfilt passes (see corrected Known Issue #2). |
+| `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. Experimental (manuscript uses `basic_algorithm()`). Applies 2 high-pass + 2 low-pass filtfilt passes. |
 | `compute_bout_structure()` | ILIs, bout lick counts, bout durations. |
 | `save_filtered_data()` | Writes per-animal HDF5 group. |
 
@@ -51,8 +51,6 @@ Multi-cohort batch analysis with Panel widgets. Includes:
 - Correlation analysis: OLS + RLM (HC3-robust), MAD-based outlier detection
 - Outlier exclusion UI → re-fit clean regression
 - CSV exports for Prism
-
-Recently updated to include outlier handling and additional analyses requested by reviewers (eNeuro submission).
 
 **Output CSVs** (repo root):
 - `cliqr_ILIs.csv`, `cliqr_ILIs_outliers_removed.csv`
@@ -86,23 +84,6 @@ Full pipeline — standalone, no imports from `data_analysis.py`:
 
 **Time alignment note:** Pi clock unreliable; only relative frame offsets in `.txt` files are trustworthy. Sipper insertion detected as a step-**down** in cap_data (sipper insertion decreases capacitance baseline). Sipper removal detected as step-**up** after stop_time for optional drift correction.
 
-#### Notebook: `FalsePositive.ipynb`
-
-Manifest-driven pipeline. Edit `SESSION_DIR` to point at a cohort folder. Reads `session_manifest.csv` with columns `task_id, xml_path, txt_path, raw_h5, filtered_h5, animal_id, sensor_num`. Produces per-session HTML/PNG figures and `false_positive_results.csv`.
-
-Sections: Configuration → Load Manifest → Run Pipeline → Alignment QC → Summary Table + Bar Chart → Export CSV.
-
-#### Results — ACG-26-3 Cohort
-
-4 sessions analyzed, saved in `false_positive_results.csv` and plotted in `False Positive Figures/`:
-
-| Session | Animal | Sensor | n_licks | TP | FP | Excluded | FP Rate |
-|---|---|---|---|---|---|---|---|
-| ACG-26-3-1 Day 1 | ACG-26-3-1 | 1 | 499 | 433 | 66 | 0 | 13.2% |
-| ACG-26-3-1 Day 2 | ACG-26-3-1 | 1 | 33 | 10 | 6 | 17 | 37.5% |
-| ACG-26-3-1 Day 4 | ACG-26-3-1 | 1 | 510 | 320 | 187 | 3 | 36.9% |
-| ACG-26-3-8 Day 5 | ACG-26-3-8 | 15 | 482 | 481 | 1 | 0 | 0.2% |
-
 ---
 
 ### Concurrent Video Capture — IMPLEMENTED
@@ -120,34 +101,6 @@ Pi 5 + Pi Camera 3 records video in sync with capacitive recording, over TCP.
 Per-sensor Start bookmarks the current video frame; `video_frame_index` /
 `video_pts` / `video_filename` written into the session HDF5. Replaces sipper-step
 alignment for new recordings. Guide: `docs/VIDEO_CAPTURE.md`.
-
----
-
-## Data on Disk
-
-**Cohorts analyzed (lickometry):** AEW2, AEW4, AEW5, AEW6, Example
-
-**Cohort analyzed (false positive validation):** ACG-26-3
-- Raw HDF5s, filtered HDF5s, CVAT annotation XMLs, picamera MP4s and TXT frame-offset files, session_manifest.csv — all in `Lickometry Data/ACG-26-3/`
-
-**Combined results files** (in `Lickometry Data/`):
-- `results_combined_Example_2025-09-01.h5`
-- `results_combined_AEW4-AEW5-AEW6_2026-01-19_20_21_22_23.h5`
-- `results_combined_AEW4-AEW5-AEW6_2025-09-01_02_03_04_05_10-13_14_15_16_17_2026-01-20_21_22_23.h5` (most complete)
-- `results_combined_ACG-26-3_2026-05-19_21_22.h5`
-
-Two raw HDF5 files from 2026-02-18 are in the `Lickometry Data/` root, not organized into a cohort folder.
-
----
-
-## Manuscript Status
-
-- eNeuro submission decision received April 2026 (`eNeuro_decision_Apr2026.pdf`)
-- `Manuscript Supplemental/` contains Hardware Assembly docx, Parts List xlsx, System Operation docx, Prism file
-- All CSV exports and figures tied to this submission
-- False positive analysis is additional validation work (post-submission or for revision)
-
----
 
 ## Environment & Dependencies
 
@@ -176,17 +129,6 @@ Dev: pyenv-virtualenv (`cliqr` env), macOS. Deploy: Miniforge/conda, Windows.
 |---|---|
 | `DataRecording.ipynb` | Deprecated — replaced by `recording_gui.py` |
 | `MPR121_DataAnalysis.ipynb` | Earlier single-file analysis (ipywidgets). Superseded by `DataAnalysis.ipynb`. |
-| `DataAnalysis_old.ipynb` | Archive |
 | `lickDetector.m`, `lickDetector_modified.m`, `lickDetector_old.m` | Original MATLAB scripts. Reference only. |
-| `filtered_data.mat` | MATLAB output artifact |
-| `ftconf.py`, `dump_ftdi_eeprom.py` | Hardware utility scripts (one-off use) |
 
 ---
-
-## Known Issues / Technical Debt
-
-1. ~~**Sensor-board mapping duplicated**~~ — RESOLVED. `data_analysis.py` now derives `SENSOR_BOARD_MAP` from `utils/state.SERIAL_NUMBER_SENSOR_MAP` (single source of truth, same as `false_positive_analysis.py`). The old hardcoded copy encoded only the retired 4-board layout and raised KeyErrors on 8-board recordings.
-2. ~~**`hilbert_algorithm()` filter passes (7×)**~~ — CORRECTED, claim was false. The old `[filtfilt(...) for _ in range(6)][-1]` one-liner never rebound its input, so all 6 list entries were identical and only ONE survived `[-1]`. Real behavior = 2 high-pass + 2 low-pass filtfilt passes total, not 7. Code now spells this out; numerical behavior unchanged. `hilbert_algorithm()` is experimental; manuscript uses `basic_algorithm()`.
-3. **`compute_bout_structure()` param inconsistency** — function signature defaults `ibi_threshold=0.25, min_licks=3`; notebook + `save_filtered_data()` call sites pass `ibi_threshold=1.0, min_licks=2`.
-4. **ML experiments not integrated** — `checkpoints/best.pt` and `Training Data/*.pt` exist but no training script or inference path is in the repo.
-5. **Two raw HDF5 files unorganized** — `Lickometry Data/raw_data_2026-02-18_*.h5` not in a cohort folder and not analyzed.
