@@ -555,8 +555,11 @@ def test_load_frame_session_times_times_encoded_frames_not_captured_ones(tmp_pat
     # One time per ENCODED frame, not per captured frame.
     assert sess.size == encoded.size
     # Bookmark frame 1 is session zero (0.1 s into the video file), so the encoded frames sit at
-    # -0.1, 0.0, 0.2, 0.4 s.
-    np.testing.assert_allclose(sess, [-0.1, 0.0, 0.2, 0.4], atol=1e-9)
+    # -0.1, 0.0, 0.2, 0.4 s. The fixture writes no Stop bookmark, so the clock carries
+    # RIG_DRIFT_SLOPE rather than exactly 1.0; over the 0.5 s of this fixture that is 3 ns, hence
+    # the tolerance. This test is about WHICH frames get times, not about the slope -- see
+    # tests/test_trimcrop.py for the slope itself.
+    np.testing.assert_allclose(sess, [-0.1, 0.0, 0.2, 0.4], atol=1e-5)
 
 
 def test_load_frame_session_times_missing_pts_sidecar_returns_none(tmp_path):

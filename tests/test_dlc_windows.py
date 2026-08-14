@@ -356,6 +356,61 @@ def test_build_near_mask_rejects_an_unknown_bodypart():
         fdw.build_near_mask(coords, "jaw", 0.8, points, threshold_px=90.0)
 
 
+# --------------------------------------------------------- the gate over several bodyparts
+def test_parse_bodyparts_splits_and_deduplicates():
+    assert fdw.parse_bodyparts("nose") == ["nose"]
+    assert fdw.parse_bodyparts(" nose , tongue ,jaw") == ["nose", "tongue", "jaw"]
+    assert fdw.parse_bodyparts("nose,nose") == ["nose"]
+    with pytest.raises(ValueError):
+        fdw.parse_bodyparts(" , ")
+
+
+def test_build_presence_mask_is_the_union_over_bodyparts():
+    """Nose confident in the first half, tongue in the second: every frame counts."""
+    n = 200
+    nose_like = np.concatenate([np.full(100, 0.95), np.full(100, 0.1)])
+    tongue_like = np.concatenate([np.full(100, 0.1), np.full(100, 0.95)])
+    coords = {
+        "nose": _nose_coords(np.full(n, 5.0), np.full(n, 5.0), nose_like),
+        "tongue": _nose_coords(np.full(n, 5.0), np.full(n, 5.0), tongue_like),
+    }
+    mask, dist, like = fdw.build_presence_mask(coords, ["nose", "tongue"], 0.8, None, None)
+    assert mask.all()
+    assert dist is None
+    # The reported likelihood is whichever part carried the frame.
+    assert like[0] == pytest.approx(0.95)
+    assert like[150] == pytest.approx(0.95)
+
+
+def test_build_presence_mask_matches_build_near_mask_for_one_bodypart():
+    points = [(100.0, 100.0), (100.0, 190.0)]
+    x = np.concatenate([np.full(100, 105.0), np.full(100, 505.0)])
+    coords = {"nose": _nose_coords(x, np.full(200, 140.0), np.full(200, 0.95))}
+    ref_mask, ref_dist = fdw.build_near_mask(coords, "nose", 0.8, points, threshold_px=90.0)
+    mask, dist, like = fdw.build_presence_mask(coords, ["nose"], 0.8, points, threshold_px=90.0)
+    assert np.array_equal(mask, ref_mask)
+    # Distance is only defined where the gate passed; elsewhere it is NaN by construction.
+    assert dist[:100] == pytest.approx(ref_dist[:100])
+    assert np.isnan(dist[100:]).all()
+    assert like == pytest.approx(coords["nose"]["likelihood"])
+
+
+def test_build_presence_mask_distance_ignores_unconfident_parts():
+    """A stray low-likelihood jaw sitting on the sipper must not win the per-frame minimum."""
+    points = [(100.0, 100.0), (100.0, 190.0)]
+    n = 50
+    coords = {
+        # Nose: confident, 5 px from the sipper -- this is what carries every frame.
+        "nose": _nose_coords(np.full(n, 105.0), np.full(n, 140.0), np.full(n, 0.95)),
+        # Jaw: sitting exactly on the polyline but never confident.
+        "jaw": _nose_coords(np.full(n, 100.0), np.full(n, 140.0), np.full(n, 0.2)),
+    }
+    mask, dist, _like = fdw.build_presence_mask(coords, ["nose", "jaw"], 0.8, points,
+                                                threshold_px=90.0)
+    assert mask.all()
+    assert dist == pytest.approx(np.full(n, 5.0))
+
+
 # ------------------------------------------------------------------ rows_for_file (assembly)
 def _sipper_polyline_coords(n=6000):
     """Sipper polyline at x=300, y=100..190 (four keypoints, arc length 90 px), all confident."""

@@ -138,16 +138,29 @@ class SessionClock:
         return self.latency + self.slope * (pts_sec - self.pts_start_sec)
 
 
-def session_clock(anchor, pts_ns):
+# Median two-bookmark slope of the five ACG-26-3 sessions that HAVE a Stop bookmark
+# (2026-07-23/24/27/28/29): 0.999994413, 0.999992955, 0.999994065, 0.999994457, 0.999992664.
+# The camera's PTS clock runs ~7 us/s fast against the host, consistently across sessions --
+# same Pi, same camera, same host. It is the right prior for a recording whose own Stop
+# bookmark is missing, which happens on a RESTART recording: read_video_anchor resolves the
+# highest cycle suffix, and the GUI wrote the Stop bookmark for the cycle that was aborted, so
+# `video_stop_*{suffix}` does not exist. Measured, not assumed; re-derive it if the rig changes.
+RIG_DRIFT_SLOPE = 0.999994
+
+
+def session_clock(anchor, pts_ns, fallback_slope=1.0):
     """Build the SessionClock for a recording from its anchor and PTS sidecar.
 
     pts_start_sec is the bookmark frame's offset from the first frame
-    (compute_video_base), keeping the clock in the 0-based video-file domain."""
+    (compute_video_base), keeping the clock in the 0-based video-file domain.
+
+    `fallback_slope` is used only when the recording has no usable Stop bookmark; pass
+    RIG_DRIFT_SLOPE to substitute the rig's measured drift rather than assume none."""
     pts_ns = np.asarray(pts_ns)
     pts_start_sec = compute_video_base(pts_ns, anchor.video_frame_index)
     return SessionClock(pts_start_sec=pts_start_sec,
                         latency=anchor.latency,
-                        slope=anchor.drift_slope(pts_ns))
+                        slope=anchor.drift_slope(pts_ns, fallback=fallback_slope))
 
 
 def frame_session_times(clock, pts_ns):
@@ -330,20 +343,26 @@ class VideoAnchor:
         return bookmark_latency(self.host_after, self.start_time,
                                 self.pi_monotonic, self.video_pts)
 
-    def drift_slope(self, pts_ns) -> float:
-        """host-seconds per video-second from the two bookmarks; 1.0 when the Stop
-        bookmark (or the Start host bracket) is absent, or the fit is degenerate.
+    def drift_slope(self, pts_ns, fallback=1.0) -> float:
+        """host-seconds per video-second from the two bookmarks; `fallback` when the
+        Stop bookmark (or the Start host bracket) is absent, or the fit is degenerate.
 
         Both endpoints use each bookmark's END-of-bracket host time (host_after,
-        backed off the Pi capture->exec gap), mirroring ``bookmark_latency``."""
+        backed off the Pi capture->exec gap), mirroring ``bookmark_latency``.
+
+        `fallback` defaults to 1.0 -- "assume the two clocks agree" -- which is what a
+        caller with no better information should use. A caller that DOES know the rig's
+        typical slope should pass it (see RIG_DRIFT_SLOPE): 1.0 is not a neutral choice,
+        it is a claim of zero drift, and on our hardware that claim is wrong by ~7 us/s,
+        which accumulates to 5-6 frames of video lag across a 2 h session."""
         if (self.stop_frame_index is None or self.stop_host_after is None
                 or self.host_after is None):
-            return 1.0
+            return fallback
         pts_ns = np.asarray(pts_ns)
         pts_start = float(pts_ns[self.video_frame_index]) / 1e9
         pts_stop = float(pts_ns[self.stop_frame_index]) / 1e9
         if pts_stop == pts_start:
-            return 1.0
+            return fallback
         host_start = _frame_host_time(self.host_after, self.pi_monotonic,
                                       self.video_pts)
         host_stop = _frame_host_time(self.stop_host_after, self.stop_pi_monotonic,

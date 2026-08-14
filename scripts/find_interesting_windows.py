@@ -66,17 +66,33 @@ What it produces
 Time-base caveat (restart recordings)
 --------------------------------------
 For a plain single-cycle recording, the combined-file time base and make_sync_video's `--start`
-reference agree, because both are produced by `filter_data`. But a RESTART recording (the operator
-stopped and restarted within one raw file, writing numbered `start_time1`, `start_time2`, ...) has
-a known history of the two references disagreeing by a fixed offset (~280 s was seen for the
-2026-07-22 recording). We do NOT silently shift times to "fix" this, because getting the shift
-subtly wrong would misalign every clip. Instead, for any cycle whose raw file is a restart
-recording, the emitted command is preceded by a loud WARNING comment telling you to verify the
-alignment and, if needed, re-run this script with `--offset <cycle>=<seconds>`, which adds the
-offset to that cycle's start/end. In DLC mode the warning says something different, because the
-remedy is different: a DLC window is already expressed in make_sync_video's own anchor reference, so
-`--offset` would slide the clip off the frames DLC selected; there the fix is `--sync-offset` on
-make_sync_video, which moves the trace against the video instead of moving the window.
+reference agree, because both are produced by `filter_data`. A RESTART recording (the operator
+stopped and restarted within one raw file, writing numbered `start_time1`, `start_time2`, ...)
+carries two DIFFERENT risks, which have different symptoms and different remedies:
+
+1. DRIFT (the one actually observed on 2026-07-22). `read_video_anchor` resolves the highest cycle
+   suffix, but the GUI wrote the Stop bookmark unsuffixed, for the cycle that was ABORTED. So
+   `video_stop_*{suffix}` does not exist, the two-bookmark drift fit is impossible, and without a
+   substitute the slope would be pinned at 1.0 -- a claim of zero drift that is wrong by ~7 us/s on
+   this rig, i.e. a video lag that GROWS to 5-6 frames by the end of a 2 h session. Both this
+   script and make_sync_video therefore fall back to `RIG_DRIFT_SLOPE`, the median slope of the
+   sessions that do have both bookmarks. A constant `--sync-offset` cannot cancel a growing error;
+   `--sync-slope` is the knob if the fallback is wrong for a given recording.
+2. OFFSET. The combined file anchors wherever its `used_start_idx` landed, which need not be the
+   cycle make_sync_video anchors to; a mismatch shifts every clip by a constant (it would be
+   start_time1 - start_time = 280.3 s for the 2026-07-22 file). This one is a RISK, not a standing
+   fact: measured for that file, `raw time_data[used_start_idx]` = 1784735595.066 == `start_time1`,
+   so the offset is 0 and no correction is warranted. Check it per combined file rather than
+   assuming either way.
+
+We do NOT silently shift times to "fix" (2), because getting the shift subtly wrong would misalign
+every clip. Instead, for any cycle whose raw file is a restart recording, the emitted command is
+preceded by a loud WARNING comment naming both risks. If (2) turns out to apply, re-run this script
+with `--offset <cycle>=<seconds>`, which adds the offset to that cycle's start/end. In DLC mode the
+warning says something different, because the remedy is different: a DLC window is already
+expressed in make_sync_video's own anchor reference, so `--offset` would slide the clip off the
+frames DLC selected; there the fix is `--sync-offset` on make_sync_video, which moves the trace
+against the video instead of moving the window.
 
 Provenance
 ----------
@@ -129,7 +145,7 @@ if _REPO_ROOT not in sys.path:
 # re-implementing the (fiddly) video-sensor / cycle-suffix logic here.
 from video.trimcrop import (  # noqa: E402
     find_video_sensor, read_video_anchor, _resolve_cycle,
-    frame_session_times, resolve_paths, session_clock,
+    frame_session_times, resolve_paths, session_clock, RIG_DRIFT_SLOPE,
 )
 
 
@@ -482,7 +498,8 @@ def resolve_filmed_animal(raw_h5_path, layout_path):
 
 def is_restart_recording(raw_h5_path):
     """True if the raw recording is a RESTART recording (stopped/restarted mid-file), which is the
-    case that carries the known time-base offset risk.
+    case that carries the time-base risks (missing drift fit, possible anchor offset) described in
+    the module docstring.
 
     A restart recording writes numbered cycle keys (`start_time1`, ...) on the video sensor group;
     `_resolve_cycle` returns a non-empty suffix in that case. Returns False if we can't tell (no
@@ -607,7 +624,10 @@ def load_frame_session_times(raw_h5_path):
         pts_ns = np.loadtxt(pts_txt, dtype=np.int64)
         if np.asarray(pts_ns).size < 2:
             return None
-        clock = session_clock(anchor, pts_ns)
+        # Same fallback slope the renderer uses. If these two disagree about the clock, a DLC
+        # window computed here selects different frames than make_sync_video will place, which
+        # is exactly the misalignment the window was supposed to guarantee against.
+        clock = session_clock(anchor, pts_ns, fallback_slope=RIG_DRIFT_SLOPE)
         return frame_session_times(clock, load_container_pts(pts_txt, pts_ns))
     except (ValueError, KeyError, OSError, IndexError):
         return None
@@ -968,9 +988,17 @@ def build_command(row, out_dir, offsets, combined_h5, speed=1.0):
     # supplied an offset for this cycle, in which case we assume it's handled).
     if row.get("restart") and not offset:
         lines.append(f"# WARNING cycle {cycle} ({os.path.basename(row['raw_h5'])}) is a RESTART "
-                     f"recording;")
-        lines.append(f"#   the combined-file time base may be offset from make_sync_video's "
-                     f"Start-bookmark reference.")
+                     f"recording; TWO independent risks:")
+        lines.append(f"#   (1) DRIFT: the Stop bookmark is written for the ABORTED cycle, so the "
+                     f"two-bookmark drift fit is impossible for the cycle actually rendered. "
+                     f"make_sync_video substitutes the rig's measured slope and says so in its "
+                     f"log; a residual lag that GROWS with session position means that "
+                     f"substitution is wrong for this recording -- fix with --sync-slope, never "
+                     f"--sync-offset (a constant cannot cancel a growing error).")
+        lines.append(f"#   (2) OFFSET: the combined-file time base may be anchored to a different "
+                     f"cycle than make_sync_video's Start bookmark, which would shift every clip "
+                     f"by a constant. Verify with: raw time_data[used_start_idx] vs start_time / "
+                     f"start_time1. (Measured 0 for the 2026-07-22 file.)")
         if row["category"] == "dlc":
             # A DLC window is ALREADY in make_sync_video's anchor reference: it was converted from
             # container frames with the renderer's own SessionClock. --offset would shift start and
@@ -1113,9 +1141,10 @@ def run_dlc_exclude_mode(args, raw_map):
     DLC spans are on the session clock (`load_frame_session_times` / `SessionClock`, anchored via
     the recording's own PTS sidecar); bout times are on the combined file's clock (`filter_data`'s
     per-cycle rebasing). For a plain single-cycle recording these agree. For a RESTART recording
-    (operator stopped and restarted within one raw file) the two have been observed to disagree by
-    a fixed offset (~280 s for the 2026-07-22 recording) -- see the module docstring's "Time-base
-    caveat". Unlike `--dlc-windows`, where a DLC window IS the renderer's own reference and so does
+    (operator stopped and restarted within one raw file) they CAN disagree by a fixed offset --
+    280.3 s for the 2026-07-22 recording had its combined file anchored to the aborted cycle, which
+    on measurement it did not -- see the module docstring's "Time-base caveat" for how to check a
+    given combined file. Unlike `--dlc-windows`, where a DLC window IS the renderer's own reference and so does
     not care whether the two clocks agree, THIS mode compares the two clocks directly (spans vs.
     bout times), so a silent offset here would convert real drinking into a reported "false
     positive" and hide genuine ones -- and it would do so invisibly: `coverage` is derived from the

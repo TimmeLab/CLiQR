@@ -264,6 +264,58 @@ def test_drift_slope_defaults_to_one_without_stop():
     assert anchor.drift_slope(pts_ns) == 1.0
 
 
+def _anchor_without_stop():
+    """A restart recording's anchor: Start bookmark present, Stop bookmark absent because the
+    GUI wrote it for the cycle that was aborted."""
+    return tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=0,
+        start_time=1000.0, stop_time=1001.0,
+        host_before=1000.0, host_after=1000.2)
+
+
+def test_drift_slope_uses_the_fallback_when_the_stop_bookmark_is_missing():
+    pts_ns = (np.arange(0, 10) * 1_000_000).astype(np.int64)
+    anchor = _anchor_without_stop()
+    assert anchor.drift_slope(pts_ns, fallback=tc.RIG_DRIFT_SLOPE) == tc.RIG_DRIFT_SLOPE
+
+
+def test_drift_slope_ignores_the_fallback_when_both_bookmarks_are_present():
+    """The fallback must never override a real two-bookmark fit."""
+    slope_true = 1.0 / 1.001
+    pts_ns = (np.arange(0, 1000) * 1_000_000).astype(np.int64)
+    anchor = tc.VideoAnchor(
+        sensor_number=1, video_filename="v.mp4", video_frame_index=0,
+        start_time=1000.0, stop_time=1001.0,
+        host_before=999.9, host_after=1000.0,
+        stop_frame_index=999,
+        stop_host_before=1000.0 + 0.999 * slope_true - 0.1,
+        stop_host_after=1000.0 + 0.999 * slope_true)
+    assert anchor.drift_slope(pts_ns, fallback=0.5) == pytest.approx(slope_true, rel=1e-6)
+
+
+def test_session_clock_passes_the_fallback_slope_through():
+    pts_ns = (np.arange(0, 10) * 1_000_000).astype(np.int64)
+    anchor = _anchor_without_stop()
+    assert tc.session_clock(anchor, pts_ns).slope == 1.0
+    clock = tc.session_clock(anchor, pts_ns, fallback_slope=tc.RIG_DRIFT_SLOPE)
+    assert clock.slope == tc.RIG_DRIFT_SLOPE
+
+
+def test_rig_drift_slope_moves_frame_times_by_frames_not_milliseconds():
+    """The whole point of the fallback: over a 2 h session the correction is several frames.
+
+    Pinning the slope at 1.0 assigns each frame a session time LATER than the truth, so the frame
+    chosen for a given trace time is one captured earlier -- the video lags."""
+    session_s = 7200.0
+    pts_ns = np.array([0, int(session_s * 1e9)], dtype=np.int64)
+    anchor = _anchor_without_stop()
+    naive = tc.session_clock(anchor, pts_ns)
+    corrected = tc.session_clock(anchor, pts_ns, fallback_slope=tc.RIG_DRIFT_SLOPE)
+    drift_s = naive.session_time(session_s) - corrected.session_time(session_s)
+    assert drift_s > 0
+    assert drift_s * 120.0 == pytest.approx(5.2, abs=0.5)  # frames at 120 fps
+
+
 def test_session_clock_builder_reads_anchor():
     pts_ns = (np.arange(0, 11) * 100_000_000).astype(np.int64)
     anchor = tc.VideoAnchor(

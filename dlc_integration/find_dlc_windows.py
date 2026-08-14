@@ -22,7 +22,11 @@ remain relatable to the capacitance trace.
 How a window is built (in order)
 --------------------------------
 1. `mask = likelihood >= --pcutoff` over the chosen `--bodypart`, AND that bodypart within
-   `--max-nose-dist` (a fraction of the sipper tip's arc length) of the sipper. The sipper's
+   `--max-nose-dist` (a fraction of the sipper tip's arc length) of the sipper. `--bodypart` takes
+   a comma-separated list, in which case the per-part gates are OR'd -- a frame counts when ANY
+   listed part passes. Use that (with `--max-nose-dist 0`) for "was the animal visible at all",
+   the gate to hand-score against; a single part with proximity is the "was it at the sipper"
+   gate. The sipper's
    position is the per-session median of the four `sipper_*` keypoints, which move by only 0.5-3.5
    px within a recording. `--max-nose-dist 0` drops the proximity test and restores the original
    likelihood-only gate. Proximity matters because a confident nose ANYWHERE in frame -- the animal
@@ -348,6 +352,46 @@ def build_near_mask(coords, bodypart, pcutoff, points, threshold_px):
     return confident & (dist <= threshold_px), dist
 
 
+def parse_bodyparts(spec):
+    """The --bodypart string as a list: "nose" -> ["nose"], "nose,tongue" -> ["nose", "tongue"]."""
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("--bodypart is empty")
+    return list(dict.fromkeys(parts))
+
+
+def build_presence_mask(coords, bodyparts, pcutoff, points, threshold_px):
+    """(mask, distance_px, likelihood) for "the animal is here", over one or more bodyparts.
+
+    The union over bodyparts, because the question a multi-part gate answers is "is the animal
+    visible", and which keypoint happens to be visible at a given frame is an accident of pose: a
+    drinking mouse shows tongue and jaw while its nose is occluded by the sipper, so gating on the
+    nose alone drops exactly the frames the animal is most certainly there.
+
+    `distance_px` is the per-frame MINIMUM over the parts (nearest visible keypoint to the sipper),
+    and `likelihood` the per-frame MAXIMUM (the best-detected part), so the CSV's distance and
+    likelihood columns keep describing whatever it was that made the frame count. With a single
+    bodypart both reduce to that part's own arrays, i.e. the previous behavior exactly.
+    """
+    masks, dists, likes = [], [], []
+    for bodypart in bodyparts:
+        mask, dist = build_near_mask(coords, bodypart, pcutoff, points, threshold_px)
+        masks.append(mask)
+        likes.append(coords[bodypart]["likelihood"])
+        if dist is not None:
+            # A part that is not confidently detected has a meaningless position, so it must not
+            # win the per-frame minimum -- otherwise a stray low-likelihood jaw sitting on the
+            # sipper would report a 2 px "distance" for a frame the nose gate carried.
+            dists.append(np.where(mask, dist, np.inf))
+
+    mask = np.logical_or.reduce(masks)
+    like = np.maximum.reduce(likes)
+    if not dists:
+        return mask, None, like
+    dist = np.minimum.reduce(dists)
+    return mask, np.where(np.isfinite(dist), dist, np.nan), like
+
+
 # --------------------------------------------------------------------------------------------
 # window construction
 # --------------------------------------------------------------------------------------------
@@ -492,8 +536,8 @@ def rows_for_file(h5_path, args, task_id_start):
     else:
         points, arc_length, threshold_px, sipper_iqr = None, None, None, None
 
-    mask, dist = build_near_mask(coords, args.bodypart, args.pcutoff, points, threshold_px)
-    like = coords[args.bodypart]["likelihood"]
+    parts = parse_bodyparts(args.bodypart)
+    mask, dist, like = build_presence_mask(coords, parts, args.pcutoff, points, threshold_px)
 
     if args.require_tongue and "tongue" not in coords:
         raise ValueError(
@@ -563,7 +607,7 @@ def rows_for_file(h5_path, args, task_id_start):
                 "video": str(video),
                 "h5": str(h5_path),
                 "scorer": scorer,
-                "bodypart": args.bodypart,
+                "bodypart": "+".join(parts),
                 "start_frame": start,
                 "end_frame": end,
                 "n_frames": end - start,
@@ -602,7 +646,11 @@ def main(argv=None):
                         help="add to an existing --csv instead of replacing it: task_id numbering "
                              "continues from the last row and windows already present are skipped")
     parser.add_argument("--bodypart", default="nose",
-                        help="bodypart whose likelihood decides 'mouse is in frame'")
+                        help="bodypart whose likelihood decides 'mouse is in frame'. A "
+                             "comma-separated list (e.g. nose,tongue,jaw) is OR'd: a frame counts "
+                             "when ANY of them clears --pcutoff, which is the right gate for "
+                             "'is the animal visible at all' rather than 'is this one keypoint "
+                             "visible'")
     parser.add_argument("--pcutoff", type=float, default=0.8,
                         help="minimum likelihood for a frame to count as confident")
     parser.add_argument("--sipper-pcutoff", type=float, default=0.6,

@@ -10,7 +10,7 @@ import re
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import matplotlib
 matplotlib.use("Agg")
@@ -44,6 +44,7 @@ from video.trimcrop import (  # noqa: F401
     read_session_window,
     read_video_anchor,
     resolve_paths,
+    RIG_DRIFT_SLOPE,
     session_clock,
     subclip_copy,
     trim_and_crop,
@@ -134,7 +135,7 @@ def _read_trace_from_combined(combined_h5_path, animal, cycle):
 
 
 def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor,
-                   combined_h5=None, cycle=None):
+                   combined_h5=None, cycle=None, sync_slope=None):
     layout = pd.read_csv(layout_path, header=None, index_col=0)
     session_duration = anchor.session_duration
     animal = str(layout.loc[anchor.sensor_number].iloc[0])
@@ -171,7 +172,20 @@ def load_recording(h5_path, layout_path, pts_txt_path, video_path, anchor,
     lick_vals = cap[lick_indices] if lick_indices.size else np.array([])
 
     pts_ns = np.loadtxt(pts_txt_path, dtype=np.int64)
-    clock = session_clock(anchor, pts_ns)
+    if sync_slope is not None:
+        clock = session_clock(anchor, pts_ns)
+        clock = replace(clock, slope=float(sync_slope))
+        print(f"  drift slope -> {clock.slope:.9f} (forced by --sync-slope)")
+    else:
+        clock = session_clock(anchor, pts_ns, fallback_slope=RIG_DRIFT_SLOPE)
+        if anchor.stop_frame_index is None or anchor.stop_host_after is None:
+            # Silence here would be the dangerous outcome: the clip still renders, and the
+            # only symptom of a wrong slope is a lag that grows with session position.
+            print(f"  WARNING no Stop bookmark on this recording (restart recording?): the "
+                  f"two-bookmark drift fit is impossible, falling back to the rig's measured "
+                  f"slope {RIG_DRIFT_SLOPE:.9f}. Pass --sync-slope to override.")
+        else:
+            print(f"  drift slope {clock.slope:.9f} (two-bookmark fit)")
     container_pts_ns = load_container_pts(pts_txt_path, pts_ns)
 
     return Recording(
@@ -468,6 +482,14 @@ def build_arg_parser():
                    help="seconds to delay the video; increase if it runs ahead of "
                         "the trace (default %(default).4f s = 2 frames, the "
                         "measured constant residual lead)")
+    p.add_argument("--sync-slope", dest="sync_slope", type=float, default=None,
+                   help="force the video<->host drift slope (host-seconds per "
+                        "video-second) instead of fitting it from the Start/Stop "
+                        "bookmarks. Only needed when the fit is wrong or impossible; "
+                        "a recording with no Stop bookmark already falls back to the "
+                        f"rig's measured {RIG_DRIFT_SLOPE:.6f}. Unlike --sync-offset "
+                        "this scales with session position, which is what a lag that "
+                        "grows through the session needs")
     p.add_argument("--intermediate", default=None,
                    help="path for the trimmed subclip (implies "
                         "--keep-intermediate); default: a temp file, deleted "
@@ -502,7 +524,8 @@ def main(argv=None):
         video, pts_txt = resolve_paths(args.h5, anchor, args.video, args.pts_txt)
         validate_window(args.start, args.end, anchor.session_duration)
         rec = load_recording(args.h5, args.layout, pts_txt, video, anchor,
-                             combined_h5=args.combined_h5, cycle=args.cycle)
+                             combined_h5=args.combined_h5, cycle=args.cycle,
+                             sync_slope=args.sync_slope)
         crop = load_crop(video, args.crop_params, args.no_crop)
         keep = args.keep_intermediate or args.intermediate is not None
         if keep:
