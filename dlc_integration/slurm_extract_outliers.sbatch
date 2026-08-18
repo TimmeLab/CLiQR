@@ -29,9 +29,6 @@
 #SBATCH --time=04:00:00
 #SBATCH --output=logs/dlc_outliers_%j.out
 #SBATCH --error=logs/dlc_outliers_%j.err
-##SBATCH --account=CHANGE_ME
-##SBATCH --mail-type=END,FAIL
-##SBATCH --mail-user=c.parker51@gmail.com
 
 set -euo pipefail
 
