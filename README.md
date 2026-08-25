@@ -2,7 +2,9 @@
 ### Created for the Timme Lab at University of Cincinnati
 ### Author: Christopher Parker
 
-This repository contains the software for running our capacitive lickometry system, which records rodent licking behavior using MPR121 capacitive touch sensors connected via FT232H USB-to-I2C boards.
+This repository contains the software for running our capacitive lickometry system, which records rodent licking behavior using MPR121 capacitive touch sensors connected via FT232H USB-to-I2C boards. 
+
+To avoid confusion about units, we clarify that the data recorded is not actual capacitance values. By repeatedly charging sensing electrodes with a known current over a known amount of time and measuring the resulting voltage, the MPR121 boards report a proxy for capacitance. This is because the higher the total capacitance in the system, the lower the voltage that results from a fixed current over a fixed time. Because the analog-to-digital converter (ADC) on the MPR121 reads and reports this voltage, the output values read from the boards are inversely related to total system capacitance.
 
 ## System Overview
 
