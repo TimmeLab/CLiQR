@@ -139,6 +139,7 @@ def start_recording():
         filename=full_path,
         controllers=state.i2c_controllers.value,
         measurements_provider=lambda: state.session["sensor_states"],
+        two_bottle=state.session["two_bottle"],
     )
 
     # Start async recording task
@@ -156,7 +157,8 @@ def start_recording():
         video_base = os.path.splitext(os.path.basename(full_path))[0]
         _start_camera(video_base)
 
-    state.add_log_message(f"Recording session started - saving to: {full_path}")
+    mode = " (2-bottle choice)" if state.session["two_bottle"] else ""
+    state.add_log_message(f"Recording session started{mode} - saving to: {full_path}")
 
 
 def _report_pi_disk_cleanup(resp):
@@ -269,12 +271,15 @@ def stop_recording():
                     start_vol=sensor.start_volume,
                     stop_vol=sensor.stop_volume,
                     weight=sensor.weight,
-                    cycle=cycle
+                    cycle=cycle,
+                    start_vol2=sensor.start_volume2,
+                    stop_vol2=sensor.stop_volume2,
                 )
 
     # Surface any started sensor whose measurements never made it to disk, so a
     # silent loss (e.g. a mid-run reset that zeroed the store) is visible.
-    for msg in measurement_warnings(state.session["sensor_states"]):
+    for msg in measurement_warnings(state.session["sensor_states"],
+                                    two_bottle=state.session["two_bottle"]):
         state.add_log_message(f"WARNING: {msg}")
 
     # Write comments to file
@@ -325,6 +330,16 @@ def stop_recording():
     # Update state
     state.set_session("recording_all", False)
     state.add_log_message(f"Recording session stopped - file saved: {state.filename.value}")
+
+
+def set_two_bottle(value: bool):
+    """Toggle 2-bottle choice mode. The channel layout is fixed for a session,
+    so the mode cannot change while recording."""
+    if state.session["recording_all"]:
+        state.add_log_message("ERROR: 2-bottle mode cannot be changed during recording")
+        return
+    state.set_session("two_bottle", bool(value))
+    state.add_log_message(f"2-bottle choice mode {'ON' if value else 'OFF'}")
 
 
 def handle_layout_file(file_info):
@@ -388,6 +403,15 @@ def SessionControlsCard():
                 on_value=state.output_directory.set,
                 style={"flex": "1", "max-width": "500px"},
                 disabled=state.recording_all.value  # Can't change during recording
+            )
+
+        # 2-bottle choice toggle
+        with solara.Column(style={"margin-top": "10px", "gap": "5px"}):
+            solara.Switch(
+                label="2-bottle choice (each sensor records fluid 1 and fluid 2)",
+                value=state.two_bottle.value,
+                on_value=set_two_bottle,
+                disabled=state.recording_all.value,
             )
 
         # Layout file upload

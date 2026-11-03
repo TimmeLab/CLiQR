@@ -79,6 +79,17 @@ raw_data_YYYY-MM-DD_HH-MM-SS.h5
 /board_{serial_number}/sensor_{sensor_id}/
     cap_data, time_data, start_time[N], stop_time[N], start_vol, stop_vol, weight
 ```
+
+2-bottle choice mode (GUI toggle; file attr `two_bottle=True`): each sensor reads an
+adjacent channel pair — (0,1),(5,6),(10,11) on the 8-board rack, (0,1)…(10,11) on the
+4-board rack — fluid 1 = lower channel. Times, weight and video bookmarks stay at the
+sensor level; per-fluid data and volumes move into subgroups:
+```
+/board_{serial_number}/sensor_{sensor_id}/
+    start_time[N], stop_time[N], weight[N]
+    fluid1/  cap_data, time_data, start_vol[N], stop_vol[N]
+    fluid2/  cap_data, time_data, start_vol[N], stop_vol[N]
+```
 Multiple start/stop cycles per sensor use numbered suffixes: `start_time1`, `start_time2`, etc.
 
 ### Data Analysis (`data_analysis.py` + `DataAnalysis.ipynb`)

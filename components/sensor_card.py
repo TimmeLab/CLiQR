@@ -310,21 +310,29 @@ def test_sensor(sensor_id: int):
         state.add_log_message(f"ERROR: Sensor {sensor_id}: Hardware not initialized")
         return
 
-    # Get recent data
-    cap_data, time_data = mpr121_manager.get_last_reading(sensor_id, num_samples=250)
+    # Get recent data: one trace, or one per fluid in 2-bottle mode
+    fluids = state.FLUIDS if state.session["two_bottle"] else (None,)
+    traces = []
+    for fluid in fluids:
+        cap_data, time_data = mpr121_manager.get_last_reading(
+            sensor_id, num_samples=250, fluid=fluid)
+        if cap_data is None or len(cap_data) == 0:
+            continue
+        label = f"Fluid {fluid}" if fluid is not None else None
+        traces.append({'label': label, 'cap_data': cap_data, 'time_data': time_data})
 
-    if cap_data is None or len(cap_data) == 0:
+    if not traces:
         state.add_log_message(f"Sensor {sensor_id}: No data available for testing")
         return
 
     # Store data in state and show dialog
     state.test_plot_data.set({
         'sensor_id': sensor_id,
-        'cap_data': cap_data,
-        'time_data': time_data
+        'traces': traces,
     })
     state.show_test_dialog.set(True)
-    state.add_log_message(f"Sensor {sensor_id}: Displaying {len(cap_data)} samples")
+    state.add_log_message(
+        f"Sensor {sensor_id}: Displaying {len(traces[0]['cap_data'])} samples")
 
 
 def format_timer(elapsed_seconds: int) -> str:
@@ -364,10 +372,11 @@ def SensorCard(sensor_id: int):
     # Determine if controls should be disabled
     recording_not_started = not state.recording_all.value
     is_recording = sensor.is_recording
+    two_bottle = state.two_bottle.value
 
     with solara.Card(
         style={
-            "width": "250px",
+            "width": "300px" if two_bottle else "250px",
             "min-height": "200px",
             "border": f"2px solid {status_color}",
             "padding": "10px"
@@ -424,45 +433,49 @@ def SensorCard(sensor_id: int):
             )
 
         # Volume and weight inputs
-        with solara.Column(style={"margin-top": "10px", "gap": "5px"}):
-            # Start volume
-            def set_start_vol(value):
+        def setter(field):
+            def set_value(value):
                 sensors = state.sensor_states.value.copy()
-                sensors[sensor_id] = replace(sensors[sensor_id], start_volume=value)
+                sensors[sensor_id] = replace(sensors[sensor_id], **{field: value})
                 state.set_session("sensor_states", sensors)
+            return set_value
 
+        def volume_inputs(start_field, stop_field):
             solara.InputFloat(
                 label="Start Vol (mL)",
-                value=sensor.start_volume,
-                on_value=set_start_vol,
+                value=getattr(sensor, start_field),
+                on_value=setter(start_field),
                 continuous_update=True,
                 style={"width": "100%"}
             )
-
-            # Stop volume
-            def set_stop_vol(value):
-                sensors = state.sensor_states.value.copy()
-                sensors[sensor_id] = replace(sensors[sensor_id], stop_volume=value)
-                state.set_session("sensor_states", sensors)
-
             solara.InputFloat(
                 label="Stop Vol (mL)",
-                value=sensor.stop_volume,
-                on_value=set_stop_vol,
+                value=getattr(sensor, stop_field),
+                on_value=setter(stop_field),
                 continuous_update=True,
                 style={"width": "100%"}
             )
 
-            # Weight
-            def set_weight(value):
-                sensors = state.sensor_states.value.copy()
-                sensors[sensor_id] = replace(sensors[sensor_id], weight=value)
-                state.set_session("sensor_states", sensors)
+        with solara.Column(style={"margin-top": "10px", "gap": "5px"}):
+            if two_bottle:
+                # Split card: fluid 1 (left sipper) | fluid 2 (right sipper)
+                with solara.Row(style={"gap": "10px"}):
+                    for fluid, start_field, stop_field in (
+                        (1, "start_volume", "stop_volume"),
+                        (2, "start_volume2", "stop_volume2"),
+                    ):
+                        with solara.Column(style={"flex": "1", "gap": "5px"}):
+                            solara.Text(f"Fluid {fluid}",
+                                        style={"font-weight": "bold", "font-size": "12px"})
+                            volume_inputs(start_field, stop_field)
+            else:
+                volume_inputs("start_volume", "stop_volume")
 
+            # Weight (shared by both fluids in 2-bottle mode)
             solara.InputFloat(
                 label="Weight (g)",
                 value=sensor.weight,
-                on_value=set_weight,
+                on_value=setter("weight"),
                 continuous_update=True,
                 style={"width": "100%"}
             )

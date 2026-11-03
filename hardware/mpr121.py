@@ -95,14 +95,15 @@ class MPR121Manager:
             Tuple of (time_data, cap_data, serial_number)
         """
         from collections import deque
-        from utils.state import NUM_CHANNELS, ACTIVE_CHANNELS, READ_RETRIES, READ_RETRY_DELAY
+        from utils.state import active_channels, READ_RETRIES, READ_RETRY_DELAY
 
         if serial_number not in self.controllers:
             raise ValueError(f"No controller found for {serial_number}")
 
         port = self.controllers[serial_number]["port"]
-        local_time_data = deque(maxlen=NUM_CHANNELS)
-        local_cap_data = deque(maxlen=NUM_CHANNELS)
+        channels = active_channels()
+        local_time_data = deque(maxlen=len(channels))
+        local_cap_data = deque(maxlen=len(channels))
 
         # Read 24 bytes (2 bytes for each of the 12 channels). Retry transient
         # USB/FTDI read failures ("No answer from FTDI") so a single hiccup
@@ -117,11 +118,12 @@ class MPR121Manager:
                     raise
                 time.sleep(READ_RETRY_DELAY)
 
-        # Only the physically wired MPR121 channels are recorded. ACTIVE_CHANNELS
-        # is set by the selected rack design (e.g. [1, 3, 5, 7, 9, 11] on the
-        # 4-board rack, [1, 6, 11] on the 8-board rack); its order matches the
-        # order of the sensor IDs mapped to this board in SERIAL_NUMBER_SENSOR_MAP.
-        for chan in ACTIVE_CHANNELS:
+        # Only the physically wired MPR121 channels are recorded. The channel
+        # list is set by the rack design and 2-bottle mode (e.g. [1, 6, 11] on
+        # the 8-board rack, [0, 1, 5, 6, 10, 11] there in 2-bottle mode); its
+        # order matches the board's sensor IDs in SERIAL_NUMBER_SENSOR_MAP, with
+        # each sensor's (fluid 1, fluid 2) pair adjacent in 2-bottle mode.
+        for chan in channels:
             # Combine two bytes (little-endian)
             value = raw_buffer[2 * chan] | (raw_buffer[2 * chan + 1] << 8)
             local_cap_data.append(value)
@@ -129,13 +131,15 @@ class MPR121Manager:
 
         return local_time_data, local_cap_data, serial_number
 
-    def get_last_reading(self, sensor_id: int, num_samples: int = 250) -> tuple:
+    def get_last_reading(self, sensor_id: int, num_samples: int = 250,
+                         fluid=None) -> tuple:
         """
         Get the last N samples from a sensor for testing/plotting.
 
         Args:
             sensor_id: Sensor ID (1-24)
             num_samples: Number of samples to retrieve
+            fluid: 1 or 2 for one bottle of a 2-bottle sensor; None otherwise
 
         Returns:
             Tuple of (cap_data, time_data) lists, or (None, None) if no data available
@@ -144,7 +148,8 @@ class MPR121Manager:
         try:
             from components.session_controls import current_recorder
             if current_recorder is not None:
-                cap_data, time_data = current_recorder.get_recent_samples(sensor_id, num_samples)
+                cap_data, time_data = current_recorder.get_recent_samples(
+                    sensor_id, num_samples, fluid=fluid)
                 if cap_data is not None:
                     return cap_data, time_data
         except Exception:
@@ -154,7 +159,7 @@ class MPR121Manager:
         try:
             from utils import state
             import h5py
-            from utils.state import SERIAL_NUMBER_SENSOR_MAP
+            from utils.state import SERIAL_NUMBER_SENSOR_MAP, channel_group_path
 
             filename = state.filename.value
             if not filename:
@@ -171,7 +176,8 @@ class MPR121Manager:
                 return None, None
 
             with h5py.File(filename, "r") as h5f:
-                group_path = f"board_{sn}/sensor_{sensor_id}"
+                key = (sensor_id, fluid) if fluid is not None else sensor_id
+                group_path = f"board_{sn}/{channel_group_path(key)}"
                 if group_path not in h5f:
                     return None, None
 
