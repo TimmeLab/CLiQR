@@ -118,7 +118,7 @@ The analysis GUI replaces `DataAnalysis.ipynb`, which became unusably slow with 
 
 Each card has an export button that writes the same CSV files the notebook produced (`cliqr_ILIs.csv`, `cliqr_cumulative_licks.csv`, `nLicksVsVol_outliers_removed.csv`, ...) to the export folder shown in the Activity log card (the repo folder by default).
 
-How it stays fast on long runs: raw files are processed one sensor at a time (memory stays well under 1 GB for a 24-sensor, 24 h file), the threshold scan in `basic_algorithm()` is vectorized (identical results, ~5x faster per sensor on 24 h traces), summaries only read lick times and volumes, and trace plots read only the visible window, reduced to a min/max envelope that keeps every lick dip.
+How it stays fast on long runs: raw files are processed one sensor at a time (memory stays well under 1 GB for a 24-sensor, 24 h file), the threshold scan in `basic_algorithm()` is vectorized (identical results; about 5 s per sensor for a 24 h trace), summaries only read lick times and volumes, and trace plots read only the visible window, reduced to a min/max envelope that keeps every lick dip.
 
 To try the GUI without real data (the example `.h5` files are Git LFS pointers):
 ```bash
