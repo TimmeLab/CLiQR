@@ -8,9 +8,10 @@ To avoid confusion about units, we clarify that the data recorded is not actual 
 
 ## System Overview
 
-**CLiQR** provides a web-based GUI for data recording and Jupyter notebooks for data analysis:
+**CLiQR** provides web-based (Solara) GUIs for data recording and data analysis:
 - **recording_gui.py** - Standalone Solara web GUI for recording (primary interface)
-- **DataAnalysis.ipynb** - Jupyter notebook for batch analysis and visualization
+- **analysis_gui.py** - Standalone Solara web GUI for batch analysis and visualization (handles 24 h recordings)
+- **DataAnalysis.ipynb** - Previous Jupyter notebook for analysis (superseded by analysis_gui.py, kept for reference)
 - **DataRecording.ipynb** - Legacy notebook interface (deprecated, kept for reference)
 
 ## Installation
@@ -92,13 +93,47 @@ Hold Shift and right-click start_cliqr.bat, then select Send To -> Desktop (crea
 
 ### Data Analysis
 
-For batch analysis of recorded data:
+**Option 1 - Command Line:**
 ```bash
-conda activate cliqr
-jupyter-lab
+conda activate cliqr  # or: pyenv activate cliqr
+solara run analysis_gui.py --port 8766
 ```
 
-Open `DataAnalysis.ipynb` and follow the instructions to analyze multiple recording sessions.
+The GUI opens at http://localhost:8766 (port 8766 so it can run next to the recording GUI on 8765). Set `CLIQR_DATA_DIR` to start in a data folder other than `Lickometry Data`.
+
+**Option 2 - Windows Desktop Shortcut:** create a shortcut to `start_analysis.bat` the same way as for `start_cliqr.bat`.
+
+The analysis GUI replaces `DataAnalysis.ipynb`, which became unusably slow with 24 h runs (~5 GB per day). It is organised as tabs:
+
+| Tab | What it does |
+|---|---|
+| **Run** | Pick cohort folders (sub-folders of the data directory that contain `layout_w_controls.csv` or `layout.csv`) and raw files, choose the algorithm and **recording length** (2 h for the standard protocol, 24 for day-long runs), then *Run analysis*. Detection runs in the background with a progress bar and can be stopped between files. Or open an existing `results_combined_*.h5`. |
+| **Start/Stop check** | Plot any sensor of a raw file with its recorded start/stop times, to decide whether a time fix file is needed. |
+| **Summary** | Licks per session, lick count vs volume, control-cage false positives and evaporation, and a table of every session. |
+| **Behavior** | ILI, licks per bout and bout duration histograms, plus lick/bout time courses (per-bin and cumulative, adjustable bin size). |
+| **Traces** | Scroll and zoom through any session's trace with detected licks marked (1 min / 10 min / 1 h / full-day windows). |
+| **Correlation** | OLS (HC3) and robust fits of volume vs licks, residual plots, MAD outliers (tick to exclude), cleaned fit and the 0.05 mL correlation ceiling. |
+| **Per-animal** | Per-animal volume vs lick fits (mL per lick). |
+| **Outliers removed** | Behavioral metrics and time courses recomputed without the excluded sessions. |
+
+Each card has an export button that writes the same CSV files the notebook produced (`cliqr_ILIs.csv`, `cliqr_cumulative_licks.csv`, `nLicksVsVol_outliers_removed.csv`, ...) to the export folder shown in the Activity log card (the repo folder by default).
+
+How it stays fast on long runs: raw files are processed one sensor at a time (memory stays well under 1 GB for a 24-sensor, 24 h file), the threshold scan in `basic_algorithm()` is vectorized (identical results, ~5x faster per sensor on 24 h traces), summaries only read lick times and volumes, and trace plots read only the visible window, reduced to a min/max envelope that keeps every lick dip.
+
+To try the GUI without real data (the example `.h5` files are Git LFS pointers):
+```bash
+python scripts/make_synthetic_recording.py "Lickometry Data/Synthetic" --days 3 --hours 2
+```
+
+#### Time Fix Files
+
+If a recording has incorrect start/stop times (check them on the **Start/Stop check** tab), create `<raw_filename>_time_fix.xlsx` next to the raw file (e.g. `raw_data_2026-01-20_11-10-18_time_fix.xlsx`) with three columns:
+
+| Sensor | New Start Time | New End Time |
+|--------|----------------|--------------|
+| 20     | 1756825855     | 1756833056   |
+
+Times are Unix epoch seconds. Time fix files are applied automatically on the next run (this can be switched off on the Run tab), and each applied fix is noted in the Activity log.
 
 ## Layout File Format
 

@@ -47,8 +47,8 @@ solara run recording_gui.py        # opens at http://localhost:8765
 # Recording GUI (mock hardware, no boards needed)
 solara run recording_gui_mock.py
 
-# Data analysis
-jupyter-lab                        # then open DataAnalysis.ipynb
+# Data analysis GUI (replaces DataAnalysis.ipynb)
+solara run analysis_gui.py --port 8766
 
 # False positive analysis
 jupyter-lab                        # then open FalsePositive.ipynb
@@ -81,9 +81,9 @@ raw_data_YYYY-MM-DD_HH-MM-SS.h5
 ```
 Multiple start/stop cycles per sensor use numbered suffixes: `start_time1`, `start_time2`, etc.
 
-### Data Analysis (`data_analysis.py` + `DataAnalysis.ipynb`)
+### Data Analysis (`data_analysis.py` + `analysis_core.py` + `analysis_gui.py`)
 
-`data_analysis.py` is the core library. `DataAnalysis.ipynb` is the batch analysis notebook (Panel widgets).
+`data_analysis.py` is the detection library. `analysis_core.py` holds the batch pipeline, statistics, windowed/decimated trace reads and CSV exports (no GUI code). `analysis_gui.py` is the Solara batch analysis GUI that replaced `DataAnalysis.ipynb` (kept for reference; it became laggy on 24 h / ~5 GB runs). Keep logic in `analysis_core.py` so it stays testable; never load whole traces just to count licks (`lick_indices.shape` is free), and plot via `read_window()` / `session_window()`.
 
 Key functions:
 
@@ -95,8 +95,8 @@ Key functions:
 | `compute_bout_structure()` | ILIs, bout lick counts, bout durations. Default params: `ibi_threshold=0.25, min_licks=3`. Call sites in notebook use `ibi_threshold=1.0, min_licks=2`. |
 | `save_filtered_data()` | Writes per-animal HDF5 group. |
 
-Notebook pipeline:
-1. Set `base_dir`, `animal_id_prefixes`, `recording_length`
+Pipeline (GUI tabs / `analysis_core.run_pipeline`; same steps the notebook had):
+1. Pick cohort folders under the data dir, raw files, algorithm and `recording_length` (24 h for day-long runs)
 2. Load per-cohort `layout.csv` files
 3. File selector GUI → pick raw HDF5 files per cohort
 4. Run `filter_data()` → `filtered_*.h5` per file
@@ -107,7 +107,7 @@ Notebook pipeline:
 9. Correlation: OLS + RLM (HC3-robust), MAD-based outlier detection
 10. CSV exports for Prism
 
-**Time fix mechanism:** If start/stop times in raw HDF5 are wrong, create `<raw_filename>_time_fix.xlsx` with columns `[Sensor, New Start Time, New End Time]`.
+**Time fix mechanism:** If start/stop times in raw HDF5 are wrong, create `<raw_filename>_time_fix.xlsx` with columns `[Sensor, New Start Time, New End Time]`. `filter_data()` applies it (it used to accept `time_fix` but silently ignore it).
 
 ### False Positive Analysis (`false_positive_analysis.py` + `FalsePositive.ipynb`)
 
