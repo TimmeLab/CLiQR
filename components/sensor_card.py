@@ -325,9 +325,15 @@ def test_sensor(sensor_id: int):
         state.add_log_message(f"Sensor {sensor_id}: No data available for testing")
         return
 
+    # Resolve the animal label here so the dialog need not read sensor_states
+    # (rewritten every second by the timers -> would re-render the dialog).
+    sensor = state.sensor_states.value.get(sensor_id)
+    animal_text = f" [{sensor.animal_id}]" if sensor and sensor.animal_id else ""
+
     # Store data in state and show dialog
     state.test_plot_data.set({
         'sensor_id': sensor_id,
+        'animal_text': animal_text,
         'traces': traces,
     })
     state.show_test_dialog.set(True)
