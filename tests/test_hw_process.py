@@ -147,3 +147,78 @@ def test_shutdown_is_idempotent_and_ends_process(clients):
     client.shutdown()
     client.shutdown()
     assert not client.is_alive()
+
+
+def test_child_exits_after_hard_parent_kill_with_full_pipe(tmp_path):
+    """GUI server killed (Task Manager) while samples sit unread in the data
+    pipe: the child must still exit rather than block flushing its queue."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    script = tmp_path / "parent.py"
+    script.write_text(
+        "import sys, time\n"
+        f"sys.path.insert(0, {repr(os.getcwd())})\n"
+        "from hardware.hw_client import HardwareClient\n"
+        "if __name__ == '__main__':\n"
+        "    c = HardwareClient('hardware.fake_backends:CounterBackend')\n"
+        "    c.start()\n"
+        "    c._request(('start', 1, [1, 6, 11], 500), 10)  # nobody reads data\n"
+        "    print(c._proc.pid, flush=True)\n"
+        "    time.sleep(60)\n")
+    parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+    child_pid = int(parent.stdout.readline())
+    time.sleep(1.5)  # let the data pipe fill
+    parent.send_signal(signal.SIGKILL)
+    parent.wait()
+    deadline = time.monotonic() + 8
+    alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.1)
+    if alive:
+        os.kill(child_pid, signal.SIGKILL)
+    assert not alive
+
+
+def test_receiver_side_fatal_stops_child_sampling(tmp_path, monkeypatch, clients):
+    """If the GUI side fails to ingest samples, the child must stop sampling;
+    otherwise it buffers unread samples without bound until the next Start."""
+    import queue as _q
+    client = clients()
+    client.start()
+    rec = _rec(tmp_path, monkeypatch, client)
+    real, n = rec.on_loops, {"calls": 0}
+
+    def flaky(loops):
+        n["calls"] += 1
+        if n["calls"] == 3:
+            raise ValueError("bad loop")
+        real(loops)
+
+    rec.on_loops = flaky
+    errors = []
+    rec.start(on_error=errors.append)
+    deadline = time.monotonic() + 3
+    while not errors and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert errors
+    time.sleep(0.5)
+
+    def drain():
+        got, end = 0, time.monotonic() + 1.0
+        while time.monotonic() < end:
+            try:
+                msg = client._data.get(timeout=0.2)
+            except _q.Empty:
+                return got
+            got += msg[0] == "loops"
+        return got
+    drain()
+    time.sleep(0.5)
+    assert drain() == 0  # nothing new sampled after the fatal

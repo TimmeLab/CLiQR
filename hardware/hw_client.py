@@ -125,6 +125,13 @@ class ProcessSource:
                     return
             except Exception as exc:
                 sink.on_fatal(str(exc))
+                # The GUI clears recording_all on a fatal error, so stop() may
+                # never be sent: stop the child's sampling now, or it keeps
+                # buffering unread samples until the next Start.
+                try:
+                    self._client._request(("stop",), 10.0)
+                except Exception:
+                    pass
                 return
 
     def stop(self, timeout: float) -> bool:

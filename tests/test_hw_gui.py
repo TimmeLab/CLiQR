@@ -138,3 +138,30 @@ def test_disconnect_ends_process(gui):
     hw.disconnect_hardware()
     assert hw.hw_client is None and not client.is_alive()
     assert state.session["boards_connected"] == {}
+
+
+def test_concurrent_initialize_spawns_one_process(gui, monkeypatch):
+    """Two tabs (or a double-click) initializing at once must not spawn two
+    hardware processes fighting over the boards."""
+    import threading
+    from hardware.hw_client import HardwareClient
+    made = []
+
+    class Counting(HardwareClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(hw, "HardwareClient", Counting)
+    ts = [threading.Thread(target=hw.initialize_hardware) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    alive = [c for c in made if c.is_alive()]
+    try:
+        assert len(made) == 1 and len(alive) == 1
+    finally:
+        for c in made:
+            if c is not hw.hw_client:
+                c.shutdown()

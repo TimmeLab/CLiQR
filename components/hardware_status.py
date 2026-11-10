@@ -7,6 +7,7 @@ HardwareClient handle is a plain module global owned by the server process, so
 a browser refresh/reconnect reuses it and never starts a second process.
 """
 import atexit
+import threading
 
 import solara
 from dataclasses import replace
@@ -21,6 +22,11 @@ BACKEND_PATH = "hardware.backends:RealBackend"
 # The live hardware process client (None until initialized).
 hw_client = None
 
+# Serializes initialize/refresh/disconnect: hw_client is only assigned after a
+# multi-second spawn+init, so two tabs (or a double-click) initializing at once
+# would otherwise spawn two processes fighting over the boards.
+_hw_lock = threading.RLock()
+
 
 def _publish(board_info):
     """Mirror the hardware view into session state (plain data, no handles)."""
@@ -30,6 +36,12 @@ def _publish(board_info):
 
 
 def initialize_hardware():
+    """Start the hardware process and initialize boards (or reuse it)."""
+    with _hw_lock:
+        _initialize_hardware_locked()
+
+
+def _initialize_hardware_locked():
     """Start the hardware process and initialize boards (or reuse it)."""
     global hw_client
 
@@ -71,6 +83,12 @@ def initialize_hardware():
 
 def disconnect_hardware():
     """Stop the hardware process and release the boards."""
+    with _hw_lock:
+        _disconnect_hardware_locked()
+
+
+def _disconnect_hardware_locked():
+    """Stop the hardware process and release the boards."""
     global hw_client
     if hw_client is not None:
         hw_client.shutdown()
@@ -81,11 +99,17 @@ def disconnect_hardware():
 
 def refresh_hardware():
     """Restart the hardware process. Refused while recording."""
+    with _hw_lock:
+        _refresh_hardware_locked()
+
+
+def _refresh_hardware_locked():
+    """Restart the hardware process. Refused while recording."""
     if state.session["recording_all"]:
         state.add_log_message("ERROR: cannot refresh hardware while recording")
         return
-    disconnect_hardware()
-    initialize_hardware()
+    _disconnect_hardware_locked()
+    _initialize_hardware_locked()
 
 
 @atexit.register

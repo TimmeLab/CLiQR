@@ -109,7 +109,10 @@ def hardware_main(cmd_conn, data_q, backend_path):
                     continue
                 msg = cmd_conn.recv()
             except (EOFError, OSError):
-                break  # GUI server gone
+                # GUI server gone. Nobody will read data_q again; don't let
+                # exit block flushing a full pipe (orphaned process).
+                data_q.cancel_join_thread()
+                break
             kind = msg[0]
             if kind == "init":
                 try:
