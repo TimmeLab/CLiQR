@@ -305,9 +305,10 @@ async def update_sensor_timer(sensor_id: int):
 
 def test_sensor(sensor_id: int):
     """Test a sensor by reading recent data and displaying a plot."""
-    from components.hardware_status import mpr121_manager
+    from components import hardware_status
+    from recording.recent import get_last_reading
 
-    if mpr121_manager is None:
+    if hardware_status.hw_client is None:
         state.add_log_message(f"ERROR: Sensor {sensor_id}: Hardware not initialized")
         return
 
@@ -315,7 +316,7 @@ def test_sensor(sensor_id: int):
     fluids = state.FLUIDS if state.session["two_bottle"] else (None,)
     traces = []
     for fluid in fluids:
-        cap_data, time_data = mpr121_manager.get_last_reading(
+        cap_data, time_data = get_last_reading(
             sensor_id, num_samples=250, fluid=fluid)
         if cap_data is None or len(cap_data) == 0:
             continue

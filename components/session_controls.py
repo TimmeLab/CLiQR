@@ -126,19 +126,22 @@ def start_recording():
     # Fresh file -> restart every sensor's recording cycle at 0.
     _reset_sensor_lifecycle()
 
-    # Create recorder instance
-    from components.hardware_status import mpr121_manager
-    if mpr121_manager is None:
-        state.add_log_message("ERROR: MPR121 manager not initialized")
+    # Create recorder instance; samples come from the hardware process.
+    from components import hardware_status
+    client = hardware_status.hw_client
+    if client is None or not client.is_alive():
+        state.add_log_message("ERROR: hardware process not running; "
+                              "initialize hardware first")
         state.set_session("recording_all", False)
         return
 
     current_recorder = SensorRecorder(
-        mpr121_manager=mpr121_manager,
+        mpr121_manager=None,
         filename=full_path,
         controllers=state.i2c_controllers.value,
         measurements_provider=lambda: state.session["sensor_states"],
         two_bottle=state.session["two_bottle"],
+        source=client.source(state.active_channels(), state.MAX_SAMPLE_HZ),
     )
 
     # Start the sampler/writer threads (off the UI event loop, so rendering

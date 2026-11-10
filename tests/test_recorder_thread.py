@@ -213,8 +213,9 @@ def test_sampler_fatal_error_reports_and_keeps_data(make_rec):
 
 
 def test_session_start_stop_uses_recorder_threads(tmp_path, monkeypatch):
-    """The GUI's Start/Stop drive the recorder threads (no asyncio task) and a
-    session Stop leaves every sample read on disk."""
+    """The GUI's Start/Stop drive the recorder (hardware process + writer
+    thread, no asyncio task) and a session Stop leaves every sample read on
+    disk."""
     import pandas as pd
     import components.hardware_status as hw
     import components.session_controls as sc
@@ -222,7 +223,9 @@ def test_session_start_stop_uses_recorder_threads(tmp_path, monkeypatch):
 
     monkeypatch.setattr(utils.state, "SERIAL_NUMBER_SENSOR_MAP", _TEST_MAP)
     monkeypatch.setattr(recording.recorder, "HISTORY_SIZE", 50)
-    monkeypatch.setattr(hw, "mpr121_manager", _CounterManager())
+    monkeypatch.setattr(hw, "BACKEND_PATH", "hardware.fake_backends:CounterBackend")
+    monkeypatch.setattr(hw, "hw_client", None)
+    monkeypatch.setattr(utils.state, "ACTIVE_CHANNELS", [1, 6, 11])
     monkeypatch.setattr(sc, "current_recorder", None)
     state.set_session("i2c_controllers", dict(_CONTROLLERS))
     state.layout_df.set(pd.DataFrame({"animal": ["A1"]}, index=[1]))
@@ -230,15 +233,17 @@ def test_session_start_stop_uses_recorder_threads(tmp_path, monkeypatch):
     state.camera_enabled.set(False)
     state.set_session("recording_all", False)
     try:
+        hw.initialize_hardware()
         sc.start_recording()
         rec = sc.current_recorder
         assert rec is not None and rec._source is not None
         time.sleep(0.2)
         sc.stop_recording()
-        assert not rec._source._thread.is_alive()
+        assert not rec._source._receiver.is_alive()
         assert not rec._writer.is_alive()
         _assert_complete(rec)
     finally:
+        hw.disconnect_hardware()
         state.layout_df.set(pd.DataFrame())
         state.set_session("recording_all", False)
 
@@ -269,7 +274,9 @@ def test_session_stop_completes_when_metadata_write_fails(tmp_path, monkeypatch)
 
     monkeypatch.setattr(utils.state, "SERIAL_NUMBER_SENSOR_MAP", _TEST_MAP)
     monkeypatch.setattr(recording.recorder, "HISTORY_SIZE", 50)
-    monkeypatch.setattr(hw, "mpr121_manager", _CounterManager())
+    monkeypatch.setattr(hw, "BACKEND_PATH", "hardware.fake_backends:CounterBackend")
+    monkeypatch.setattr(hw, "hw_client", None)
+    monkeypatch.setattr(utils.state, "ACTIVE_CHANNELS", [1, 6, 11])
     monkeypatch.setattr(sc, "current_recorder", None)
     state.set_session("i2c_controllers", dict(_CONTROLLERS))
     state.layout_df.set(pd.DataFrame({"animal": ["A1"]}, index=[1]))
@@ -277,6 +284,7 @@ def test_session_stop_completes_when_metadata_write_fails(tmp_path, monkeypatch)
     state.camera_enabled.set(False)
     state.set_session("recording_all", False)
     try:
+        hw.initialize_hardware()
         sc.start_recording()
         rec = sc.current_recorder
         sensors = state.session["sensor_states"].copy()
@@ -289,10 +297,11 @@ def test_session_stop_completes_when_metadata_write_fails(tmp_path, monkeypatch)
         monkeypatch.setattr(rec, "write_sensor_metadata", broken)
         time.sleep(0.1)
         sc.stop_recording()
-        assert not rec._source._thread.is_alive()
+        assert not rec._source._receiver.is_alive()
         assert state.session["recording_all"] is False
         assert any("ERROR" in m and "disk unwritable" in m
                    for m in state.log_messages.value)
     finally:
+        hw.disconnect_hardware()
         state.layout_df.set(pd.DataFrame())
         state.set_session("recording_all", False)

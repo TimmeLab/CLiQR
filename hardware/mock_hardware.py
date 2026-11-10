@@ -199,24 +199,6 @@ class MockMPR121Manager:
 
         return local_time_data, local_cap_data, serial_number
 
-    def get_last_reading(self, sensor_id: int, num_samples: int = 250,
-                         fluid=None) -> Tuple:
-        """
-        Simulate getting last N samples.
-
-        Args:
-            sensor_id: Sensor ID (1-24)
-            num_samples: Number of samples to retrieve
-
-        Returns:
-            Tuple of (cap_data, time_data) lists
-        """
-        # Generate some random data for plotting
-        baseline = 500
-        cap_data = [baseline + random.randint(-30, 30) for _ in range(num_samples)]
-        time_data = [time.time() + i * 0.02 for i in range(num_samples)]  # ~50Hz
-        return cap_data, time_data
-
 
 def use_mock_hardware():
     """
@@ -227,42 +209,6 @@ def use_mock_hardware():
     """
     import components.hardware_status as hw_status
 
-    # Replace the real managers with mock versions
-    hw_status.ft232h_manager = MockFT232HManager()
-
-    def mock_initialize():
-        """Mock initialization function."""
-        from utils import state
-
-        state.add_log_message("Using MOCK HARDWARE for testing")
-
-        # Scan for mock devices
-        num_devices = hw_status.ft232h_manager.scan_devices()
-        state.add_log_message(f"Found {num_devices} mock FT232H board(s)")
-
-        # Initialize mock controllers
-        controllers, errors = hw_status.ft232h_manager.initialize_controllers()
-
-        if errors:
-            for error in errors:
-                state.add_log_message(f"ERROR: {error}")
-
-        # Store controllers. Route through set_session (like real init) so mock
-        # hardware also survives a browser refresh for UI/refresh testing.
-        state.set_session("i2c_controllers", controllers)
-
-        # Create mock MPR121 manager
-        hw_status.mpr121_manager = MockMPR121Manager(controllers)
-        config_messages = hw_status.mpr121_manager.configure_all_sensors()
-
-        for msg in config_messages:
-            state.add_log_message(msg)
-
-        # Update boards_connected
-        board_info = hw_status.ft232h_manager.get_controller_info()
-        state.set_session("boards_connected", board_info)
-
-        state.add_log_message(f"Mock hardware ready: {len(board_info)} boards")
-
-    # Replace the initialize function
-    hw_status.initialize_hardware = mock_initialize
+    # The hardware process runs the mock boards; initialization, refresh and
+    # sampling then follow exactly the real path.
+    hw_status.BACKEND_PATH = "hardware.backends:MockBackend"

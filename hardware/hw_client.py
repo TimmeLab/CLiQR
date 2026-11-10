@@ -30,6 +30,7 @@ class HardwareClient:
         self._cmd = None
         self._data = None
         self._lock = threading.Lock()  # one command/reply exchange at a time
+        self.board_info = {}
 
     def start(self, timeout: float = 60.0) -> InitResult:
         """Spawn the hardware process and initialize the boards."""
@@ -43,6 +44,7 @@ class HardwareClient:
         child.close()  # so the child sees EOF if this process goes away
         self._cmd = parent
         _, info, messages, errors = self._request(("init",), timeout)
+        self.board_info = info
         return InitResult(info, messages, errors)
 
     def _request(self, msg, timeout):
