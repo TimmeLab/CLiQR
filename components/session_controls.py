@@ -225,6 +225,18 @@ def _on_recorder_error(exc):
     state.set_session("recording_all", False)
 
 
+def _safe_recorder_write(write, *args, **kwargs):
+    """Run a recorder metadata write during Stop; log failures, never raise.
+
+    A failing disk must not abort stop_recording before the recorder is
+    stopped, or the session could never be stopped.
+    """
+    try:
+        write(*args, **kwargs)
+    except Exception as exc:
+        state.add_log_message(f"ERROR: could not write session metadata: {exc}")
+
+
 def stop_recording():
     """Stop the current recording session."""
     global current_recorder
@@ -242,7 +254,7 @@ def stop_recording():
         if sensor.is_recording:
             # Write stop time for sensors still recording
             if current_recorder:
-                current_recorder.write_sensor_metadata(
+                _safe_recorder_write(current_recorder.write_sensor_metadata,
                     sensor_id=sensor_id,
                     stop_time=time.time(),
                     cycle=sensor.recording_cycle
@@ -269,7 +281,7 @@ def stop_recording():
         for sensor_id, sensor in sensors.items():
             # Write metadata for each recording cycle
             for cycle in range(sensor.recording_cycle):
-                current_recorder.write_sensor_metadata(
+                _safe_recorder_write(current_recorder.write_sensor_metadata,
                     sensor_id=sensor_id,
                     start_vol=sensor.start_volume,
                     stop_vol=sensor.stop_volume,
@@ -287,7 +299,7 @@ def stop_recording():
 
     # Write comments to file
     if current_recorder and state.comments.value:
-        current_recorder.write_comments(state.comments.value)
+        _safe_recorder_write(current_recorder.write_comments, state.comments.value)
 
     # Stop the recorder. Blocks until every sample read is on disk (the final
     # partial batch used to be discarded here).

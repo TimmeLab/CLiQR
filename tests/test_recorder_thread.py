@@ -241,3 +241,58 @@ def test_session_start_stop_uses_recorder_threads(tmp_path, monkeypatch):
     finally:
         state.layout_df.set(pd.DataFrame())
         state.set_session("recording_all", False)
+
+
+def test_fatal_error_ends_writer_without_stop(make_rec):
+    """After a fatal sampler error the GUI clears recording_all and may never
+    call stop(). The writer must still exit, or its periodic volume/weight
+    persist would later write the NEXT session's values into this old file."""
+    rec = make_rec(history=50, hz=500, manager=_CounterManager(bad_call=40))
+    errors = []
+    rec.start(on_error=errors.append)
+    deadline = time.monotonic() + 3.0
+    while rec._writer.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(errors) == 1
+    assert not rec._writer.is_alive()
+    _assert_complete(rec)
+
+
+def test_session_stop_completes_when_metadata_write_fails(tmp_path, monkeypatch):
+    """A failing disk must not make Stop impossible: the metadata write error is
+    logged and the recorder is still stopped."""
+    import pandas as pd
+    from dataclasses import replace
+    import components.hardware_status as hw
+    import components.session_controls as sc
+    from utils import state
+
+    monkeypatch.setattr(utils.state, "SERIAL_NUMBER_SENSOR_MAP", _TEST_MAP)
+    monkeypatch.setattr(recording.recorder, "HISTORY_SIZE", 50)
+    monkeypatch.setattr(hw, "mpr121_manager", _CounterManager())
+    monkeypatch.setattr(sc, "current_recorder", None)
+    state.set_session("i2c_controllers", dict(_CONTROLLERS))
+    state.layout_df.set(pd.DataFrame({"animal": ["A1"]}, index=[1]))
+    state.output_directory.set(str(tmp_path))
+    state.camera_enabled.set(False)
+    state.set_session("recording_all", False)
+    try:
+        sc.start_recording()
+        rec = sc.current_recorder
+        sensors = state.session["sensor_states"].copy()
+        sensors[1] = replace(sensors[1], is_recording=True, start_time=1.0)
+        state.set_session("sensor_states", sensors)
+
+        def broken(*a, **k):
+            raise OSError("disk unwritable")
+
+        monkeypatch.setattr(rec, "write_sensor_metadata", broken)
+        time.sleep(0.1)
+        sc.stop_recording()
+        assert not rec._sampler.is_alive()
+        assert state.session["recording_all"] is False
+        assert any("ERROR" in m and "disk unwritable" in m
+                   for m in state.log_messages.value)
+    finally:
+        state.layout_df.set(pd.DataFrame())
+        state.set_session("recording_all", False)

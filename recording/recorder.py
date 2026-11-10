@@ -278,16 +278,25 @@ class SensorRecorder:
                         break
                     self._sample_once(executor)
         except Exception as e:
+            fatal = True
             self._emit(f"ERROR in recording loop: {e}")
             if self._on_error is not None:
                 try:
                     self._on_error(e)
                 except Exception:
                     pass
+        else:
+            fatal = False
         finally:
             # Hand over the final partial batch (also after a fatal error, so
             # the samples read so far reach disk even if stop() comes late).
             self._queue.put(self._take_pending())
+        if fatal:
+            # The GUI clears recording_all on a fatal error, so stop() may
+            # never be called. End the writer now: left running, its periodic
+            # volume/weight persist would write a LATER session's values into
+            # this file.
+            self._queue.put(None)
 
     def _sample_once(self, executor):
         """One acquisition iteration: read every board, buffer the results."""
