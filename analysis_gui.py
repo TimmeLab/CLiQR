@@ -43,17 +43,53 @@ apply_time_fix = solara.reactive(True)
 keep_intermediate = solara.reactive(False)
 export_dir = solara.reactive(".")
 bin_minutes = solara.reactive(5.0)
+# 2-bottle choice: analysis mode (must match how the files were recorded),
+# bottle names for plots/exports, and which bottle preference is reported for.
+two_bottle = solara.reactive(False)
+fluid1_name = solara.reactive("Fluid 1")
+fluid2_name = solara.reactive("Fluid 2")
+pref_target = solara.reactive(1)
+require_weight = solara.reactive(True)
 
 log_lines = solara.reactive([])
 progress = solara.reactive((0.0, ""))
 results = solara.reactive(None)          # core.CombinedResults
-excluded = solara.reactive(frozenset())  # {(session, animal_id)} dropped as outliers
+excluded = solara.reactive(frozenset())  # {(session, animal_id, fluid)} dropped as outliers
 tab = solara.reactive("Run")
 
 _stop_event = threading.Event()
 MAX_LOG_LINES = 3000
 PLOT_POINTS = 4000
 BLUE, RED, GREY = "#1f77b4", "#d62728", "#7f7f7f"
+# 2-bottle: one fixed hue per bottle wherever both share an axis (fluid 0 =
+# 1-bottle data keeps the original trace blue). Checked for colour-blind
+# separation; every shared axis also carries a legend with the fluid names.
+FLUID_COLORS = {0: BLUE, 1: "#2a78d6", 2: "#eb6834"}
+_mode_cache = {}
+
+
+def file_mode(path):
+    """Cached core.file_is_two_bottle (True/False/None), keyed on mtime."""
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return None
+    if key not in _mode_cache:
+        _mode_cache[key] = core.file_is_two_bottle(path)
+    return _mode_cache[key]
+
+
+def _fluid_names():
+    return {1: fluid1_name.value.strip() or "Fluid 1", 2: fluid2_name.value.strip() or "Fluid 2"}
+
+
+def _panels(res):
+    """[(fluid, label)]: [(0, "")] for 1-bottle, one entry per bottle otherwise."""
+    return [(f, res.fluid_label(f)) for f in res.fluids]
+
+
+def _sfx(label):
+    return f" — {label}" if label else ""
 
 
 def add_log(message: str):
@@ -90,7 +126,8 @@ def run_analysis_task():
     _stop_event.clear()
     files = list(selected_files.value)
     add_log(f"Starting analysis of {len(files)} file(s) with {algorithm.value}, "
-            f"recording length {recording_hours.value:g} h")
+            f"recording length {recording_hours.value:g} h"
+            + (", 2-bottle choice" if two_bottle.value else ""))
 
     def _progress(frac, msg):
         progress.set((float(frac), msg))
@@ -101,6 +138,8 @@ def run_analysis_task():
         recording_length=recording_hours.value * 3600,
         apply_time_fix=apply_time_fix.value,
         keep_intermediate=keep_intermediate.value,
+        two_bottle=two_bottle.value, fluid_names=_fluid_names(),
+        require_weight=require_weight.value,
         log=add_log, progress=_progress, should_stop=_stop_event.is_set,
     )
     if path:
@@ -126,10 +165,10 @@ def Plot(fig, deps):
     return solara.FigureMatplotlib(fig, dependencies=deps, format="png")
 
 
-def _hist(ax, data, bins, title, xlabel, x_range=None):
+def _hist(ax, data, bins, title, xlabel, x_range=None, color=BLUE):
     kw = {'range': x_range} if x_range else {}
     if len(data):
-        ax.hist(data, bins=bins, color=BLUE, edgecolor="white", **kw)
+        ax.hist(data, bins=bins, color=color, edgecolor="white", **kw)
     ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel("Count")
 
 
@@ -139,13 +178,13 @@ def _band(ax, x, mat, label, color=BLUE):
     ax.plot(x, mean, "-o", color=color, ms=3, lw=1.5, label=label)
 
 
-def _trace_plot(w, title, unit=None, vlines=(), t_offset=0.0):
+def _trace_plot(w, title, unit=None, vlines=(), t_offset=0.0, color=BLUE):
     """Plot a (possibly decimated) window from analysis_core.read_window/session_window."""
     fig, ax = _fig(10, 3.2)
     span = (w['t'][-1] - w['t'][0]) if len(w['t']) else 0
     scale, uname = unit or _time_unit(span)
     t = (w['t'] - t_offset) / scale
-    ax.plot(t, w['y'], color=BLUE, lw=0.6)
+    ax.plot(t, w['y'], color=color, lw=0.6)
     if len(w.get('lick_t', [])):
         ax.plot((np.asarray(w['lick_t']) - t_offset) / scale, w['lick_y'], "o", color=RED,
                 ms=3, label=f"Licks ({len(w['lick_t'])})")
@@ -187,6 +226,7 @@ def FileSelection():
                         cur.add(f) if on else cur.discard(f)
                         selected_files.set(sorted(cur))
                     tf = " · time fix" if os.path.exists(core.time_fix_path_for(f)) else ""
+                    tf += " · 2-bottle" if file_mode(f) else ""
                     solara.Checkbox(label=f"{os.path.basename(f)}  ({core.file_size_gb(f):.2f} GB{tf})",
                                     value=f in selected_files.value, on_value=toggle)
         n = len(selected_files.value)
@@ -205,13 +245,33 @@ def RunOptions():
                               style={"max-width": "180px"})
             solara.Checkbox(label="Apply *_time_fix.xlsx files", value=apply_time_fix)
             solara.Checkbox(label="Keep intermediate filtered_*.h5", value=keep_intermediate)
+            solara.Checkbox(label="Require animal weight", value=require_weight)
+        with solara.Row(style={"flex-wrap": "wrap", "gap": "16px", "align-items": "center"}):
+            solara.Checkbox(label="2-bottle choice", value=two_bottle)
+            if two_bottle.value:
+                solara.InputText("Fluid 1 name", value=fluid1_name, style={"max-width": "180px"})
+                solara.InputText("Fluid 2 name", value=fluid2_name, style={"max-width": "180px"})
         solara.Markdown(
             f"*{core.ALGORITHMS[algorithm.value]}.* Each sensor is trimmed to its last "
             f"start/stop cycle and then to **{recording_hours.value:g} h** "
-            "(use 24 for day-long runs).")
+            "(use 24 for day-long runs)."
+            + (" Each bottle is detected separately; fluid 1 is the lower MPR121 channel "
+               "of each pair." if two_bottle.value else "")
+            + ("" if require_weight.value else
+               " Animals without a recorded weight are **kept** (weight left blank)."))
+        mismatched = [f for f in selected_files.value
+                      if file_mode(f) is not None and file_mode(f) != two_bottle.value]
+        if mismatched:
+            solara.Warning(
+                f"{len(mismatched)} selected file(s) were recorded in "
+                f"{'1' if two_bottle.value else '2'}-bottle mode: "
+                + ", ".join(os.path.basename(f) for f in mismatched[:5])
+                + ("…" if len(mismatched) > 5 else "")
+                + f". Toggle **2-bottle choice** {'off' if two_bottle.value else 'on'} or "
+                  "deselect them (1- and 2-bottle sessions cannot be combined).")
         with solara.Row():
             solara.Button("Run analysis", color="primary", icon_name="mdi-play",
-                          disabled=running or not selected_files.value,
+                          disabled=running or not selected_files.value or bool(mismatched),
                           on_click=run_analysis_task)
             solara.Button("Stop after current file", icon_name="mdi-stop",
                           disabled=not running, on_click=_stop_event.set)
@@ -314,15 +374,22 @@ def RawSensorView(raw_file, sensor_num, sensor_label, window_state):
         lambda: _safe(core.raw_sensor_overview, raw_file, sensor_num, max_points=PLOT_POINTS),
         [raw_file, sensor_num])
     ok = not isinstance(overview, Exception)
+    # 2-bottle sensors: one panel per bottle (the overview is fluid 1's).
+    fluids = list(core.FLUIDS) if ok and overview['two_bottle'] else [None]
     t_first = overview['t_first'] if ok else 0.0
     total_min = max((overview['t_last'] - t_first) / 60, 0.01) if ok else 1.0
     window = window_state.value[1] if window_state.value[0] == key else (0.0, total_min)
-    zoomed = solara.use_memo(
-        lambda: overview if (not ok or window == (0.0, total_min)) else _safe(
-            core.raw_sensor_overview, raw_file, sensor_num, t_first + window[0] * 60,
-            t_first + window[1] * 60, max_points=PLOT_POINTS),
-        [raw_file, sensor_num, window])
-    for r in (overview, zoomed):
+
+    def _views():
+        full = window == (0.0, total_min)
+        return {f: overview if (not ok or (full and f in (None, 1))) else _safe(
+                    core.raw_sensor_overview, raw_file, sensor_num,
+                    None if full else t_first + window[0] * 60,
+                    None if full else t_first + window[1] * 60,
+                    max_points=PLOT_POINTS, fluid=f)
+                for f in fluids}
+    views = solara.use_memo(_views, [raw_file, sensor_num, window, tuple(fluids)])
+    for r in [overview, *views.values()]:
         if isinstance(r, Exception):
             solara.Error(str(r))
             return
@@ -339,9 +406,14 @@ def RawSensorView(raw_file, sensor_num, sensor_label, window_state):
             vlines.append((c['stop_time'], RED, f"stop{tag}"))
     lo, hi = t_first + window[0] * 60, t_first + window[1] * 60
     vlines = [v for v in vlines if lo <= v[0] <= hi]
-    fig = _trace_plot(zoomed, f"{os.path.basename(raw_file)} — {sensor} ({overview['board']})",
-                      unit=_time_unit((hi - lo)), vlines=vlines, t_offset=t_first)
-    Plot(fig, [raw_file, sensor, window])
+    names = _fluid_names()
+    for f in fluids:
+        ftag = f" — fluid {f} ({names[f]})" if f else ""
+        fig = _trace_plot(views[f], f"{os.path.basename(raw_file)} — {sensor} "
+                                    f"({overview['board']}){ftag}",
+                          unit=_time_unit((hi - lo)), vlines=vlines, t_offset=t_first,
+                          color=FLUID_COLORS[f or 0])
+        Plot(fig, [raw_file, sensor, window, f])
 
     if overview['cycles']:
         df = pd.DataFrame(overview['cycles'])
@@ -355,7 +427,9 @@ def RawSensorView(raw_file, sensor_num, sensor_label, window_state):
                        "used. Consider a time fix file.")
     solara.Text(f"File spans {datetime.datetime.fromtimestamp(t_first):%Y-%m-%d %H:%M:%S} → "
                 f"{datetime.datetime.fromtimestamp(overview['t_last']):%H:%M:%S} "
-                f"(Unix {t_first:.0f} – {overview['t_last']:.0f})")
+                f"(Unix {t_first:.0f} – {overview['t_last']:.0f})"
+                + (" · 2-bottle sensor: start/stop is shared by both bottles"
+                   if fluids != [None] else ""))
 
 
 def _safe(fn, *args, **kwargs):
@@ -368,29 +442,42 @@ def _safe(fn, *args, **kwargs):
 # ---------------------------------------------------------------------------
 # Results tabs
 # ---------------------------------------------------------------------------
+# 2-bottle results get one panel / card per bottle wherever a 1-bottle result
+# had one; fluid 0 (1-bottle) renders exactly as before.
 @solara.component
 def SummaryTab(res):
-    det = solara.use_memo(lambda: core.detection_summary(res), [res])
+    panels = _panels(res)
+    dets = solara.use_memo(lambda: {f: core.detection_summary(res, fluid=f) for f in res.fluids},
+                           [res])
     controls = solara.use_memo(lambda: core.control_summary(res), [res])
 
     with solara.Card("Detection summary"):
-        solara.Markdown(
-            f"**{len(res.animal_ids)}** animals · **{res.sessions['session'].nunique()}** sessions · "
-            f"recording length **{res.recording_length / 3600:g} h** · algorithm "
-            f"`{res.attrs.get('algorithm', '?')}`\n\n"
-            f"CLiQR: **{det['mean']:.0f} ± {det['sd']:.0f}** licks/session (mean ± SD) · "
-            f"lick count vs volume **R² = {det['r2']:.4f}**")
-        fig, ax = _fig(5, 4)
-        ax.scatter(det['x'], det['y'], s=18, color=BLUE, alpha=0.7)
-        if not np.isnan(det['slope']) and len(det['x']):
-            xs = np.array([det['x'].min(), det['x'].max()])
-            ax.plot(xs, det['intercept'] + det['slope'] * xs, color=GREY, lw=1)
-        ax.set_title(f"CLiQR (R²={det['r2']:.3f})"); ax.set_xlabel("Lick Count")
-        ax.set_ylabel("Volume Consumed (mL)")
+        lines = [f"**{len(res.animal_ids)}** animals · **{res.sessions['session'].nunique()}** "
+                 f"sessions · recording length **{res.recording_length / 3600:g} h** · algorithm "
+                 f"`{res.attrs.get('algorithm', '?')}`"
+                 + (" · **2-bottle choice**" if res.two_bottle else "")]
+        for f, label in panels:
+            d = dets[f]
+            lines.append(f"CLiQR{_sfx(label)}: **{d['mean']:.0f} ± {d['sd']:.0f}** licks/session "
+                         f"(mean ± SD) · lick count vs volume **R² = {d['r2']:.4f}**")
+        solara.Markdown("\n\n".join(lines))
+        fig = Figure(figsize=(5 * len(panels), 4), dpi=100)
+        axes = np.atleast_1d(fig.subplots(1, len(panels)))
+        for ax, (f, label) in zip(axes, panels):
+            d = dets[f]
+            ax.scatter(d['x'], d['y'], s=18, color=FLUID_COLORS[f], alpha=0.7)
+            if not np.isnan(d['slope']) and len(d['x']):
+                xs = np.array([d['x'].min(), d['x'].max()])
+                ax.plot(xs, d['intercept'] + d['slope'] * xs, color=GREY, lw=1)
+            ax.set_title(f"CLiQR{_sfx(label)} (R²={d['r2']:.3f})")
+            ax.set_xlabel("Lick Count"); ax.set_ylabel("Volume Consumed (mL)")
         Plot(fig, [res])
-        solara.Button("Export cliqr_licks_vs_vol.csv", text=True,
-                      on_click=lambda: export(lambda d: core.export_licks_vs_vol(det, d),
-                                              "licks vs volume"))
+        with solara.Row():
+            for f, label in panels:
+                solara.Button(f"Export cliqr_licks_vs_vol{core.fluid_tag(f)}.csv", text=True,
+                              on_click=lambda f=f, label=label: export(
+                                  lambda d: core.export_licks_vs_vol(dets[f], d, core.fluid_tag(f)),
+                                  f"licks vs volume{_sfx(label)}"))
 
     with solara.Card("Control cages"):
         solara.Markdown("Controls have sippers but no animal: any detected licks are false "
@@ -400,13 +487,14 @@ def SummaryTab(res):
             solara.Text("No control cages in this results file.")
         else:
             solara.Markdown(
-                f"False-positive licks / control-session: mean "
-                f"**{controls['false_positive_licks'].mean():.1f}**, max "
+                f"False-positive licks / control-{'bottle' if res.two_bottle else 'session'}: "
+                f"mean **{controls['false_positive_licks'].mean():.1f}**, max "
                 f"**{controls['false_positive_licks'].max()}** · evaporation: mean "
                 f"**{controls['evaporation_mL'].mean():.3f} mL**, max "
                 f"**{controls['evaporation_mL'].max():.3f} mL**")
             fig, ax = _fig(max(5, 0.5 * len(controls)), 3)
-            labels = [f"{r.control} ({r.date})" for r in controls.itertuples()]
+            labels = [f"{r.control} ({r.date}{', ' + r.fluid if res.two_bottle else ''})"
+                      for r in controls.itertuples()]
             ax.bar(range(len(labels)), controls['false_positive_licks'], color="firebrick")
             ax.set_xticks(range(len(labels)), labels, rotation=45, ha="right", fontsize=8)
             ax.set_ylabel("False-positive licks")
@@ -416,24 +504,135 @@ def SummaryTab(res):
     with solara.Card("All sessions"):
         cols = ['animal_id', 'date', 'session', 'n_licks', 'n_bouts', 'consumed_vol', 'weight',
                 'duration_s']
-        solara.DataFrame(res.sessions[cols], items_per_page=15)
+        table = res.sessions[cols]
+        if res.two_bottle:
+            table = table.assign(fluid=[res.fluid_label(f) for f in res.sessions['fluid']])
+            table = table[['animal_id', 'date', 'session', 'fluid'] + cols[3:]]
+        solara.DataFrame(table, items_per_page=15)
         solara.Button("Export cliqr_session_summary.csv", text=True,
                       on_click=lambda: export(lambda d: core.export_session_table(res, d),
                                               "session table"))
 
 
 @solara.component
-def MetricsBlock(res, excl, suffix, title):
-    """Behavioral metric histograms + time course (shared by the all-data and
-    outliers-removed tabs)."""
+def PreferenceBlock(res, excl, suffix, title):
+    """2-bottle fluid preference: per-session and per-animal comparisons of the
+    two bottles, group tests, and preference over the session."""
+    names = res.fluid_names
+    target = pref_target.value if pref_target.value in core.FLUIDS else 1
+    other = 3 - target
     bin_s = max(float(bin_minutes.value), 0.5) * 60
-    length_s = res.recording_length
-    m = solara.use_memo(lambda: core.pooled_metrics(res, excl), [res, excl])
-    tc = solara.use_memo(lambda: core.timecourse(res, bin_s=bin_s, length_s=length_s,
-                                                 exclude=excl), [res, excl, bin_s])
-    s = core.metric_summary(m)
+    table = solara.use_memo(lambda: core.preference_table(res, excl, target=target),
+                            [res, excl, target])
+    summ = solara.use_memo(lambda: core.preference_summary(table, target=target), [table])
+    by_s = solara.use_memo(lambda: core.preference_by_session(table), [table])
+    ptc = solara.use_memo(lambda: core.preference_timecourse(
+        res, bin_s=bin_s, length_s=res.recording_length, exclude=excl, target=target),
+        [res, excl, target, bin_s])
 
-    with solara.Card(f"Behavioral metrics{title}"):
+    with solara.Card(f"Fluid preference{title}"):
+        label_to_f = {names[f]: f for f in core.FLUIDS}
+        solara.Select("Preference reported for", value=names[target],
+                      values=list(label_to_f), on_value=lambda v: pref_target.set(label_to_f[v]),
+                      style={"max-width": "260px"})
+        T, O = names[target], names[other]
+        if table.empty:
+            solara.Warning("No animal sessions with both bottles.")
+            return
+        pa = summ['per_animal']
+        tests = summ['tests']
+
+        def _p(measure, test):
+            r = tests[(tests['measure'] == measure) & (tests['test'].str.startswith(test))]
+            return r['p'].iloc[0] if len(r) else np.nan
+        solara.Markdown(
+            f"Preference ratio = {T} / ({T} + {O}) (0.5 = no preference, also called the "
+            f"discrimination ratio); discrimination index = ({T} − {O}) / ({T} + {O}) "
+            f"(0 = no preference). Volumes below 0 are treated as 0 in the ratios. "
+            f"Statistics treat **animals** as the unit (each animal's sessions averaged first).\n\n"
+            f"- Volume: **{T} {pa[f'vol_f{target}'].mean():.2f} mL** vs **{O} "
+            f"{pa[f'vol_f{other}'].mean():.2f} mL** per session · difference "
+            f"**{pa['vol_diff'].mean():+.2f} mL** · preference ratio "
+            f"**{pa['vol_pref'].mean():.2f}** · paired t p = {_p('Volume (mL)', 'paired'):.3g}\n"
+            f"- Licks: **{T} {pa[f'licks_f{target}'].mean():.0f}** vs **{O} "
+            f"{pa[f'licks_f{other}'].mean():.0f}** per session · preference ratio "
+            f"**{pa['licks_pref'].mean():.2f}** · paired t p = {_p('Licks', 'paired'):.3g}\n"
+            f"- {len(pa)} animals, {len(table)} sessions")
+
+        fig = Figure(figsize=(13, 3.8), dpi=100)
+        a0, a1, a2 = fig.subplots(1, 3)
+        # (a) per-animal volume per bottle, paired lines
+        xs = np.array([0, 1])
+        for r in pa.itertuples():
+            v = [getattr(r, f"vol_f{target}"), getattr(r, f"vol_f{other}")]
+            a0.plot(xs, v, color=GREY, lw=0.8, alpha=0.6)
+        for x, f in zip(xs, (target, other)):
+            a0.scatter(np.full(len(pa), x), pa[f"vol_f{f}"], s=36, color=FLUID_COLORS[f],
+                       zorder=3, label=names[f], edgecolors="white", linewidths=1)
+        a0.set_xticks(xs, [T, O]); a0.set_xlim(-0.5, 1.5)
+        a0.set_ylabel("Volume consumed (mL / session)")
+        a0.set_title("Per animal (session mean)"); a0.legend(fontsize=8)
+        # (b) per-animal preference ratios
+        for i, (m, (_c, mlabel)) in enumerate(core.PREFERENCE_MEASURES.items()):
+            v = pa[f"{m}_pref"].dropna().to_numpy()
+            jitter = np.linspace(-0.12, 0.12, len(v)) if len(v) > 1 else np.zeros(len(v))
+            a1.scatter(i + jitter, v, s=30, color=FLUID_COLORS[target], alpha=0.8,
+                       edgecolors="white", linewidths=1)
+            if len(v):
+                a1.hlines(v.mean(), i - 0.25, i + 0.25, color="black", lw=2)
+        a1.axhline(0.5, color=GREY, ls="--", lw=1)
+        a1.set_xticks(range(len(core.PREFERENCE_MEASURES)),
+                      [lbl.split(" (")[0] for _c, lbl in core.PREFERENCE_MEASURES.values()])
+        a1.set_ylim(-0.02, 1.02); a1.set_ylabel(f"{T} preference ratio")
+        a1.set_title("Per animal (bar = mean, dashed = 0.5)")
+        # (c) preference across sessions
+        x = np.arange(len(by_s))
+        for m, color, marker in (('vol', "#333333", "o"), ('licks', "#999999", "s")):
+            a2.errorbar(x, by_s[f"{m}_pref_mean"], yerr=by_s[f"{m}_pref_sem"], color=color,
+                        marker=marker, ms=5, lw=1.5, capsize=3,
+                        label=core.PREFERENCE_MEASURES[m][1].split(" (")[0])
+        a2.axhline(0.5, color=GREY, ls="--", lw=1)
+        a2.set_xticks(x, by_s['date'], rotation=45, ha="right", fontsize=8)
+        a2.set_ylim(-0.02, 1.02); a2.set_ylabel(f"{T} preference ratio")
+        a2.set_title("Across sessions (mean ± SEM)"); a2.legend(fontsize=8)
+        Plot(fig, [res, excl, target])
+
+        scale, uname = _time_unit(res.recording_length)
+        xt = ptc['centers_min'] * 60 / scale
+        fig = Figure(figsize=(13, 3.4), dpi=100)
+        b1, b2 = fig.subplots(1, 2)
+        for f in (target, other):
+            if ptc['cum_licks'][f].shape[0]:
+                _band(b1, xt, ptc['cum_licks'][f], names[f], color=FLUID_COLORS[f])
+        b1.set_title("Cumulative licks per bottle"); b1.set_ylabel("Cumulative licks")
+        b1.legend(fontsize=8)
+        if ptc['pref'].shape[0]:
+            _band(b2, xt, ptc['pref'], f"{T} preference", color=FLUID_COLORS[target])
+        b2.axhline(0.5, color=GREY, ls="--", lw=1)
+        b2.set_ylim(-0.02, 1.02); b2.set_title("Cumulative lick preference")
+        b2.set_ylabel(f"{T} / all licks so far")
+        for ax in (b1, b2):
+            ax.set_xlabel(f"Time ({uname})")
+        Plot(fig, [res, excl, target, bin_s])
+
+        with solara.Details("Group tests (animals as the unit)"):
+            solara.DataFrame(tests, items_per_page=10)
+        with solara.Details("Per-animal preference table"):
+            solara.DataFrame(pa, items_per_page=20)
+        with solara.Details("Per-session preference table"):
+            solara.DataFrame(table, items_per_page=20)
+        solara.Button("Export preference CSVs", text=True,
+                      on_click=lambda: export(
+                          lambda d: core.export_preference(table, summ, d, suffix),
+                          "fluid preference"))
+
+
+@solara.component
+def BehaviorCard(res, excl, suffix, title, fluid, label):
+    m = solara.use_memo(lambda: core.pooled_metrics(res, excl, fluid=fluid), [res, excl, fluid])
+    s = core.metric_summary(m)
+    color = FLUID_COLORS[fluid]
+    with solara.Card(f"Behavioral metrics{_sfx(label)}{title}"):
         solara.Markdown(
             f"Median ILI **{s['median_ili_ms']:.1f} ms** ({s['median_ili_hz']:.1f} Hz) · "
             f"mean licks/bout **{s['mean_licks_per_bout']:.1f}** (median "
@@ -442,38 +641,68 @@ def MetricsBlock(res, excl, suffix, title):
             f"{s['n_bouts']} bouts")
         fig = Figure(figsize=(13, 3.2), dpi=100)
         a1, a2, a3 = fig.subplots(1, 3)
-        _hist(a1, m['ILIs'] * 1000, 100, "ILI", "ILI (ms)", (0, 1000))
+        _hist(a1, m['ILIs'] * 1000, 100, "ILI", "ILI (ms)", (0, 1000), color=color)
         max_b = int(m['bout_lick_counts'].max()) if len(m['bout_lick_counts']) else 1
         _hist(a2, m['bout_lick_counts'], np.arange(1, min(max_b, 300) + 2), "Licks per Bout",
-              "Licks per Bout")
-        _hist(a3, m['bout_durations'], 50, "Bout Duration", "Duration (s)")
-        Plot(fig, [res, excl])
-        solara.Button("Export ILI / bout CSVs", text=True,
-                      on_click=lambda: export(lambda d: core.export_metrics(m, d, suffix),
-                                              "behavioral metrics"))
+              "Licks per Bout", color=color)
+        _hist(a3, m['bout_durations'], 50, "Bout Duration", "Duration (s)", color=color)
+        Plot(fig, [res, excl, fluid])
+        tag = core.fluid_tag(fluid)
+        solara.Button(f"Export ILI / bout CSVs{_sfx(label)}", text=True,
+                      on_click=lambda: export(lambda d: core.export_metrics(m, d, suffix, tag),
+                                              f"behavioral metrics{_sfx(label)}"))
 
+
+@solara.component
+def TemporalCard(res, excl, suffix, title):
+    panels = _panels(res)
+    bin_s = max(float(bin_minutes.value), 0.5) * 60
+    length_s = res.recording_length
+    tcs = solara.use_memo(lambda: {f: core.timecourse(res, bin_s=bin_s, length_s=length_s,
+                                                      exclude=excl, fluid=f)
+                                   for f in res.fluids}, [res, excl, bin_s])
     with solara.Card(f"Temporal dynamics{title}"):
         solara.InputFloat("Bin size (minutes)", value=bin_minutes, style={"max-width": "200px"})
         scale, uname = _time_unit(length_s)
-        x = tc['centers_min'] * 60 / scale
-        solara.Text(f"{tc['licks'].shape[0]} sessions, mean ± SEM, "
+        first = tcs[res.fluids[0]]
+        x = first['centers_min'] * 60 / scale
+        solara.Text(f"{first['licks'].shape[0]} sessions, mean ± SEM, "
                     f"{len(x)} bins over {length_s / 3600:g} h")
-        fig = Figure(figsize=(13, 3.4), dpi=100)
-        (b1, b2) = fig.subplots(1, 2)
-        if tc['licks'].shape[0]:
-            _band(b1, x, tc['licks'], "Licks")
-            _band(b2, x, np.cumsum(tc['licks'], axis=1), "Licks")
-        if tc['bouts'].shape[0]:
-            _band(b1, x, tc['bouts'], "Bouts", color="#ff7f0e")
-            _band(b2, x, np.cumsum(tc['bouts'], axis=1), "Bouts", color="#ff7f0e")
-        b1.set_title(f"Per {bin_s / 60:g}-min bin"); b2.set_title("Cumulative")
-        for ax in (b1, b2):
-            ax.set_xlabel(f"Time ({uname})"); ax.legend(fontsize=8)
-        b1.set_ylabel("Count per bin"); b2.set_ylabel("Cumulative count")
+        fig = Figure(figsize=(13, 3.4 * len(panels)), dpi=100)
+        axes = np.atleast_2d(fig.subplots(len(panels), 2))
+        for (b1, b2), (f, label) in zip(axes, panels):
+            tc = tcs[f]
+            if tc['licks'].shape[0]:
+                _band(b1, x, tc['licks'], "Licks")
+                _band(b2, x, np.cumsum(tc['licks'], axis=1), "Licks")
+            if tc['bouts'].shape[0]:
+                _band(b1, x, tc['bouts'], "Bouts", color="#ff7f0e")
+                _band(b2, x, np.cumsum(tc['bouts'], axis=1), "Bouts", color="#ff7f0e")
+            b1.set_title(f"Per {bin_s / 60:g}-min bin{_sfx(label)}")
+            b2.set_title(f"Cumulative{_sfx(label)}")
+            for ax in (b1, b2):
+                ax.set_xlabel(f"Time ({uname})"); ax.legend(fontsize=8)
+            b1.set_ylabel("Count per bin"); b2.set_ylabel("Cumulative count")
         Plot(fig, [res, excl, bin_s])
-        solara.Button("Export cumulative CSVs", text=True,
-                      on_click=lambda: export(lambda d: core.export_cumulative(tc, d, suffix),
-                                              "cumulative licks/bouts"))
+        with solara.Row():
+            for f, label in panels:
+                solara.Button(f"Export cumulative CSVs{_sfx(label)}", text=True,
+                              on_click=lambda f=f, label=label: export(
+                                  lambda d: core.export_cumulative(tcs[f], d, suffix,
+                                                                   core.fluid_tag(f)),
+                                  f"cumulative licks/bouts{_sfx(label)}"))
+
+
+@solara.component
+def MetricsBlock(res, excl, suffix, title):
+    """Behavioral metric histograms + time course (shared by the all-data and
+    outliers-removed tabs); 2-bottle results add fluid preference and one
+    card per bottle."""
+    if res.two_bottle:
+        PreferenceBlock(res, excl, suffix, title)
+    for f, label in _panels(res):
+        BehaviorCard(res, excl, suffix, title, f, label)
+    TemporalCard(res, excl, suffix, title)
 
 
 @solara.component
@@ -487,12 +716,17 @@ def TracesTab(res):
         return
     animal = animal_choice.value if animal_choice.value in animals else animals[0]
     sess = res.sessions[res.sessions['animal_id'] == animal]
-    labels = {f"{r.date} (#{r.session}) — {r.n_licks} licks": int(r.session)
-              for r in sess.itertuples()}
+    labels = {}
+    for s_idx, d in sess.groupby('session', sort=True):
+        if res.two_bottle:
+            licks = " / ".join(f"{res.fluid_label(r.fluid)} {r.n_licks}" for r in d.itertuples())
+        else:
+            licks = str(int(d['n_licks'].iloc[0]))
+        labels[f"{d['date'].iloc[0]} (#{s_idx}) — {licks} licks"] = int(s_idx)
     session = session_choice.value if session_choice.value in labels else next(iter(labels))
     s_idx = labels[session]
-    row = sess[sess['session'] == s_idx].iloc[0]
-    duration = max(float(row['duration_s']), 1.0)
+    rows = sess[sess['session'] == s_idx]
+    duration = max(float(rows['duration_s'].max()), 1.0)
     scale, uname = _time_unit(duration)
     total = duration / scale
     key = (res.path, animal, s_idx)
@@ -524,61 +758,77 @@ def TracesTab(res):
     solara.SliderRangeFloat(f"Window ({uname})", value=(lo, hi), on_value=set_window,
                             min=0.0, max=float(total), step=1 / scale)  # 1 s steps
 
-    SessionTraceView(res, animal, s_idx, row['date'], lo * scale, hi * scale)
+    date = rows['date'].iloc[0]
+    for f in rows['fluid']:
+        SessionTraceView(res, animal, s_idx, date, lo * scale, hi * scale, int(f))
     solara.Text("Long windows are min/max decimated (every dip is kept). Zoom in to see "
                 "individual samples.", style={"font-size": "12px", "color": GREY})
 
 
 @solara.component
-def SessionTraceView(res, animal, s_idx, date, t0, t1):
+def SessionTraceView(res, animal, s_idx, date, t0, t1, fluid=0):
     w = solara.use_memo(lambda: core.session_window(res, animal, s_idx, t0, t1,
-                                                    max_points=PLOT_POINTS),
-                        [res, animal, s_idx, t0, t1])
-    title = (f"{animal} — {date} — consumed {w['consumed_vol']:.2f} mL — "
-             f"{w['n_licks_window']} licks in view")
-    Plot(_trace_plot(w, title, unit=_time_unit(t1 - t0)), [res, animal, s_idx, t0, t1])
+                                                    max_points=PLOT_POINTS, fluid=fluid),
+                        [res, animal, s_idx, t0, t1, fluid])
+    title = (f"{animal}{_sfx(res.fluid_label(fluid))} — {date} — consumed "
+             f"{w['consumed_vol']:.2f} mL — {w['n_licks_window']} licks in view")
+    Plot(_trace_plot(w, title, unit=_time_unit(t1 - t0), color=FLUID_COLORS[fluid]),
+         [res, animal, s_idx, t0, t1, fluid])
 
 
 @solara.component
 def CorrelationTab(res):
+    if res.two_bottle:
+        solara.Markdown("Lick count vs volume is fitted **separately for each bottle**. "
+                        "Excluding an outlier drops only that bottle of that session from the "
+                        "bottle's metrics, but drops the whole session from fluid preference.")
+    for f, label in _panels(res):
+        if label:
+            solara.Markdown(f"## {label}")
+        FluidCorrelation(res, f, label)
+
+
+@solara.component
+def FluidCorrelation(res, fluid, label):
     from scipy import stats
-    corr = solara.use_memo(lambda: core.correlation_analysis(res), [res])
-    clean = solara.use_memo(lambda: core.refit_excluding(res, set(excluded.value)),
-                            [res, excluded.value])
-    ceiling = solara.use_memo(lambda: core.correlation_ceiling(res), [res])
+    corr = solara.use_memo(lambda: core.correlation_analysis(res, fluid=fluid), [res, fluid])
+    clean = solara.use_memo(lambda: core.refit_excluding(res, set(excluded.value), fluid=fluid),
+                            [res, excluded.value, fluid])
+    ceiling = solara.use_memo(lambda: core.correlation_ceiling(res, fluid=fluid), [res, fluid])
+    sfx = _sfx(label)
     if not corr['ok']:
-        solara.Warning("Need at least 3 animal sessions with volumes for the correlation.")
+        solara.Warning(f"Need at least 3 animal sessions with volumes for the correlation{sfx}.")
         return
     mdl, robust = corr['ols'], corr['robust']
 
-    with solara.Card("Lick count vs volume consumed (all animal sessions)"):
+    with solara.Card(f"Lick count vs volume consumed{sfx} (all animal sessions)"):
         solara.Markdown(f"OLS **R² = {mdl.rsquared:.4f}** · HC3-robust slope "
                         f"**{robust.params[1]:.4g}** mL/lick, p = {robust.pvalues[1]:.3e} · "
                         f"n = {len(corr['x'])}")
         fig = Figure(figsize=(13, 3.6), dpi=100)
         a0, a1, a2 = fig.subplots(1, 3)
         out = corr['is_outlier']
-        a0.scatter(corr['x'][~out], corr['y'][~out], s=16, color=BLUE)
+        a0.scatter(corr['x'][~out], corr['y'][~out], s=16, color=FLUID_COLORS[fluid])
         a0.scatter(corr['x'][out], corr['y'][out], s=40, color=RED, marker="x", label="MAD outlier")
         a0.set_xlabel("Number of Licks"); a0.set_ylabel("Volume Consumed (mL)")
-        a0.set_title("Outliers detected"); a0.legend(fontsize=8)
+        a0.set_title(f"Outliers detected{sfx}"); a0.legend(fontsize=8)
         stats.probplot(mdl.resid, dist="norm", plot=a1)
         a1.set_title(f"Linear fit residuals, R²={mdl.rsquared:.4f}", fontsize=10)
         stats.probplot(corr['resid_r'], dist="norm", plot=a2)
         a2.set_title("Robust (Huber) fit residuals", fontsize=10)
-        Plot(fig, [res])
+        Plot(fig, [res, fluid])
         with solara.Details("Full OLS summary (HC3)"):
             solara.Preformatted(str(robust.summary()))
 
     outliers = corr['outliers']
-    with solara.Card(f"Outliers ({len(outliers)}) — MAD > 3.5 on robust residuals"):
+    with solara.Card(f"Outliers{sfx} ({len(outliers)}) — MAD > 3.5 on robust residuals"):
         if outliers.empty:
             solara.Success("No outliers detected.")
         else:
             solara.Markdown("Tick a session to **exclude** it from the cleaned regression and "
                             "from the *Outliers removed* tab. Nothing is excluded by default.")
             for r in outliers.itertuples():
-                k = (int(r.session), r.animal_id)
+                k = (int(r.session), r.animal_id, int(r.fluid))
 
                 def toggle(on, k=k):
                     cur = set(excluded.value)
@@ -589,11 +839,13 @@ def CorrelationTab(res):
                                 value=k in excluded.value, on_value=toggle)
             with solara.Details("Outlier traces"):
                 for r in outliers.itertuples():
-                    w = core.session_window(res, r.animal_id, int(r.session), max_points=2000)
-                    Plot(_trace_plot(w, f"{r.animal_id}, date: {r.date}"),
-                         [res, r.animal_id, int(r.session)])
+                    w = core.session_window(res, r.animal_id, int(r.session), max_points=2000,
+                                            fluid=fluid)
+                    Plot(_trace_plot(w, f"{r.animal_id}{sfx}, date: {r.date}",
+                                     color=FLUID_COLORS[fluid]),
+                         [res, r.animal_id, int(r.session), fluid])
 
-    with solara.Card("Cleaned fit"):
+    with solara.Card(f"Cleaned fit{sfx}"):
         if clean['ok']:
             mc, rc = clean['ols'], clean['robust']
             solara.Markdown(
@@ -604,9 +856,11 @@ def CorrelationTab(res):
                 f"HC3 p {rc.pvalues[1]:.3e}")
             with solara.Details("Cleaned OLS summary (HC3)"):
                 solara.Preformatted(str(rc.summary()))
-            solara.Button("Export nLicksVsVol_outliers_removed.csv", text=True,
-                          on_click=lambda: export(lambda d: core.export_clean_regression(clean, d),
-                                                  "cleaned regression data"))
+            tag = core.fluid_tag(fluid)
+            solara.Button(f"Export nLicksVsVol{tag}_outliers_removed.csv", text=True,
+                          on_click=lambda: export(
+                              lambda d: core.export_clean_regression(clean, d, tag),
+                              f"cleaned regression data{sfx}"))
         else:
             solara.Warning("Fewer than 3 sessions left after exclusion.")
         if ceiling is not None:
@@ -617,12 +871,23 @@ def CorrelationTab(res):
 
 @solara.component
 def PerAnimalTab(res):
-    table, fits, skipped = solara.use_memo(lambda: core.per_animal_fits(res), [res])
     solara.Markdown(
         "`volume ~ licks` fitted **separately for each animal** across its own sessions (raw "
         "data, independent of outlier exclusion). Each slope is that animal's mL per lick; the "
         "spread across animals is the between-individual variability pooling hides. Animals "
-        "with fewer than 3 sessions are skipped.")
+        "with fewer than 3 sessions are skipped."
+        + (" 2-bottle results are fitted separately per bottle." if res.two_bottle else ""))
+    for f, label in _panels(res):
+        if label:
+            solara.Markdown(f"## {label}")
+        FluidPerAnimal(res, f, label)
+
+
+@solara.component
+def FluidPerAnimal(res, fluid, label):
+    table, fits, skipped = solara.use_memo(lambda: core.per_animal_fits(res, fluid=fluid),
+                                           [res, fluid])
+    sfx = _sfx(label)
     if skipped:
         solara.Text("Skipped: " + ", ".join(f"{a} (n={n})" for a, n in skipped))
     if table.empty:
@@ -630,7 +895,7 @@ def PerAnimalTab(res):
         return
     sl = table['slope_mL_per_lick']
     spread = f", {sl.max() / sl.min():.1f}× spread" if sl.min() > 0 else ""
-    solara.Markdown(f"Slope (mL/lick): mean **{sl.mean():.2e}**, range "
+    solara.Markdown(f"Slope (mL/lick){sfx}: mean **{sl.mean():.2e}**, range "
                     f"{sl.min():.2e}–{sl.max():.2e}{spread}")
     solara.DataFrame(table, items_per_page=20)
     fig, ax = _fig(9, 5.5)
@@ -642,12 +907,13 @@ def PerAnimalTab(res):
         xl = np.array([x.min(), x.max()])
         ax.plot(xl, b0 + b1 * xl, color=c, lw=1.5, label=animal_id)
     ax.set_xlabel("Lick Count"); ax.set_ylabel("Volume Consumed (mL)")
-    ax.set_title("Per-animal: volume consumed vs lick count")
+    ax.set_title(f"Per-animal: volume consumed vs lick count{sfx}")
     ax.legend(fontsize=7, loc="center left", bbox_to_anchor=(1, 0.5))
-    Plot(fig, [res])
-    solara.Button("Export per_animal_lick_vs_volume_fits.csv", text=True,
-                  on_click=lambda: export(lambda d: core.export_per_animal(table, d),
-                                          "per-animal fits"))
+    Plot(fig, [res, fluid])
+    tag = core.fluid_tag(fluid)
+    solara.Button(f"Export per_animal_lick_vs_volume_fits{tag}.csv", text=True,
+                  on_click=lambda: export(lambda d: core.export_per_animal(table, d, tag),
+                                          f"per-animal fits{sfx}"))
 
 
 @solara.component
@@ -655,7 +921,8 @@ def CleanTab(res):
     excl = excluded.value
     if excl:
         solara.Info("Excluded sessions: " + ", ".join(
-            f"{a} ({res.session_label(s)})" for s, a in sorted(excl)))
+            f"{a} ({res.session_label(s)}{', ' + res.fluid_label(f) if f else ''})"
+            for s, a, f in sorted(excl)))
     else:
         solara.Info("No sessions excluded (tick outliers on the Correlation tab). "
                     "Exports from this tab use the *_outliers_removed.csv names.")

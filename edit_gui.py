@@ -4,6 +4,8 @@ Run with:  solara run edit_gui.py
 
 Pick a raw_data*.h5 recording file, correct any mistyped start/stop volume or
 weight values (all recording cycles shown), and save the corrections in place.
+2-bottle choice files show start/stop volumes for each bottle (fluid 1 = the
+lower MPR121 channel of the pair) plus the shared weight.
 """
 import datetime
 from pathlib import Path
@@ -17,6 +19,7 @@ import edit_io
 # ---------------------------------------------------------------------------
 selected_file = solara.reactive("")
 edit_data = solara.reactive({})   # {sensor_id: {cycle: {field: float}}}
+two_bottle = solara.reactive(False)  # mode of the loaded file
 log_messages = solara.reactive([])
 
 FIELD_LABELS = {
@@ -24,6 +27,16 @@ FIELD_LABELS = {
     "stop_vol": "Stop Vol (mL)",
     "weight": "Weight (g)",
 }
+
+
+def field_label(field: str) -> str:
+    """'fluid2/stop_vol' -> 'Stop Vol (mL)' (the fluid is shown as a heading)."""
+    return FIELD_LABELS[field.rsplit("/", 1)[-1]]
+
+
+def field_section(field: str) -> str:
+    """Heading a field sits under: 'Fluid 1', 'Fluid 2', or '' (sensor level)."""
+    return f"Fluid {field[5]}" if field.startswith("fluid") else ""
 
 
 def add_log(message: str):
@@ -34,15 +47,18 @@ def add_log(message: str):
 def load_selected(path: str):
     try:
         data = edit_io.load_file(path)
+        mode = edit_io.is_two_bottle(path)
     except Exception as exc:  # bad/corrupt/non-h5 file
         add_log(f"ERROR loading {Path(path).name}: {exc}")
         edit_data.set({})
         selected_file.set("")
         return
+    two_bottle.set(mode)
     edit_data.set(data)
     selected_file.set(path)
     n_cycles = sum(len(c) for c in data.values())
-    add_log(f"Loaded {len(data)} sensors, {n_cycles} cycles from {Path(path).name}")
+    add_log(f"Loaded {len(data)} sensors, {n_cycles} cycles from {Path(path).name}"
+            + (" (2-bottle choice)" if mode else ""))
 
 
 def save_selected():
@@ -71,7 +87,7 @@ def EditSensorCard(sensor_id: int):
     cycles = edit_data.value.get(sensor_id)
     border = "#4CAF50" if cycles else "#9E9E9E"
     with solara.Card(style={
-        "width": "250px", "min-height": "160px",
+        "width": "280px" if two_bottle.value else "250px", "min-height": "160px",
         "border": f"2px solid {border}", "padding": "10px",
     }):
         solara.Text(f"Sensor {sensor_id}",
@@ -85,9 +101,15 @@ def EditSensorCard(sensor_id: int):
                 if multi:
                     solara.Text(f"Cycle {cycle}",
                                 style={"font-size": "11px", "font-weight": "bold"})
-                for field in edit_io.FIELDS:
+                section = None
+                for field in cycles[cycle]:
+                    if two_bottle.value and field_section(field) != section:
+                        section = field_section(field)
+                        solara.Text(section or "Animal",
+                                    style={"font-size": "11px", "color": "#336",
+                                           "margin-top": "4px"})
                     solara.InputFloat(
-                        label=FIELD_LABELS[field],
+                        label=field_label(field),
                         value=cycles[cycle][field],
                         on_value=lambda v, s=sensor_id, c=cycle, f=field: set_field(s, c, f, v),
                         continuous_update=True,
@@ -133,7 +155,9 @@ def Page():
         )
 
         if selected_file.value:
-            solara.Info(f"Editing: {Path(selected_file.value).name}")
+            solara.Info(f"Editing: {Path(selected_file.value).name}"
+                        + (" — 2-bottle choice (volumes per bottle, shared weight)"
+                           if two_bottle.value else ""))
             solara.Button("SAVE", color="primary", on_click=save_selected)
             EditSensorGrid()
         else:

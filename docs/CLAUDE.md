@@ -118,6 +118,8 @@ Pipeline (GUI tabs / `analysis_core.run_pipeline`; same steps the notebook had):
 9. Correlation: OLS + RLM (HC3-robust), MAD-based outlier detection
 10. CSV exports for Prism
 
+**2-bottle choice analysis:** toggle *2-bottle choice* on the Run tab (files recorded in the other mode are flagged and skipped; 1- and 2-bottle sessions never share a combined file). `filter_data()` detects each bottle separately (`<animal>/fluid1`, `<animal>/fluid2` in `filtered_*.h5`). Combined layout: `<animal>/<session>/weights` shared, `fluid1/` and `fluid2/` each hold `consumed_vols` + the per-session datasets; root attrs `two_bottle`, `fluid_names`. In `analysis_core` every session row has a `fluid` (1/2; 0 = 1-bottle) and every analysis takes `fluid=`; outlier exclusions are `(session, animal_id, fluid)`. Preference: `preference_table()` (per session: difference, preference ratio T/(T+O), discrimination index (T−O)/(T+O) for volume, licks, bouts; volumes clipped at 0 for ratios), `preference_summary()` (per-animal means; paired t / Wilcoxon / one-sample-vs-0.5 tests with animals as the unit), `preference_timecourse()`. `require_weight=False` (GUI: untick *Require animal weight*) keeps animals with no weight recorded.
+
 **Time fix mechanism:** If start/stop times in raw HDF5 are wrong, create `<raw_filename>_time_fix.xlsx` with columns `[Sensor, New Start Time, New End Time]`. `filter_data()` applies it (it used to accept `time_fix` but silently ignore it).
 
 ### False Positive Analysis (`false_positive_analysis.py` + `FalsePositive.ipynb`)

@@ -99,7 +99,7 @@ def test_load_combined_and_analyses(combined, tmp_path):
 
     corr = core.correlation_analysis(res)
     assert corr['ok'] and len(corr['x']) == 12
-    excl = {(0, "T-1")}
+    excl = {(0, "T-1", 0)}
     clean = core.refit_excluding(res, excl)
     assert clean['n_excluded'] == 1 and clean['x'].size == 11
     m2 = core.pooled_metrics(res, excl)
@@ -202,8 +202,197 @@ def test_gui_tabs_render(combined, cohort):
     for comp in (gui.Page, gui.RunTab, gui.StartStopTab):
         solara.render(comp(), handle_error=False)
     gui.results.set(res)
-    gui.excluded.set(frozenset({(0, "T-1")}))
+    gui.excluded.set(frozenset({(0, "T-1", 0)}))
     for comp in (gui.SummaryTab, gui.TracesTab, gui.CorrelationTab, gui.PerAnimalTab,
                  gui.CleanTab):
         solara.render(comp(res), handle_error=False)
     solara.render(gui.MetricsBlock(res, frozenset(), "", ""), handle_error=False)
+
+
+# ---------------------------------------------------------------------------
+# 2-bottle choice
+# ---------------------------------------------------------------------------
+# The synthetic 2-bottle cohort licks fluid 2 ~3x more than fluid 1 and drains
+# more of it (scripts/make_synthetic_recording.TWO_BOTTLE_FLUIDS).
+NAMES = {1: "Water", 2: "Sucrose"}
+
+
+@pytest.fixture(scope="module")
+def cohort2(tmp_path_factory):
+    base = tmp_path_factory.mktemp("data2")
+    cohort_dir = base / "TB"
+    raws = write_cohort(str(cohort_dir), days=3, hours=HOURS, layout=LAYOUT, seed=5,
+                        two_bottle=True)
+    return str(base), str(cohort_dir), raws
+
+
+@pytest.fixture(scope="module")
+def combined2(cohort2):
+    base, _cohort_dir, raws = cohort2
+    lines = []
+    path = core.run_pipeline(raws, base, recording_length=HOURS * 3600, two_bottle=True,
+                             fluid_names=NAMES, log=lines.append)
+    assert path is not None, "\n".join(lines)
+    return path, raws, lines
+
+
+def test_two_bottle_combined_layout(combined2):
+    path, raws, _ = combined2
+    assert all(core.file_is_two_bottle(r) for r in raws)
+    with h5py.File(path) as f:
+        assert bool(f.attrs['two_bottle'])
+        assert json.loads(f.attrs['fluid_names']) == {"1": "Water", "2": "Sucrose"}
+        g = f["T-1"]["0"]
+        assert 'weights' in g and 'consumed_vols' not in g
+        for fl in ("fluid1", "fluid2"):
+            for key in ('consumed_vols', 'lick_indices', 'lick_times', 'cap_data',
+                        'time_data', 'ILIs', 'bout_lick_counts'):
+                assert key in g[fl], (fl, key)
+        assert 'weights' not in f["Control1"]["0"]
+        # each bottle was detected on its own trace
+        assert g["fluid1"]["lick_indices"].shape[0] < g["fluid2"]["lick_indices"].shape[0]
+
+
+def test_two_bottle_mode_mismatch_is_skipped(cohort, cohort2):
+    base1, _, raws1 = cohort
+    _, _, raws2 = cohort2
+    lines = []
+    # 1-bottle files under a 2-bottle analysis (and vice versa) are skipped.
+    assert core.run_pipeline(raws1[:1], base1, recording_length=HOURS * 3600,
+                             two_bottle=True, log=lines.append) is None
+    assert any("1-bottle mode" in line for line in lines)
+    lines.clear()
+    assert core.run_pipeline(raws2[:1], base1, recording_length=HOURS * 3600,
+                             two_bottle=False, log=lines.append) is None
+    assert any("2-bottle mode" in line for line in lines)
+
+
+def test_two_bottle_analyses_split_by_fluid(combined2, tmp_path):
+    path, _, _ = combined2
+    res = core.load_combined(path)
+    assert res.two_bottle and res.fluids == [1, 2]
+    assert res.fluid_label(2) == "Sucrose"
+    assert res.animal_ids == ["T-1", "T-2", "T-3", "T-4"]
+    assert len(res.sessions) == 30  # 5 cages x 3 days x 2 bottles
+    assert (res.sessions.groupby(['animal_id', 'session'])['weight'].nunique(dropna=False) == 1).all()
+
+    for fl in (1, 2):
+        det = core.detection_summary(res, fluid=fl)
+        assert det['x'].size == 12
+        corr = core.correlation_analysis(res, fluid=fl)
+        assert corr['ok'] and len(corr['x']) == 12 and (corr['data']['fluid'] == fl).all()
+        table, _fits, _sk = core.per_animal_fits(res, fluid=fl)
+        assert len(table) == 4
+        tc = core.timecourse(res, bin_s=60, length_s=res.recording_length, fluid=fl)
+        assert tc['licks'].sum() == res.animals.query("fluid == @fl")['n_licks'].sum()
+        w = core.session_window(res, "T-1", 0, fluid=fl, max_points=500)
+        assert w['n_licks_window'] == res.sessions.query(
+            "animal_id == 'T-1' and session == 0 and fluid == @fl")['n_licks'].item()
+
+    # excluding one bottle of one session only touches that bottle
+    excl = {(0, "T-1", 1)}
+    assert core.refit_excluding(res, excl, fluid=1)['n_excluded'] == 1
+    assert core.refit_excluding(res, excl, fluid=2)['n_excluded'] == 0
+    full = core.pooled_metrics(res, fluid=1)
+    assert len(core.pooled_metrics(res, excl, fluid=1)['ILIs']) < len(full['ILIs'])
+    assert len(core.pooled_metrics(res, excl, fluid=2)['ILIs']) == \
+        len(core.pooled_metrics(res, fluid=2)['ILIs'])
+
+    ctrl = core.control_summary(res)
+    assert sorted(ctrl['fluid'].unique()) == ["Sucrose", "Water"]
+
+    # --- preference ---------------------------------------------------------
+    pt = core.preference_table(res, target=2)
+    assert len(pt) == 12
+    row = pt.iloc[0]
+    t, o = row['licks_f2'], row['licks_f1']
+    assert row['licks_diff'] == t - o
+    assert row['licks_pref'] == pytest.approx(t / (t + o))
+    assert row['licks_di'] == pytest.approx((t - o) / (t + o))
+    assert (pt['vol_pref'] > 0.5).all() and pt['licks_pref'].mean() > 0.5
+    # flipping the target mirrors the ratios
+    pt1 = core.preference_table(res, target=1)
+    np.testing.assert_allclose(pt1['vol_pref'], 1 - pt['vol_pref'])
+    # excluding either bottle drops that whole session from the preference
+    assert len(core.preference_table(res, excl, target=2)) == 11
+
+    summ = core.preference_summary(pt, target=2)
+    assert list(summ['per_animal']['animal_id']) == res.animal_ids
+    vol_t = summ['tests'].query("measure == 'Volume (mL)'")
+    assert (vol_t['n_animals'] == 4).all()
+    assert vol_t['mean_target'].iloc[0] > vol_t['mean_other'].iloc[0]
+    assert vol_t.query("test.str.startswith('paired')", engine='python')['p'].item() < 0.05
+
+    by_s = core.preference_by_session(pt)
+    assert list(by_s['date']) == res.dates
+
+    ptc = core.preference_timecourse(res, bin_s=60, length_s=res.recording_length, target=2)
+    assert ptc['cum_licks'][2].shape == (12, 6)
+    np.testing.assert_allclose(ptc['cum_licks'][1][:, -1] + ptc['cum_licks'][2][:, -1],
+                               pt['licks_total'].to_numpy())
+
+    out = str(tmp_path)
+    written = (core.export_preference(pt, summ, out)
+               + core.export_metrics(full, out, tag=core.fluid_tag(1))
+               + core.export_session_table(res, out))
+    assert all(os.path.exists(p) for p in written)
+    assert os.path.exists(os.path.join(out, "cliqr_ILIs_fluid1.csv"))
+    st = pd.read_csv(os.path.join(out, "cliqr_session_summary.csv"))
+    assert set(st['fluid_name']) == {"Water", "Sucrose"}
+
+
+def test_preference_ratio_clips_negative_volumes():
+    # A bottle that reads fuller afterwards counts as 0 consumed, not negative.
+    np.testing.assert_allclose(core._ratio([0.4, -0.1, 0.0], [-0.1, 0.4, 0.0]),
+                               [1.0, 0.0, np.nan])
+
+
+def test_two_bottle_missing_weight_policy(cohort2, tmp_path):
+    _, cohort_dir, raws = cohort2
+    raw = str(tmp_path / os.path.basename(raws[0]))
+    import shutil
+    shutil.copy(raws[0], raw)
+    with h5py.File(raw, "r+") as f:
+        del f[SENSOR_BOARD_MAP[1]]["sensor_1"]["weight"]
+    layout = core.load_layout(cohort_dir)
+    try:
+        assert core.process_raw_file(raw, layout, recording_length=HOURS * 3600,
+                                     log=lambda *_: None) is False
+        with h5py.File(core.filtered_path_for(raw)) as f:
+            assert "T-1/fluid1" not in f and "T-1/fluid2" not in f  # weight required by default
+        core.process_raw_file(raw, layout, recording_length=HOURS * 3600,
+                              require_weight=False, log=lambda *_: None)
+        with h5py.File(core.filtered_path_for(raw)) as f:
+            assert np.isnan(f["T-1/fluid1/weight"][()])
+            assert "lick_times" in f["T-1/fluid2"]
+    finally:
+        os.remove(core.filtered_path_for(raw))
+
+
+def test_raw_sensor_overview_two_bottle(cohort2):
+    _, _, raws = cohort2
+    ov1 = core.raw_sensor_overview(raws[0], 1, max_points=1000)
+    ov2 = core.raw_sensor_overview(raws[0], 1, max_points=1000, fluid=2)
+    assert ov1['two_bottle'] and ov1['fluid'] == 1 and ov2['fluid'] == 2
+    assert len(ov1['cycles']) == 1 and ov1['cycles'] == ov2['cycles']
+
+
+def test_gui_tabs_render_two_bottle(combined2, cohort2):
+    solara = pytest.importorskip("solara")
+    import analysis_gui as gui
+
+    path, _, _ = combined2
+    base, _, _ = cohort2
+    res = core.load_combined(path)
+    gui.base_dir.set(base)
+    gui.selected_cohorts.set(["TB"])
+    gui.two_bottle.set(True)
+    for comp in (gui.Page, gui.RunTab, gui.StartStopTab):
+        solara.render(comp(), handle_error=False)
+    gui.results.set(res)
+    gui.excluded.set(frozenset({(0, "T-1", 2)}))
+    for comp in (gui.SummaryTab, gui.TracesTab, gui.CorrelationTab, gui.PerAnimalTab,
+                 gui.CleanTab):
+        solara.render(comp(res), handle_error=False)
+    solara.render(gui.MetricsBlock(res, frozenset(), "", ""), handle_error=False)
+    gui.two_bottle.set(False)
