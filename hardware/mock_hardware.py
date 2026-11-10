@@ -9,7 +9,7 @@ import time
 import numpy as np
 from collections import deque
 from typing import Dict, List, Tuple
-from utils.state import SERIAL_NUMBER_SENSOR_MAP, NUM_CHANNELS, ACTIVE_CHANNELS
+from utils.state import SERIAL_NUMBER_SENSOR_MAP, active_channels
 
 
 class MockFT232HManager:
@@ -182,21 +182,23 @@ class MockMPR121Manager:
             raise ValueError(f"No controller found for {serial_number}")
 
         port = self.controllers[serial_number]["port"]
-        local_time_data = deque(maxlen=NUM_CHANNELS)
-        local_cap_data = deque(maxlen=NUM_CHANNELS)
+        channels = active_channels()
+        local_time_data = deque(maxlen=len(channels))
+        local_cap_data = deque(maxlen=len(channels))
 
         # Read simulated data
         raw_buffer = port.read_from(0x04, 24)
 
         # Extract only the wired channels (same as real implementation)
-        for chan in ACTIVE_CHANNELS:
+        for chan in channels:
             value = raw_buffer[2 * chan] | (raw_buffer[2 * chan + 1] << 8)
             local_cap_data.append(value)
             local_time_data.append(time.time())
 
         return local_time_data, local_cap_data, serial_number
 
-    def get_last_reading(self, sensor_id: int, num_samples: int = 250) -> Tuple:
+    def get_last_reading(self, sensor_id: int, num_samples: int = 250,
+                         fluid=None) -> Tuple:
         """
         Simulate getting last N samples.
 

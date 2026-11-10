@@ -13,10 +13,32 @@ from typing import Dict
 import h5py
 
 from hardware.mpr121 import MPR121Manager
-from utils.state import HISTORY_SIZE, NUM_CHANNELS, MAX_SAMPLE_HZ, MEASUREMENT_PERSIST_SECONDS
+from utils.state import (HISTORY_SIZE, MAX_SAMPLE_HZ, MEASUREMENT_PERSIST_SECONDS,
+                         channel_keys, channel_group_path)
 
 
-def measurement_warnings(sensor_states):
+def measurement_fields(s, two_bottle, suffix=""):
+    """Map HDF5 dataset path (relative to the sensor group) -> measured value.
+
+    In 2-bottle mode the volumes live in the fluid1/fluid2 subgroups beside each
+    fluid's cap_data; the shared weight stays at the sensor level.
+    """
+    if two_bottle:
+        return {
+            f"fluid1/start_vol{suffix}": s.start_volume,
+            f"fluid1/stop_vol{suffix}": s.stop_volume,
+            f"fluid2/start_vol{suffix}": s.start_volume2,
+            f"fluid2/stop_vol{suffix}": s.stop_volume2,
+            f"weight{suffix}": s.weight,
+        }
+    return {
+        f"start_vol{suffix}": s.start_volume,
+        f"stop_vol{suffix}": s.stop_volume,
+        f"weight{suffix}": s.weight,
+    }
+
+
+def measurement_warnings(sensor_states, two_bottle=False):
     """Return one warning string per started sensor missing any measurement.
 
     A sensor is "started" if it is recording or has a start_time. A field is
@@ -27,11 +49,9 @@ def measurement_warnings(sensor_states):
     for sid, s in sensor_states.items():
         if not (s.is_recording or s.start_time > 0):
             continue
-        missing = [name for name, value in (
-            ("start_vol", s.start_volume),
-            ("stop_vol", s.stop_volume),
-            ("weight", s.weight),
-        ) if value is None or value <= 0]
+        missing = [name.replace("/", " ") for name, value
+                   in measurement_fields(s, two_bottle).items()
+                   if value is None or value <= 0]
         if missing:
             warnings.append(f"Sensor {sid}: no {', '.join(missing)} recorded")
     return warnings
@@ -41,7 +61,8 @@ class SensorRecorder:
     """Manages asynchronous sensor data recording."""
 
     def __init__(self, mpr121_manager: MPR121Manager, filename: str,
-                 controllers: Dict, measurements_provider=None):
+                 controllers: Dict, measurements_provider=None,
+                 two_bottle: bool = False):
         """
         Initialize the sensor recorder.
 
@@ -52,10 +73,14 @@ class SensorRecorder:
             measurements_provider: Optional callable returning
                 {sensor_id: SensorState}, read from the context-immune session
                 global, used for periodic measurement persistence.
+            two_bottle: 2-bottle choice mode. Each sensor then records two
+                channels (fluid 1, fluid 2) into sensor_<id>/fluid1 and
+                sensor_<id>/fluid2. Must match the channels the manager reads.
         """
         self.mpr121_manager = mpr121_manager
         self.filename = filename
         self.controllers = controllers
+        self.two_bottle = two_bottle
         self.recording = False
         self.loop_counter = 0
         # Count of read failures that survived retries, for rate-limited logging.
@@ -79,19 +104,20 @@ class SensorRecorder:
         # to avoid "unable to lock file" errors and lost writes.
         self._h5_lock = threading.Lock()
 
-        # Initialize data buffers for each board and sensor
+        # Initialize data buffers for each board channel. Keys are sensor IDs,
+        # or (sensor_id, fluid) in 2-bottle mode (see utils.state.channel_keys),
+        # in the same order as the channels a board read returns.
         self.board_time_data = {}
         self.board_cap_data = {}
 
         for sn in controllers.keys():
-            from utils.state import SERIAL_NUMBER_SENSOR_MAP
-            sensors = SERIAL_NUMBER_SENSOR_MAP.get(sn, [])
+            keys = self._channel_keys(sn)
 
             self.board_time_data[sn] = {
-                sensor: deque(maxlen=HISTORY_SIZE) for sensor in sensors
+                key: deque(maxlen=HISTORY_SIZE) for key in keys
             }
             self.board_cap_data[sn] = {
-                sensor: deque(maxlen=HISTORY_SIZE) for sensor in sensors
+                key: deque(maxlen=HISTORY_SIZE) for key in keys
             }
 
         # Per-sensor counters that drive HDF5 writes independently of the plot
@@ -105,17 +131,21 @@ class SensorRecorder:
             self.board_produced[sn] = {s: 0 for s in self.board_cap_data[sn]}
             self.board_written[sn] = {s: 0 for s in self.board_cap_data[sn]}
 
+    def _channel_keys(self, sn):
+        """Buffer keys for board sn, in the order its read returns channels."""
+        from utils.state import SERIAL_NUMBER_SENSOR_MAP
+        return channel_keys(SERIAL_NUMBER_SENSOR_MAP.get(sn, []), self.two_bottle)
+
     def initialize_hdf5_file(self):
         """Create the HDF5 file and initialize the group structure."""
         with self._h5_lock, h5py.File(self.filename, "w") as h5f:
-            # Create groups for each board and sensor
+            h5f.attrs["two_bottle"] = self.two_bottle
+            # Create groups for each board channel (require_group creates the
+            # parent sensor group of a 2-bottle fluid subgroup on the way).
             for sn in self.controllers.keys():
-                from utils.state import SERIAL_NUMBER_SENSOR_MAP
-                sensors = SERIAL_NUMBER_SENSOR_MAP.get(sn, [])
-
                 board_group = h5f.create_group(f"board_{sn}")
-                for sensor in sensors:
-                    board_group.create_group(f"sensor_{sensor}")
+                for key in self._channel_keys(sn):
+                    board_group.require_group(channel_group_path(key))
 
     async def record_sensors(self, log_callback=None):
         """
@@ -184,13 +214,10 @@ class SensorRecorder:
 
                     # Append data to buffers
                     for local_time, local_cap, serial_number in results:
-                        from utils.state import SERIAL_NUMBER_SENSOR_MAP
-                        sensors = SERIAL_NUMBER_SENSOR_MAP.get(serial_number, [])
-
-                        for idx, sensor in enumerate(sensors):
-                            self.board_time_data[serial_number][sensor].append(local_time[idx])
-                            self.board_cap_data[serial_number][sensor].append(local_cap[idx])
-                            self.board_produced[serial_number][sensor] += 1
+                        for idx, key in enumerate(self.board_cap_data[serial_number]):
+                            self.board_time_data[serial_number][key].append(local_time[idx])
+                            self.board_cap_data[serial_number][key].append(local_cap[idx])
+                            self.board_produced[serial_number][key] += 1
 
                     # Write to HDF5 file every HISTORY_SIZE loops
                     if self.loop_counter == HISTORY_SIZE:
@@ -227,11 +254,8 @@ class SensorRecorder:
         """
         with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             for sn in self.controllers.keys():
-                from utils.state import SERIAL_NUMBER_SENSOR_MAP
-                sensors = SERIAL_NUMBER_SENSOR_MAP.get(sn, [])
-
-                for sensor in sensors:
-                    group = h5f[f"board_{sn}"][f"sensor_{sensor}"]
+                for sensor in self.board_cap_data[sn]:
+                    group = h5f[f"board_{sn}"][channel_group_path(sensor)]
 
                     produced = self.board_produced[sn][sensor]
                     n = produced - self.board_written[sn][sensor]
@@ -260,16 +284,13 @@ class SensorRecorder:
         """
         with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
             for sn in self.controllers.keys():
-                from utils.state import SERIAL_NUMBER_SENSOR_MAP
-                sensors = SERIAL_NUMBER_SENSOR_MAP.get(sn, [])
-
-                for sensor in sensors:
+                for sensor in self.board_cap_data[sn]:
                     produced = self.board_produced[sn][sensor]
                     n = produced - self.board_written[sn][sensor]
                     if n <= 0:
                         continue
 
-                    group = h5f[f"board_{sn}"][f"sensor_{sensor}"]
+                    group = h5f[f"board_{sn}"][channel_group_path(sensor)]
                     time_tail = list(self.board_time_data[sn][sensor])[-n:]
                     cap_tail = list(self.board_cap_data[sn][sensor])[-n:]
 
@@ -286,7 +307,8 @@ class SensorRecorder:
         self.recording = False
 
     def write_sensor_metadata(self, sensor_id: int, start_time=None, stop_time=None,
-                              start_vol=None, stop_vol=None, weight=None, cycle=0):
+                              start_vol=None, stop_vol=None, weight=None, cycle=0,
+                              start_vol2=None, stop_vol2=None):
         """
         Write metadata for a specific sensor to the HDF5 file.
 
@@ -298,6 +320,11 @@ class SensorRecorder:
             stop_vol: Stopping volume (mL)
             weight: Animal weight (g)
             cycle: Recording cycle number (0 for first, 1 for second, etc.)
+            start_vol2: Fluid 2 starting volume (mL), 2-bottle mode only
+            stop_vol2: Fluid 2 stopping volume (mL), 2-bottle mode only
+
+        In 2-bottle mode start_vol/stop_vol are fluid 1 and land, with the fluid
+        2 volumes, in the fluid subgroups; times and weight stay sensor-level.
         """
         # Find which board this sensor is on
         sn = self._serial_for_sensor(sensor_id)
@@ -315,9 +342,11 @@ class SensorRecorder:
             # Determine dataset names based on cycle number
             start_name = "start_time" if cycle == 0 else f"start_time{cycle}"
             stop_name = "stop_time" if cycle == 0 else f"stop_time{cycle}"
-            start_vol_name = "start_vol" if cycle == 0 else f"start_vol{cycle}"
-            stop_vol_name = "stop_vol" if cycle == 0 else f"stop_vol{cycle}"
-            weight_name = "weight" if cycle == 0 else f"weight{cycle}"
+            suffix = "" if cycle == 0 else str(cycle)
+            fluid1 = "fluid1/" if self.two_bottle else ""
+            start_vol_name = f"{fluid1}start_vol{suffix}"
+            stop_vol_name = f"{fluid1}stop_vol{suffix}"
+            weight_name = f"weight{suffix}"
 
             # Write metadata (only if provided and not already exists)
             if start_time is not None and start_name not in group:
@@ -338,6 +367,13 @@ class SensorRecorder:
                 if weight_name in group:
                     del group[weight_name]
                 group.create_dataset(weight_name, data=weight)
+            if self.two_bottle:
+                for name, value in ((f"fluid2/start_vol{suffix}", start_vol2),
+                                    (f"fluid2/stop_vol{suffix}", stop_vol2)):
+                    if value is not None and value > 0:
+                        if name in group:
+                            del group[name]
+                        group.create_dataset(name, data=value)
 
     def _flush_measurements(self):
         """Persist changed, >0 volume/weight values for started sensors.
@@ -365,11 +401,7 @@ class SensorRecorder:
 
                     cycle = s.recording_cycle
                     suffix = "" if cycle == 0 else str(cycle)
-                    fields = {
-                        f"start_vol{suffix}": s.start_volume,
-                        f"stop_vol{suffix}": s.stop_volume,
-                        f"weight{suffix}": s.weight,
-                    }
+                    fields = measurement_fields(s, self.two_bottle, suffix)
                     grp = h5f[f"board_{sn}/sensor_{sensor_id}"]
                     cache = self._persisted.setdefault(sensor_id, {})
                     for name, value in fields.items():
@@ -462,13 +494,14 @@ class SensorRecorder:
                 del h5f["comments"]
             h5f.create_dataset("comments", data=comments)
 
-    def get_recent_samples(self, sensor_id: int, num_samples: int = 250):
+    def get_recent_samples(self, sensor_id: int, num_samples: int = 250, fluid=None):
         """
         Get recent capacitance samples for a specific sensor.
 
         Args:
             sensor_id: Sensor ID (1-24)
             num_samples: Number of recent samples to retrieve
+            fluid: 1 or 2 for one bottle of a 2-bottle sensor; None otherwise
 
         Returns:
             Tuple of (cap_data, time_data) lists, or (None, None) if no data available
@@ -482,12 +515,13 @@ class SensorRecorder:
         sn = self._serial_for_sensor(sensor_id)
 
         # Check if this sensor has data in the buffer
-        if sn not in self.board_cap_data or sensor_id not in self.board_cap_data[sn]:
+        key = (sensor_id, fluid) if fluid is not None else sensor_id
+        if sn not in self.board_cap_data or key not in self.board_cap_data[sn]:
             return None, None
 
         # Get data from the live buffer
-        cap_buffer = self.board_cap_data[sn][sensor_id]
-        time_buffer = self.board_time_data[sn][sensor_id]
+        cap_buffer = self.board_cap_data[sn][key]
+        time_buffer = self.board_time_data[sn][key]
 
         if len(cap_buffer) == 0:
             return None, None

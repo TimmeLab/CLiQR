@@ -16,8 +16,7 @@ def TestPlotDialog():
 
     plot_data = state.test_plot_data.value
     sensor_id = plot_data['sensor_id']
-    cap_data = plot_data['cap_data']
-    time_data = plot_data['time_data']
+    traces = plot_data['traces']
 
     # Get sensor's animal ID if available
     sensor = state.sensor_states.value.get(sensor_id)
@@ -60,17 +59,24 @@ def TestPlotDialog():
         # Create matplotlib plot
         fig, ax = plt.subplots(figsize=(8, 4))
 
-        # Convert time_data to relative seconds if they're timestamps
-        if len(time_data) > 0:
-            time_rel = [t - time_data[0] for t in time_data]
-            ax.plot(time_rel, cap_data, linewidth=1.5, color='#2196F3')
-            ax.set_xlabel('Time (seconds)', fontsize=12)
-        else:
-            ax.plot(cap_data, linewidth=1.5, color='#2196F3')
-            ax.set_xlabel('Sample', fontsize=12)
+        # One trace per sipper (two in 2-bottle mode, labelled Fluid 1/2)
+        colors = ['#2196F3', '#FF9800']
+        for trace, color in zip(traces, colors):
+            cap_data = trace['cap_data']
+            time_data = trace['time_data']
+            # Convert time_data to relative seconds if they're timestamps
+            if len(time_data) > 0:
+                time_rel = [t - time_data[0] for t in time_data]
+                ax.plot(time_rel, cap_data, linewidth=1.5, color=color, label=trace['label'])
+                ax.set_xlabel('Time (seconds)', fontsize=12)
+            else:
+                ax.plot(cap_data, linewidth=1.5, color=color, label=trace['label'])
+                ax.set_xlabel('Sample', fontsize=12)
+        if traces[0]['label'] is not None:
+            ax.legend()
 
         ax.set_ylabel('Capacitance (picofarads)', fontsize=12)
-        ax.set_title(f'Sensor {sensor_id}{animal_text} - Last {len(cap_data)} Samples', fontsize=14)
+        ax.set_title(f'Sensor {sensor_id}{animal_text} - Last {len(traces[0]["cap_data"])} Samples', fontsize=14)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
 

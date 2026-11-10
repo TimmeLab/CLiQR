@@ -62,6 +62,10 @@ class SensorState:
     start_volume: float = 0.0
     stop_volume: float = 0.0
     weight: float = 0.0
+    # Fluid 2 volumes, used only in 2-bottle choice mode (start_volume /
+    # stop_volume then hold fluid 1). Weight is shared by both bottles.
+    start_volume2: float = 0.0
+    stop_volume2: float = 0.0
     status: str = "idle"  # idle, recording, error
     error_message: str = ""
     animal_id: str = ""
@@ -85,6 +89,16 @@ comments = solara.reactive("")
 
 
 # ============================================================================
+# 2-bottle choice
+# ============================================================================
+
+two_bottle = solara.reactive(False)
+"""2-bottle choice mode: each sensor card records two sipper channels (fluid 1
+and fluid 2) that share one start/stop and one weight but have separate
+volumes. Fixed for the whole session (the toggle is locked while recording)."""
+
+
+# ============================================================================
 # Authoritative session state (context-immune)
 # ============================================================================
 #
@@ -98,6 +112,7 @@ session = {
     "recording_all": False,
     "filename": "",
     "comments": "",
+    "two_bottle": False,
     "sensor_states": {i: SensorState(sensor_id=i) for i in range(1, 25)},
     # Hardware — live handles stay open in the server process across a browser
     # refresh; these hold the same references so a fresh context can be
@@ -119,6 +134,7 @@ _REACTIVE_FOR = {
     "recording_all": recording_all,
     "filename": filename,
     "comments": comments,
+    "two_bottle": two_bottle,
     "sensor_states": sensor_states,
     # Hardware (these reactives are defined above, near the top of the module).
     "boards_connected": boards_connected,
@@ -194,6 +210,11 @@ show_test_dialog = solara.reactive(False)
 #   "8board" - new DID rack: 8 FT232H boards (shorter cable runs, tidier),
 #              3 sensors per MPR121 wired on channels [1, 6, 11].
 #
+# In 2-bottle choice mode each sensor (cage) owns a PAIR of adjacent channels,
+# (fluid 1, fluid 2): (0, 1), (2, 3), ... (10, 11) on the 4-board rack and
+# (0, 1), (5, 6), (10, 11) on the 8-board rack. "channels_two_bottle" lists the
+# pairs flattened in sensor order, fluid 1 first.
+#
 # Select with the RACK_DESIGN constant below, or override at launch with the
 # CLIQR_RACK environment variable (e.g. CLIQR_RACK=8board).
 import os
@@ -209,6 +230,7 @@ _RACK_CONFIGS = {
             "FT232H3": [16, 17, 18, 22, 23, 24],
         },
         "channels": [1, 3, 5, 7, 9, 11],
+        "channels_two_bottle": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     },
     "8board": {
         "map": {
@@ -222,6 +244,7 @@ _RACK_CONFIGS = {
             "FT232H7": [22, 23, 24],
         },
         "channels": [1, 6, 11],
+        "channels_two_bottle": [0, 1, 5, 6, 10, 11],
     },
 }
 
@@ -280,7 +303,41 @@ READ_RETRY_DELAY = 0.001  # seconds between read retries
 # The wired MPR121 channels for this rack. read_sensor_data reads these in
 # order and maps them to the board's sensor IDs (see SERIAL_NUMBER_SENSOR_MAP).
 ACTIVE_CHANNELS = _RACK_CONFIGS[RACK_DESIGN]["channels"]
-NUM_CHANNELS = len(ACTIVE_CHANNELS)  # Channels recorded per MPR121
+NUM_CHANNELS = len(ACTIVE_CHANNELS)  # Channels recorded per MPR121 (1 bottle)
+ACTIVE_CHANNELS_TWO_BOTTLE = _RACK_CONFIGS[RACK_DESIGN]["channels_two_bottle"]
+
+# Fluids per sensor in 2-bottle mode. HDF5 subgroup names are fluid1, fluid2.
+FLUIDS = (1, 2)
+
+
+def active_channels():
+    """MPR121 channels to read for the current mode, in board sensor order.
+
+    Reads the context-immune session dict (not the reactive) because it is
+    called from the recorder's worker threads.
+    """
+    if session["two_bottle"]:
+        return ACTIVE_CHANNELS_TWO_BOTTLE
+    return ACTIVE_CHANNELS
+
+
+def channel_keys(sensors, two_bottle):
+    """Recorder buffer keys for a board's sensors, in channel read order.
+
+    One-bottle: the sensor ID. 2-bottle: (sensor_id, fluid) for each fluid, so
+    keys line up one-to-one with active_channels().
+    """
+    if two_bottle:
+        return [(sensor, fluid) for sensor in sensors for fluid in FLUIDS]
+    return list(sensors)
+
+
+def channel_group_path(key):
+    """HDF5 group path (relative to the board group) for a recorder key."""
+    if isinstance(key, tuple):
+        sensor, fluid = key
+        return f"sensor_{sensor}/fluid{fluid}"
+    return f"sensor_{key}"
 
 
 # ============================================================================
