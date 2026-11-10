@@ -66,7 +66,11 @@ Solara web app at `localhost:8765`. Modular structure:
 | `hardware/ft232h.py` | FT232H USB scan, I2C controller init, auto-detect MPR121 address |
 | `hardware/mpr121.py` | MPR121 soft reset, config, channel reads |
 | `hardware/mock_hardware.py` | Simulated hardware for testing |
-| `recording/recorder.py` | Sampler + writer threads (off the UI event loop), ThreadPoolExecutor reads, batched HDF5 writes; `stop()` flushes every sample |
+| `hardware/hw_process.py` | Hardware process (spawned): owns ALL USB I/O — board scan, MPR121 config, sampling — with its own GIL so Solara re-renders can't stall reads |
+| `hardware/hw_client.py` | GUI-side `HardwareClient` (module global in `components/hardware_status.py`, survives browser refresh) + `ProcessSource` |
+| `hardware/sampling.py` | `run_sampling_loop`: 150 Hz pacing, parallel board reads, per-board skip on read failure |
+| `hardware/backends.py` / `fake_backends.py` | Real/mock boards for the hardware process; fake boards for tests and `scripts/measure_sample_gaps.py` |
+| `recording/recorder.py` | Consumes a sample source; ring buffers for TEST, writer thread with batched HDF5 writes; `stop()` flushes every sample |
 | `components/hardware_status.py` | Board init UI |
 | `components/session_controls.py` | Start/stop session, layout file upload (CSV or XLSX), output dir |
 | `components/sensor_card.py` | 24 per-sensor cards |
@@ -186,6 +190,7 @@ MPR121 reads every other channel: 1, 3, 5, 7, 9, 11 (6 sensors per board). The 8
 ## Important Notes
 
 - **Recording:** Initialize hardware before starting sessions. Volume/weight inputs disabled once sensor is recording.
+- **Hardware process:** never touch USB from the GUI process. Each Solara re-render holds the GIL, and a pyftdi read (~20 GIL-releasing USB transfers) stalled ~125 ms per UI action on the rig when sampling shared the GUI's process. Modules imported by the hardware process (`hardware/sampling.py`, `backends.py`, `utils/hw_constants.py`) must not import Solara/pandas/`utils.state`.
 - **Layout files:** CSV or XLSX. Format: sensor number in index, animal ID in first column. Template at `layouts/default_layout.csv`.
 - **Timestamps:** `time.time()` (Unix epoch) throughout. `time_data` in raw HDF5 is absolute Unix seconds.
 - **False positive data:** CVAT annotations, picamera MP4/TXT files, and raw/filtered HDF5s all live under `Lickometry Data/ACG-26-3/` currently (ACG-26-3 is the current cohort of animals in the lab). Pipeline driven by `session_manifest.csv` in that directory.
