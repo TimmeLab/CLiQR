@@ -43,105 +43,152 @@ def is_control(animal_id):
     return bool(_CONTROL_RE.match(str(animal_id)))
 
 
-def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold', recording_length=2*60*60):
+_START_TIME_RE = re.compile(r'^start_time(\d+)?$')
+
+
+def _last_cycle_start_stop(sensor_group, time_data):
+    """Return (start_time, stop_time, had_start) for the LAST recording cycle.
+
+    A sensor may have been started and stopped several times in one session.
+    Each cycle writes a start_time key: the first is plain "start_time", later
+    ones are "start_time1", "start_time2", ... We want the LAST cycle, so
+    collect every start_time key and index it by its cycle number (the
+    unnumbered first cycle is treated as cycle -1 so it sorts before the
+    numbered ones).
+    """
+    cycle_number_to_key = {}
+    for k in sensor_group.keys():
+        m = _START_TIME_RE.match(k)
+        if m:
+            cycle_number = int(m.group(1)) if m.group(1) else -1
+            cycle_number_to_key[cycle_number] = k
+    if not cycle_number_to_key:
+        return time_data[0], time_data[-1], False
+    # The most recent cycle is the one with the largest cycle number.
+    last_start = cycle_number_to_key[max(cycle_number_to_key)]
+    start_time = sensor_group[last_start][()]
+    # Try the stop_time corresponding to the start_time above
+    stop_key = 'stop' + last_start[5:]
+    if stop_key in sensor_group:
+        stop_time = sensor_group[stop_key][()]
+    else:
+        # Stop time wasn't recorded (likely clicked stop all button too soon)
+        stop_time = time_data[-1]
+    return start_time, stop_time, True
+
+
+def load_trimmed_sensor(sensor_group, label, recording_length, start_stop_override=None):
+    """Read ONE sensor's group from a raw HDF5 file and trim it for analysis.
+
+    The trace is cut to the last start/stop cycle, rebased so time starts at 0,
+    and then cut (from the end) to `recording_length` seconds. Only the samples
+    that survive the trim are read from disk for cap_data, so peak memory is a
+    single sensor's time axis plus its trimmed trace -- not the whole file.
+    (A 24 h, 24-sensor recording is several GB; loading it all at once is what
+    made long runs crawl.)
+
+    Returns a plain dict with the same keys filter_data has always produced:
+    every dataset in the sensor group (scalars read eagerly), plus cap_data,
+    time_data, fs, consumed_vol (when volumes exist), used_start_idx and
+    used_stop_idx.
+
+    `start_stop_override`, if given, is a (start_time, stop_time) pair in Unix
+    seconds (from a *_time_fix.xlsx file) that replaces the recorded times.
+    """
+    time_data = sensor_group['time_data'][()]
+    if start_stop_override is not None:
+        start_time, stop_time = start_stop_override
+        had_start = True
+        print(f"Applying time fix for {label}: start={start_time}, stop={stop_time}")
+    else:
+        start_time, stop_time, had_start = _last_cycle_start_stop(sensor_group, time_data)
+    if not had_start:
+        print(f"Warning: no start/stop times recorded for {label}, create a time fix file or we will default to the entire trace.")
+    start_idx = int(np.argmin(np.abs(time_data - start_time)))
+    stop_idx = int(np.argmin(np.abs(time_data - stop_time)))
+
+    sensor_data = {}
+    for k, v in sensor_group.items():
+        if k in ('time_data', 'cap_data') or not isinstance(v, h5py.Dataset):
+            continue
+        sensor_data[k] = v[()]
+
+    t = time_data[start_idx:stop_idx+1] - time_data[start_idx]
+    del time_data
+    end = stop_idx + 1
+    fs = (stop_idx - start_idx) / (t[-1] - t[0])
+
+    # Check if we still have at least recording_length
+    remaining_time = t[-1] - t[0]
+    if remaining_time < recording_length:
+        print(f"Warning: {label} was left with only {remaining_time} seconds of recording after trimming to recorded start/stop times. Consider a time fix file.")
+    else:
+        # Now we trim any excess to the desired recording length (from the end)
+        revised_stop_idx = int(np.argmin(np.abs(t - recording_length)))
+        t = t[:revised_stop_idx]
+        end = start_idx + revised_stop_idx
+
+    sensor_data['time_data'] = t
+    sensor_data['cap_data'] = sensor_group['cap_data'][start_idx:end]
+    sensor_data['fs'] = fs
+
+    if 'stop_vol' in sensor_data:
+        sensor_data['consumed_vol'] = sensor_data['start_vol'] - sensor_data['stop_vol']
+
+    # Record which start/stop indices we actually used in the analysis
+    sensor_data['used_start_idx'] = start_idx
+    sensor_data['used_stop_idx'] = stop_idx
+    return sensor_data
+
+
+def parse_time_fix(time_fix):
+    """Turn a time-fix DataFrame into {sensor_number: (start_time, stop_time)}.
+
+    Columns are taken by position (Sensor, New Start Time, New End Time) so
+    small header spelling differences in hand-made spreadsheets don't matter.
+    Rows with a missing value are ignored.
+    """
+    if time_fix is None or len(time_fix) == 0:
+        return {}
+    if time_fix.shape[1] < 3:
+        raise ValueError("time fix file needs 3 columns: Sensor, New Start Time, New End Time")
+    overrides = {}
+    for sensor, start, stop in time_fix.iloc[:, :3].itertuples(index=False):
+        if any(v is None or (isinstance(v, float) and np.isnan(v)) for v in (sensor, start, stop)):
+            continue
+        overrides[int(sensor)] = (float(start), float(stop))
+    return overrides
+
+
+def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold', recording_length=2*60*60, progress=None):
     """This organizes the data by animal and handles some common issues relating to
     recording start/stop times, volumes, and weights. Current algorithm choices:
         - basic_threshold
-        - hilbert (Hilbert envelope threshold)"""
-    data_dict = {}
-    # We only expect up to 3 nested levels based on the DataRecording notebook
-    for k,v in raw_h5f.items():
-        data_dict[k] = {} if isinstance(v, h5py._hl.group.Group) else v
-        if not isinstance(data_dict[k], dict): continue
-        for k2,v2 in v.items():
-            data_dict[k][k2] = (
-                {} if isinstance(v2, h5py._hl.group.Group) else v2[()]
-            )
-            if not isinstance(data_dict[k][k2], dict): continue
-            for k3,v3 in v2.items():
-                data_dict[k][k2][k3] = v3[()]
-    # Loop through all boards and sensors and truncate at start_time and
-    # stop_time, then subtract the first time point from the data
-    for board_id, board_data in data_dict.items():
-        if board_id == 'comments': continue
-        for sensor_id, sensor_data in board_data.items():
-            # Initialize with the start and stop indices indicating the entire time series
-            start_idx = 0
-            stop_idx = -1
-            # A sensor may have been started and stopped several times in one
-            # session. Each cycle writes a start_time key: the first is plain
-            # "start_time", later ones are "start_time1", "start_time2", ...
-            # We want the LAST cycle, so collect every start_time key and index
-            # it by its cycle number (the unnumbered first cycle is treated as
-            # cycle -1 so it sorts before the numbered ones).
-            pattern = re.compile(r'^start_time(\d+)?$')
-            cycle_number_to_key = {}
-            for k in sensor_data.keys():
-                m = pattern.match(k)
-                if m:
-                    cycle_number = int(m.group(1)) if m.group(1) else -1
-                    cycle_number_to_key[cycle_number] = k
-            if cycle_number_to_key:
-                # The most recent cycle is the one with the largest cycle number.
-                last_cycle_number = max(cycle_number_to_key)
-                last_start = cycle_number_to_key[last_cycle_number]
-                start_time = sensor_data[last_start][()]
-                # Try the stop_time corresponding to the start_time above
-                try:
-                    stop_time = sensor_data['stop' + last_start[5:]][()]
-                except KeyError:
-                    # Stop time wasn't recorded (likely clicked stop all button too soon)
-                    stop_time = sensor_data['time_data'][-1]
-            else: # no start time recorded
-                print(f"Warning: no start/stop times recorded for {board_id} {sensor_id}, create a time fix file or we will default to the entire trace.")
-                start_time = sensor_data['time_data'][0] # start at beginning
-                stop_time = sensor_data['time_data'][-1] # stop at end
-            total_recording_time = stop_time - start_time
-            start_idx = np.argmin(
-                np.abs(sensor_data['time_data'] - start_time)
-            )
-            stop_idx = np.argmin(
-                np.abs(sensor_data['time_data'] - stop_time)
-            )
+        - hilbert (Hilbert envelope threshold)
+        - ml
 
-            sensor_data['time_data'] = (
-                sensor_data['time_data'][start_idx:stop_idx+1] -
-                    sensor_data['time_data'][start_idx]
-			)
-            sensor_data['cap_data'] = (
-                sensor_data['cap_data'][start_idx:stop_idx+1]
-			)
-            sensor_data['fs'] = (
-				(stop_idx - start_idx) /
-					(sensor_data['time_data'][-1] - sensor_data['time_data'][0])
-			)
+    Sensors are processed ONE AT A TIME (load -> trim -> detect -> save -> free)
+    so memory stays bounded for long (e.g. 24 h) recordings. Only sensors listed
+    in `sensor_animal_map` are read from disk.
 
-            # Check if we still have at least recording_length
-            remaining_time = sensor_data['time_data'][-1] - sensor_data['time_data'][0]
-            if remaining_time < recording_length:
-                print(f"Warning: {board_id} {sensor_id} was left with only {remaining_time} seconds of recording after trimming to recorded start/stop times. Consider a time fix file.")
-            else:
-                # Now we trim any excess to the desired recording length (from the end)
-                revised_stop_idx = np.argmin(
-                    np.abs(sensor_data['time_data'] - recording_length)
-                )
-                sensor_data['time_data'] = sensor_data['time_data'][:revised_stop_idx]
-                sensor_data['cap_data'] = sensor_data['cap_data'][:revised_stop_idx]
+    `progress`, if given, is called as progress(done, total, animal_id) after
+    each animal finishes (used by the analysis GUI for a progress bar).
 
-			
-            if 'stop_vol' in sensor_data.keys():
-                sensor_data['consumed_vol'] = (
-					sensor_data['start_vol'] - sensor_data['stop_vol']
-				)
+    `time_fix` is an optional DataFrame read from `<raw>_time_fix.xlsx` with
+    columns [Sensor, New Start Time, New End Time] (Unix epoch seconds). Listed
+    sensors use those times instead of the recorded start/stop times.
+    """
+    algorithms = {
+        'basic_threshold': basic_algorithm,
+        'hilbert': hilbert_algorithm,
+        'ml': ml_algorithm,
+    }
+    if algorithm not in algorithms:
+        raise ValueError(f"Unknown algorithm {algorithm!r}; expected one of {sorted(algorithms)}")
 
-            # Add in datasets to indicate which start/stop indices we actually used in the analysis
-            sensor_data['used_start_idx'] = start_idx
-            sensor_data['used_stop_idx'] = stop_idx
-
-
-    # Reorganize the data to be by animal ID, agnostic wrt any board/sensor numbering
-    data_by_animal = {}
-    for idx,row in sensor_animal_map.iterrows():
+    # Reorganize by animal ID, agnostic wrt any board/sensor numbering
+    jobs = []
+    for idx, row in sensor_animal_map.iterrows():
         sensor = row.name
         animal = row.item()
         # Look up which board's HDF5 group holds this sensor (derived from the
@@ -150,20 +197,29 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
         if board_id is None:
             print(f"Sensor {sensor} is not part of the current rack layout; skipping.")
             continue
-        try:
-            data_by_animal[animal] = data_dict[board_id][f"sensor_{sensor}"]
-        except KeyError as e:
-            print(f"Missing key in data_dict: {e}")
+        if board_id not in raw_h5f or f"sensor_{sensor}" not in raw_h5f[board_id]:
+            print(f"Missing key in data_dict: {board_id}/sensor_{sensor}")
+            continue
+        jobs.append((animal, board_id, sensor))
 
-    # Flag to track if we had any animals without necessary data recorded
-    missing_data = False
-    if algorithm == 'basic_threshold':
-        missing_data = basic_algorithm(data_by_animal, filtered_h5f, logfile)
-    elif algorithm == 'hilbert':
-        missing_data = hilbert_algorithm(data_by_animal, filtered_h5f, logfile)
-    elif algorithm == 'ml':
-        missing_data = ml_algorithm(data_by_animal, filtered_h5f, logfile)
-    return missing_data
+    overrides = parse_time_fix(time_fix)
+
+    extra = {}
+    if algorithm == 'ml':
+        # Load the networks once for the whole file, not once per animal.
+        extra['nets'] = _load_ml_nets(None)
+
+    for n_done, (animal, board_id, sensor) in enumerate(jobs, start=1):
+        data = load_trimmed_sensor(raw_h5f[board_id][f"sensor_{sensor}"],
+                                   f"{board_id} sensor_{sensor}", recording_length,
+                                   start_stop_override=overrides.get(int(sensor)))
+        missing_data = algorithms[algorithm]({animal: data}, filtered_h5f, logfile, **extra)
+        del data
+        if progress is not None:
+            progress(n_done, len(jobs), animal)
+        if missing_data:
+            return missing_data
+    return False
 
 
 def _record_zero_licks(data, animal, logfile, reason):
@@ -179,6 +235,43 @@ def _record_zero_licks(data, animal, logfile, reason):
     data['num_licks'] = 0
     with open(logfile, 'a') as lf:
         lf.write(f"No licks detectable for {animal}: {reason}; recorded 0 licks\n")
+
+
+def _narrow_int_trace(trace):
+    """Return (trace in the narrowest safe integer dtype, True) for integer
+    traces, or (trace, False) otherwise."""
+    if not np.issubdtype(trace.dtype, np.integer) or trace.size == 0:
+        return trace, False
+    lo, hi = int(trace.min()), int(trace.max())
+    for dt in (np.int16, np.int32):
+        info = np.iinfo(dt)
+        # leave headroom so ceil(threshold) always fits the comparison
+        if info.min < lo and hi < info.max:
+            return trace.astype(dt), True
+    return trace, True
+
+
+def _span_min(trace, starts, ends):
+    """min(trace[s:e+1]) for each (s, e) pair (all e >= s).
+
+    Lick-sized spans are short (< 1/6 s, ~20 samples), so the minimum is taken
+    by stepping an offset across all spans at once: O(spans * longest span)
+    instead of a pass over the whole trace.
+    """
+    if starts.size == 0:
+        return np.array([], dtype=trace.dtype)
+    lengths = ends - starts + 1
+    short = lengths <= 64
+    out = np.empty(starts.size, dtype=trace.dtype)
+    s, e = starts[short], ends[short]
+    if s.size:
+        m = trace[s]
+        for off in range(1, int(lengths[short].max())):
+            m = np.minimum(m, trace[np.minimum(s + off, e)])
+        out[short] = m
+    for j in np.flatnonzero(~short):  # rare (irregular sampling): do it directly
+        out[j] = trace[starts[j]:ends[j] + 1].min()
+    return out
 
 
 def basic_algorithm(data_by_animal, filtered_h5f, logfile):
@@ -264,14 +357,23 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
             thresholds = (unique_vals[:-1] + unique_vals[1:]) / 2.0
 
             n_peaks = np.full((len(thresholds),), np.nan)
-            peak_bins = [None] * len(thresholds)
+            # Accepted (start, end) sample pairs per threshold. The lick sample
+            # (argmin inside each dip) is only needed for the WINNING threshold,
+            # so it is computed once after the scan instead of for every one.
+            good_spans = [None] * len(thresholds)
+            empty = np.array([], dtype=int)
+            # Speed-up for long recordings: the trace is integer counts, so
+            # `trace < thr` is exactly `trace < ceil(thr)`, which can be done in
+            # a narrow integer type (4x less memory traffic than int64-vs-float).
+            work, as_int = _narrow_int_trace(trace)
 
             for i_thr in range(depth_back, len(thresholds)):
                 thr = thresholds[i_thr]
+                below = work < (int(np.ceil(thr)) if as_int else thr)
                 # Identify peaks below threshold. 1 marks the time bin just before a
                 # peak starts (the last bin that isn't in the peak), -1 marks the time
                 # bin just before a peak ends (the last bin in the peak)
-                peak_trans = np.diff((trace < thr).astype(np.int8))
+                peak_trans = np.diff(below.view(np.int8))
                 # Add 1 so we are getting the actual start of the lick, not the time
                 # 1 sample before
                 peak_starts = np.where(peak_trans == 1)[0] + 1
@@ -285,7 +387,7 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
 
                 # If we still have no peaks, skip
                 if peak_starts.size == 0 or peak_ends.size == 0:
-                    peak_bins[i_thr] = np.array([], dtype=int)
+                    good_spans[i_thr] = (empty, empty)
                     n_peaks[i_thr] = 0
                     continue
                 if peak_starts.size != peak_ends.size:
@@ -293,56 +395,39 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
                     m = min(peak_starts.size, peak_ends.size)
                     peak_starts = peak_starts[:m]
                     peak_ends = peak_ends[:m]
-                
+
                 # Remove peaks that are below threshold for too long (set by max_lick_time)
                 peak_t = times[peak_ends] - times[peak_starts]
                 good_peaks = np.where(peak_t < max_lick_time)[0]
                 # Check if we have any good peaks to start with, if not just move on
                 if good_peaks.size == 0:
-                    peak_bins[i_thr] = np.array([], dtype=int)
+                    good_spans[i_thr] = (empty, empty)
                     n_peaks[i_thr] = 0
                     continue
 
                 # Only look at peaks that are at least depth_back thresholds deep
                 # MATLAB checks cap(start:end) < thresholds(iThresh-N) (inclusive end)
+                # i.e. keep a peak iff ANY sample in trace[start:end+1] is below
+                # depth_thr, i.e. iff the span's minimum is below it. Vectorized
+                # (see _span_min); this replaces a per-peak Python loop with
+                # np.delete (O(peaks^2) per threshold) that made 24 h recordings
+                # crawl. Results are identical (tests/test_basic_algorithm_parity.py).
                 depth_thr = thresholds[i_thr - depth_back]
-                i_peak = 0
-                good_peaks = good_peaks.astype(int, copy=False)
-                while i_peak < good_peaks.size:
-                    p_idx = good_peaks[i_peak]
-                    # If we don't cross the 2-deep threshold, remove that peak from the "good" list
-                    ps_ = int(peak_starts[p_idx])
-                    pe_ = int(peak_ends[p_idx])
-                    peak_trace = trace[ps_:pe_+1]
-                    if np.count_nonzero(peak_trace < depth_thr) == 0:
-                        good_peaks = np.delete(good_peaks, i_peak, 0)
-                    else:
-                        # It was a good peak still, increment i_peak
-                        i_peak += 1
+                ps_good = peak_starts[good_peaks]
+                pe_good = peak_ends[good_peaks]
+                # An inverted (end < start) pair is an empty slice: never deep enough.
+                valid = pe_good >= ps_good
+                deep = np.zeros(ps_good.size, dtype=bool)
+                deep[valid] = _span_min(trace, ps_good[valid], pe_good[valid]) < depth_thr
+                ps_good = ps_good[deep]
+                pe_good = pe_good[deep]
 
-                # Check again if we have any good peaks, as we may have deleted them all
-                if good_peaks.size == 0:
-                    peak_bins[i_thr] = np.array([], dtype=int)
-                    n_peaks[i_thr] = 0
-                    continue
-                    
                 # Number of total good peaks with this threshold
-                n_peaks[i_thr] = int(good_peaks.size)
-
-                # Record the peak time bins
-                temp_peak_bins = np.full((good_peaks.size,), -1, dtype=int)
-                for j, p_idx in enumerate(good_peaks):
-                    ps_ = int(peak_starts[p_idx])
-                    pe_ = int(peak_ends[p_idx])
-                    peak_trace = trace[ps_:pe_+1]
-                    if peak_trace.size == 0: continue
-                    peak_rel_min = int(np.argmin(peak_trace))  # relative min index in the peak
-                    temp_peak_bins[j] = ps_ + peak_rel_min
-                peak_bins[i_thr] = temp_peak_bins
+                n_peaks[i_thr] = int(ps_good.size)
+                good_spans[i_thr] = (ps_good, pe_good)
 
             peak_info[animal] = {
                     'thr_and_peaks': np.vstack([thresholds, n_peaks]),
-                    'peak_bins': peak_bins,
             }
 
             peaks_row = peak_info[animal]['thr_and_peaks'][1, :]
@@ -358,7 +443,11 @@ def basic_algorithm(data_by_animal, filtered_h5f, logfile):
             max_peaks = np.nanmax(peaks_row)
             i_thr = int(np.where(peaks_row == max_peaks)[0][0])
 
-            pb_ = peak_info[animal]['peak_bins'][i_thr]
+            # Lick sample = deepest (first minimum) sample of each accepted dip.
+            ps_best, pe_best = good_spans[i_thr]
+            pb_ = np.array([ps_ + int(np.argmin(trace[ps_:pe_+1]))
+                            for ps_, pe_ in zip(ps_best.tolist(), pe_best.tolist())],
+                           dtype=int)
             lick_times_arr = times[pb_]
 
             # Isolated single dips are usually noise, not licking (mice lick in
@@ -556,7 +645,7 @@ def _load_ml_nets(checkpoint=None):
 detect_licks = None
 
 
-def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None):
+def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None, nets=None):
     """Detect licks with the ML cascade. Mirrors basic_algorithm's I/O contract exactly:
     writes lick_times, lick_indices, num_licks per animal (num_licks is in-memory only, same
     as basic_algorithm -- neither is persisted via save_filtered_data)."""
@@ -564,7 +653,8 @@ def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None):
     if detect_licks is None:
         from ml_detection.infer import detect_licks as _dl
         detect_licks = _dl
-    bout_net, point_net = _load_ml_nets(checkpoint)
+    # `nets` lets filter_data load the networks once per file instead of once per animal.
+    bout_net, point_net = nets if nets is not None else _load_ml_nets(checkpoint)
     for animal, data in data_by_animal.items():
         cap = np.asarray(data["cap_data"])
         t = np.asarray(data["time_data"])

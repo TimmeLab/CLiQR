@@ -34,15 +34,23 @@ Entry point: `recording_gui.py` (Solara web app, `localhost:8765`)
 
 | Function | Description |
 |---|---|
-| `filter_data()` | Top-level: loads raw HDF5, trims to start/stop times, calls algorithm |
-| `basic_algorithm()` | Threshold-based peak detection. Scans all inter-value thresholds, picks the one maximizing peak count. Requires 2-threshold depth. |
+| `filter_data()` | Top-level: streams one sensor at a time from the raw HDF5 (`load_trimmed_sensor()`), trims to start/stop times (or a `*_time_fix.xlsx` override via `parse_time_fix()`), runs the algorithm, saves, frees. Memory is bounded by one sensor, so 24 h / ~5 GB files are fine. |
+| `basic_algorithm()` | Threshold-based peak detection. Scans all inter-value thresholds, picks the one maximizing peak count. Requires 2-threshold depth. Depth check vectorized (`_span_min`); bit-identical to the original loop (`tests/test_basic_algorithm_parity.py`). |
 | `hilbert_algorithm()` | Bandpass 8–12 Hz → Hilbert envelope → threshold + neighbor filtering. Experimental (manuscript uses `basic_algorithm()`). Applies 2 high-pass + 2 low-pass filtfilt passes. |
 | `compute_bout_structure()` | ILIs, bout lick counts, bout durations. |
 | `save_filtered_data()` | Writes per-animal HDF5 group. |
 
-#### Notebook: `DataAnalysis.ipynb`
+#### GUI: `analysis_gui.py` (Solara, replaces the notebook)
 
-Multi-cohort batch analysis with Panel widgets. Includes:
+`solara run analysis_gui.py --port 8766` (or `start_analysis.bat`). Logic lives in `analysis_core.py` (no GUI code, unit-tested in `tests/test_analysis_core.py`); the GUI only wires widgets. Tabs: Run (cohort/file picker, algorithm, recording length, background run with progress, open existing results), Start/Stop check (raw trace + recorded cycles, for time fix files), Summary, Behavior, Traces (windowed min/max-decimated viewer, 24 h capable), Correlation (OLS/HC3, RLM, MAD outliers with exclusion checkboxes, cleaned fit, ceiling), Per-animal, Outliers removed. Exports the same CSVs as the notebook.
+
+`results_combined_*.h5` now also carries root attrs `files`, `dates`, `cohorts`, `recording_length`, `algorithm` and a per-session `date` attr (older combined files still load).
+
+`scripts/make_synthetic_recording.py` writes recorder-format raw files for demos/load tests.
+
+#### Notebook: `DataAnalysis.ipynb` (superseded, kept for reference)
+
+Multi-cohort batch analysis with Panel widgets. Became laggy with 24 h runs (full traces in Bokeh, whole raw files loaded into memory). Includes:
 - File selector GUI for raw HDF5 files per cohort
 - Lick detection via `filter_data()`
 - Detection summary: per-session lick counts, lick-count vs. volume fit
@@ -108,6 +116,7 @@ alignment for new recordings. Guide: `docs/VIDEO_CAPTURE.md`.
 |---|---|
 | Python | 3.13 |
 | solara | 1.57.3 |
+| ipyvuetify / ipyvue | 1.12.0 / 1.13.0 (pinned: Solara 1.x needs Vuetify 2; unpinned installs pull 3.x) |
 | jupyterlab | 4.5.6 |
 | h5py | 3.13.0 |
 | numpy | 2.3.5 |
