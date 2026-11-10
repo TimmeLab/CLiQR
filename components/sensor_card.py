@@ -140,11 +140,12 @@ def start_sensor(sensor_id: int):
     # Bookmark the concurrent video for the designated camera sensor.
     #
     # The bookmark is a blocking wireless round-trip. start_sensor runs on the
-    # Solara asyncio event loop, the SAME loop that drives record_sensors, so a
-    # synchronous bookmark here stalls all sensor acquisition for the whole
-    # round-trip (observed: a ~5 s hole in every sensor's data at session start).
-    # Run it on its own thread so acquisition keeps sampling; write_video_metadata
-    # is already h5-lock guarded. Return the thread so callers/tests can join it.
+    # Solara asyncio event loop; when acquisition also ran on that loop, a
+    # synchronous bookmark here punched a ~5 s hole in every sensor's data at
+    # session start. Acquisition now has its own thread, but the bookmark still
+    # runs on its own thread so it doesn't freeze the UI either;
+    # write_video_metadata is h5-lock guarded. Return the thread so
+    # callers/tests can join it.
     bookmark_thread = None
     if state.camera_enabled.value and sensor_id == state.camera_sensor_id.value:
         from components import session_controls

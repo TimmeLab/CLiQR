@@ -66,7 +66,7 @@ Solara web app at `localhost:8765`. Modular structure:
 | `hardware/ft232h.py` | FT232H USB scan, I2C controller init, auto-detect MPR121 address |
 | `hardware/mpr121.py` | MPR121 soft reset, config, channel reads |
 | `hardware/mock_hardware.py` | Simulated hardware for testing |
-| `recording/recorder.py` | Async loop, ThreadPoolExecutor reads, buffered HDF5 writes |
+| `recording/recorder.py` | Sampler + writer threads (off the UI event loop), ThreadPoolExecutor reads, batched HDF5 writes; `stop()` flushes every sample |
 | `components/hardware_status.py` | Board init UI |
 | `components/session_controls.py` | Start/stop session, layout file upload (CSV or XLSX), output dir |
 | `components/sensor_card.py` | 24 per-sensor cards |

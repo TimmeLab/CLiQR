@@ -210,3 +210,34 @@ def test_sampler_fatal_error_reports_and_keeps_data(make_rec):
     assert len(errors) == 1
     assert rec.stop() is True
     _assert_complete(rec)
+
+
+def test_session_start_stop_uses_recorder_threads(tmp_path, monkeypatch):
+    """The GUI's Start/Stop drive the recorder threads (no asyncio task) and a
+    session Stop leaves every sample read on disk."""
+    import pandas as pd
+    import components.hardware_status as hw
+    import components.session_controls as sc
+    from utils import state
+
+    monkeypatch.setattr(utils.state, "SERIAL_NUMBER_SENSOR_MAP", _TEST_MAP)
+    monkeypatch.setattr(recording.recorder, "HISTORY_SIZE", 50)
+    monkeypatch.setattr(hw, "mpr121_manager", _CounterManager())
+    monkeypatch.setattr(sc, "current_recorder", None)
+    state.set_session("i2c_controllers", dict(_CONTROLLERS))
+    state.layout_df.set(pd.DataFrame({"animal": ["A1"]}, index=[1]))
+    state.output_directory.set(str(tmp_path))
+    state.camera_enabled.set(False)
+    state.set_session("recording_all", False)
+    try:
+        sc.start_recording()
+        rec = sc.current_recorder
+        assert rec is not None and rec._sampler is not None
+        time.sleep(0.2)
+        sc.stop_recording()
+        assert not rec._sampler.is_alive()
+        assert not rec._writer.is_alive()
+        _assert_complete(rec)
+    finally:
+        state.layout_df.set(pd.DataFrame())
+        state.set_session("recording_all", False)
