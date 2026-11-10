@@ -39,8 +39,32 @@ SENSOR_BOARD_MAP = {
 _CONTROL_RE = re.compile(r'^Control\d+$')
 
 def is_control(animal_id):
-    """True if animal_id is a control cage (no animal, no weight recorded)."""
-    return bool(_CONTROL_RE.match(str(animal_id)))
+    """True if animal_id is a control cage (no animal, no weight recorded).
+
+    Accepts 2-bottle per-fluid keys ("Control1/fluid2") as well as bare IDs.
+    """
+    return bool(_CONTROL_RE.match(str(animal_id).split('/')[0]))
+
+
+# ---------------------------------------------------------------------------
+# 2-bottle choice
+# ---------------------------------------------------------------------------
+# A 2-bottle recording (file attr two_bottle=True) stores each sensor's two
+# sippers in fluid subgroups. Start/stop times and weight stay at the sensor
+# level; cap_data, time_data and the volumes live in the fluid subgroups:
+#     sensor_<id>/start_time, stop_time, weight
+#     sensor_<id>/fluid1/cap_data, time_data, start_vol, stop_vol
+#     sensor_<id>/fluid2/...
+FLUIDS = (1, 2)
+
+
+def fluid_group_name(fluid):
+    return f"fluid{int(fluid)}"
+
+
+def is_two_bottle(raw_h5f):
+    """True if an open raw HDF5 file was recorded in 2-bottle choice mode."""
+    return bool(raw_h5f.attrs.get('two_bottle', False))
 
 
 _START_TIME_RE = re.compile(r'^start_time(\d+)?$')
@@ -77,7 +101,8 @@ def _last_cycle_start_stop(sensor_group, time_data):
     return start_time, stop_time, True
 
 
-def load_trimmed_sensor(sensor_group, label, recording_length, start_stop_override=None):
+def load_trimmed_sensor(sensor_group, label, recording_length, start_stop_override=None,
+                        fluid=None):
     """Read ONE sensor's group from a raw HDF5 file and trim it for analysis.
 
     The trace is cut to the last start/stop cycle, rebased so time starts at 0,
@@ -94,8 +119,13 @@ def load_trimmed_sensor(sensor_group, label, recording_length, start_stop_overri
 
     `start_stop_override`, if given, is a (start_time, stop_time) pair in Unix
     seconds (from a *_time_fix.xlsx file) that replaces the recorded times.
+
+    `fluid` (1 or 2) selects one bottle of a 2-bottle sensor: the trace and
+    volumes come from that fluid's subgroup, start/stop times and weight from
+    the sensor group (both bottles share them).
     """
-    time_data = sensor_group['time_data'][()]
+    data_group = sensor_group if fluid is None else sensor_group[fluid_group_name(fluid)]
+    time_data = data_group['time_data'][()]
     if start_stop_override is not None:
         start_time, stop_time = start_stop_override
         had_start = True
@@ -108,10 +138,12 @@ def load_trimmed_sensor(sensor_group, label, recording_length, start_stop_overri
     stop_idx = int(np.argmin(np.abs(time_data - stop_time)))
 
     sensor_data = {}
-    for k, v in sensor_group.items():
-        if k in ('time_data', 'cap_data') or not isinstance(v, h5py.Dataset):
-            continue
-        sensor_data[k] = v[()]
+    # Sensor-level scalars first, then (2-bottle) the fluid's own volumes.
+    for grp in ((sensor_group,) if fluid is None else (sensor_group, data_group)):
+        for k, v in grp.items():
+            if k in ('time_data', 'cap_data') or not isinstance(v, h5py.Dataset):
+                continue
+            sensor_data[k] = v[()]
 
     t = time_data[start_idx:stop_idx+1] - time_data[start_idx]
     del time_data
@@ -129,7 +161,7 @@ def load_trimmed_sensor(sensor_group, label, recording_length, start_stop_overri
         end = start_idx + revised_stop_idx
 
     sensor_data['time_data'] = t
-    sensor_data['cap_data'] = sensor_group['cap_data'][start_idx:end]
+    sensor_data['cap_data'] = data_group['cap_data'][start_idx:end]
     sensor_data['fs'] = fs
 
     if 'stop_vol' in sensor_data:
@@ -160,7 +192,7 @@ def parse_time_fix(time_fix):
     return overrides
 
 
-def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold', recording_length=2*60*60, progress=None):
+def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None, algorithm='basic_threshold', recording_length=2*60*60, progress=None, require_weight=True):
     """This organizes the data by animal and handles some common issues relating to
     recording start/stop times, volumes, and weights. Current algorithm choices:
         - basic_threshold
@@ -177,6 +209,14 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
     `time_fix` is an optional DataFrame read from `<raw>_time_fix.xlsx` with
     columns [Sensor, New Start Time, New End Time] (Unix epoch seconds). Listed
     sensors use those times instead of the recorded start/stop times.
+
+    2-bottle recordings (file attr two_bottle=True) are detected automatically:
+    each bottle is analysed as its own channel and saved under
+    "<animal>/fluid1" and "<animal>/fluid2" in the filtered file (a time fix
+    applies to both bottles of a sensor).
+
+    `require_weight=False` keeps animals whose weight was never recorded (their
+    weight is saved as NaN) instead of dropping them as missing data.
     """
     algorithms = {
         'basic_threshold': basic_algorithm,
@@ -202,6 +242,22 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
             continue
         jobs.append((animal, board_id, sensor))
 
+    two_bottle = is_two_bottle(raw_h5f)
+    if two_bottle:
+        # One detection job per bottle; the output key nests the fluid under
+        # the animal so save_filtered_data writes "<animal>/fluid<n>".
+        fluid_jobs = []
+        for animal, board_id, sensor in jobs:
+            sensor_grp = raw_h5f[board_id][f"sensor_{sensor}"]
+            for fluid in FLUIDS:
+                if fluid_group_name(fluid) not in sensor_grp:
+                    print(f"Missing key in data_dict: {board_id}/sensor_{sensor}/{fluid_group_name(fluid)}")
+                    continue
+                fluid_jobs.append((f"{animal}/{fluid_group_name(fluid)}", board_id, sensor, fluid))
+        jobs = fluid_jobs
+    else:
+        jobs = [(animal, board_id, sensor, None) for animal, board_id, sensor in jobs]
+
     overrides = parse_time_fix(time_fix)
 
     extra = {}
@@ -209,10 +265,14 @@ def filter_data(raw_h5f, filtered_h5f, sensor_animal_map, logfile, time_fix=None
         # Load the networks once for the whole file, not once per animal.
         extra['nets'] = _load_ml_nets(None)
 
-    for n_done, (animal, board_id, sensor) in enumerate(jobs, start=1):
+    for n_done, (animal, board_id, sensor, fluid) in enumerate(jobs, start=1):
+        label = f"{board_id} sensor_{sensor}" + (f" {fluid_group_name(fluid)}" if fluid else "")
         data = load_trimmed_sensor(raw_h5f[board_id][f"sensor_{sensor}"],
-                                   f"{board_id} sensor_{sensor}", recording_length,
-                                   start_stop_override=overrides.get(int(sensor)))
+                                   label, recording_length,
+                                   start_stop_override=overrides.get(int(sensor)),
+                                   fluid=fluid)
+        if not require_weight and 'weight' not in data and not is_control(animal):
+            data['weight'] = np.nan  # kept on purpose; see require_weight
         missing_data = algorithms[algorithm]({animal: data}, filtered_h5f, logfile, **extra)
         del data
         if progress is not None:

@@ -94,3 +94,108 @@ def test_save_preserves_untouched_datasets(tmp_path):
     edit_io.save_file(str(p), {3: {0: {"start_vol": 0.0, "stop_vol": 0.0, "weight": 25.0}}})
     with h5py.File(p, "r") as h5f:
         assert h5f["board_FT232H0/sensor_3/start_time"][()] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# 2-bottle choice files: volumes live in sensor_<id>/fluid1, fluid2 subgroups;
+# start/stop times and weight stay at the sensor level.
+# ---------------------------------------------------------------------------
+def build_two_bottle_h5(path, board="board_FT232H0", sensor_id=3, cycles=(0,)):
+    with h5py.File(path, "w") as h5f:
+        h5f.attrs["two_bottle"] = True
+        g = h5f.require_group(board).require_group(f"sensor_{sensor_id}")
+        for cycle in cycles:
+            suf = "" if cycle == 0 else str(cycle)
+            g.create_dataset(f"start_time{suf}", data=100.0 + cycle)
+            g.create_dataset(f"weight{suf}", data=24.0 + cycle)
+            g.create_dataset(f"fluid1/start_vol{suf}", data=10.0 + cycle)
+            g.create_dataset(f"fluid1/stop_vol{suf}", data=9.5)
+            g.create_dataset(f"fluid2/start_vol{suf}", data=8.0)
+            # fluid2 stop_vol deliberately missing
+            g.create_dataset("fluid1/cap_data", data=[1, 2, 3]) if cycle == 0 else None
+
+
+def test_fields_for_mode():
+    assert edit_io.fields_for(False) == ("start_vol", "stop_vol", "weight")
+    assert edit_io.fields_for(True) == ("fluid1/start_vol", "fluid1/stop_vol",
+                                        "fluid2/start_vol", "fluid2/stop_vol", "weight")
+
+
+def test_is_two_bottle(tmp_path):
+    p1, p2 = tmp_path / "one.h5", tmp_path / "two.h5"
+    build_h5(p1, {3: {0: {"start_time": 100.0}}})
+    build_two_bottle_h5(p2)
+    assert edit_io.is_two_bottle(str(p1)) is False
+    assert edit_io.is_two_bottle(str(p2)) is True
+
+
+def test_load_two_bottle_reads_fluid_volumes(tmp_path):
+    p = tmp_path / "raw.h5"
+    build_two_bottle_h5(p, cycles=(0, 1))
+    data = edit_io.load_file(str(p))
+    assert data[3][0] == {"fluid1/start_vol": 10.0, "fluid1/stop_vol": 9.5,
+                          "fluid2/start_vol": 8.0, "fluid2/stop_vol": 0.0, "weight": 24.0}
+    assert data[3][1]["fluid1/start_vol"] == 11.0 and data[3][1]["weight"] == 25.0
+    # field order is display order
+    assert tuple(data[3][0]) == edit_io.fields_for(True)
+
+
+def test_save_two_bottle_writes_fluid_subgroups(tmp_path):
+    p = tmp_path / "raw.h5"
+    build_two_bottle_h5(p)
+    edit_io.save_file(str(p), {3: {0: {"fluid1/start_vol": 10.0, "fluid1/stop_vol": 9.4,
+                                        "fluid2/start_vol": 0.0, "fluid2/stop_vol": 7.6,
+                                        "weight": 24.5}}})
+    with h5py.File(p, "r") as h5f:
+        g = h5f["board_FT232H0/sensor_3"]
+        assert g["fluid1/stop_vol"][()] == 9.4
+        assert g["fluid2/stop_vol"][()] == 7.6
+        assert "fluid2/start_vol" not in g          # 0 deletes, as in 1-bottle mode
+        assert g["weight"][()] == 24.5
+        assert "start_vol" not in g and "stop_vol" not in g  # nothing at sensor level
+        assert list(g["fluid1/cap_data"][()]) == [1, 2, 3]   # traces untouched
+
+
+def test_save_finds_sensor_on_any_board(tmp_path):
+    # 8-board rack file (sensor 3 on FT232H0 there, but sensor 13 on FT232H4):
+    # the group is located in the file, not via the configured rack map.
+    p = tmp_path / "raw.h5"
+    build_two_bottle_h5(p, board="board_FT232H4", sensor_id=13)
+    data = edit_io.load_file(str(p))
+    data[13][0]["weight"] = 30.0
+    edit_io.save_file(str(p), data)
+    with h5py.File(p, "r") as h5f:
+        assert h5f["board_FT232H4/sensor_13/weight"][()] == 30.0
+
+
+def test_save_rejects_fields_of_other_mode(tmp_path):
+    p = tmp_path / "raw.h5"
+    build_two_bottle_h5(p)
+    with pytest.raises(ValueError):
+        edit_io.save_file(str(p), {3: {0: {"start_vol": 5.0}}})
+
+
+def test_edit_gui_renders_and_saves_two_bottle(tmp_path):
+    solara = pytest.importorskip("solara")
+    import edit_gui
+
+    p = tmp_path / "raw_data_2026-11-09_12-45-00.h5"
+    build_two_bottle_h5(p, board="board_FT232H4", sensor_id=13)
+    edit_gui.load_selected(str(p))
+    assert edit_gui.two_bottle.value is True
+    assert edit_gui.field_label("fluid2/stop_vol") == "Stop Vol (mL)"
+    assert edit_gui.field_section("fluid2/stop_vol") == "Fluid 2"
+    solara.render(edit_gui.Page(), handle_error=False)
+
+    edit_gui.set_field(13, 0, "fluid2/stop_vol", 7.5)
+    edit_gui.save_selected()
+    with h5py.File(p, "r") as h5f:
+        assert h5f["board_FT232H4/sensor_13/fluid2/stop_vol"][()] == 7.5
+    assert not any("ERROR" in m for m in edit_gui.log_messages.value)
+
+    # a 1-bottle file afterwards switches the mode back
+    p1 = tmp_path / "raw_data_one.h5"
+    build_h5(p1, {3: {0: {"start_time": 100.0, "weight": 24.1}}})
+    edit_gui.load_selected(str(p1))
+    assert edit_gui.two_bottle.value is False
+    solara.render(edit_gui.Page(), handle_error=False)
