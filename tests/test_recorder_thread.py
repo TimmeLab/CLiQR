@@ -33,8 +33,8 @@ class _CounterManager:
 
     cap_data counts successful reads per board (1, 2, 3, ...), so any dropped,
     duplicated or reordered sample is visible on disk. ``bad_call`` makes that
-    (global) call return an unknown serial, which breaks the sampler outside the
-    per-board read error handling (a fatal sampler error).
+    (global) call return a malformed read (wrong channel count), which breaks
+    sampling outside the per-board read error handling (a fatal error).
     """
 
     def __init__(self, bad_call=None):
@@ -47,7 +47,7 @@ class _CounterManager:
         with self._lock:
             self.calls += 1
             if self.bad_call is not None and self.calls >= self.bad_call:
-                return [time.time()] * 3, [0] * 3, "BOGUS"
+                return [time.time()], [0], sn  # malformed: 1 channel, not 3
             self.n[sn] += 1
             v = self.n[sn]
         k = len(_TEST_MAP[sn])
@@ -232,10 +232,10 @@ def test_session_start_stop_uses_recorder_threads(tmp_path, monkeypatch):
     try:
         sc.start_recording()
         rec = sc.current_recorder
-        assert rec is not None and rec._sampler is not None
+        assert rec is not None and rec._source is not None
         time.sleep(0.2)
         sc.stop_recording()
-        assert not rec._sampler.is_alive()
+        assert not rec._source._thread.is_alive()
         assert not rec._writer.is_alive()
         _assert_complete(rec)
     finally:
@@ -289,7 +289,7 @@ def test_session_stop_completes_when_metadata_write_fails(tmp_path, monkeypatch)
         monkeypatch.setattr(rec, "write_sensor_metadata", broken)
         time.sleep(0.1)
         sc.stop_recording()
-        assert not rec._sampler.is_alive()
+        assert not rec._source._thread.is_alive()
         assert state.session["recording_all"] is False
         assert any("ERROR" in m and "disk unwritable" in m
                    for m in state.log_messages.value)

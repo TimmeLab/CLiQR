@@ -6,9 +6,11 @@ Solara event loop. Previously the loop was an asyncio task on the UI's event
 loop, so any slow UI work or HDF5 flush delayed the next read and every board
 silently lost samples. Now:
 
-  sampler thread  paces reads at MAX_SAMPLE_HZ, reads all boards in parallel,
-                  appends to the plot ring buffers and to per-channel pending
-                  batches; never touches HDF5.
+  sample source   paces reads at MAX_SAMPLE_HZ and reads all boards in
+                  parallel -- in the hardware process (GUI; own GIL, see
+                  hardware/hw_process.py) or on an in-process thread (tests).
+                  It pushes loops into on_loops(), which appends to the plot
+                  ring buffers and per-channel pending batches.
   writer thread   owns all recorder-initiated HDF5 writes (sample batches and
                   the periodic volume/weight persist), fed through a queue.
 
@@ -20,11 +22,9 @@ import queue
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict
 import h5py
 
-from hardware.mpr121 import MPR121Manager
 from utils.state import (HISTORY_SIZE, MAX_SAMPLE_HZ, MEASUREMENT_PERSIST_SECONDS,
                          channel_keys, channel_group_path)
 
@@ -72,9 +72,9 @@ def measurement_warnings(sensor_states, two_bottle=False):
 class SensorRecorder:
     """Manages asynchronous sensor data recording."""
 
-    def __init__(self, mpr121_manager: MPR121Manager, filename: str,
+    def __init__(self, mpr121_manager, filename: str,
                  controllers: Dict, measurements_provider=None,
-                 two_bottle: bool = False):
+                 two_bottle: bool = False, source=None):
         """
         Initialize the sensor recorder.
 
@@ -85,6 +85,9 @@ class SensorRecorder:
             measurements_provider: Optional callable returning
                 {sensor_id: SensorState}, read from the context-immune session
                 global, used for periodic measurement persistence.
+            source: Sample source (see recording/sources.py). None samples
+                in-process from mpr121_manager (ThreadSource); the GUI passes
+                the hardware process's ProcessSource.
             two_bottle: 2-bottle choice mode. Each sensor then records two
                 channels (fluid 1, fluid 2) into sensor_<id>/fluid1 and
                 sensor_<id>/fluid2. Must match the channels the manager reads.
@@ -93,6 +96,7 @@ class SensorRecorder:
         self.filename = filename
         self.controllers = controllers
         self.two_bottle = two_bottle
+        self._source = source
         self.recording = False
         self.loop_counter = 0
         # Count of read failures that survived retries, for rate-limited logging.
@@ -114,8 +118,8 @@ class SensorRecorder:
         # writes and the GUI (get_recent_samples) / stop() read.
         self._buf_lock = threading.Lock()
         self._queue = queue.Queue()
-        self._stop_event = threading.Event()
-        self._sampler = None
+        self._started = False
+        self._fatal = False
         self._writer = None
         self._stop_result = None
         # Batches handed to the writer but not yet on disk (failed writes are
@@ -188,50 +192,54 @@ class SensorRecorder:
     # ------------------------------------------------------------------
 
     def start(self, log_callback=None, on_error=None):
-        """Create the HDF5 file and start the writer and sampler threads.
+        """Create the HDF5 file, start the writer thread and the sample source.
 
         Args:
             log_callback: Optional callable(str) for activity-log messages.
-            on_error: Optional callable(exc), called once from the sampler
-                thread if it dies on an unexpected exception (board read
-                failures are not fatal; they skip one sample on that board).
+            on_error: Optional callable(exc), called once if sampling dies
+                (board read failures are not fatal; they skip one sample on
+                that board).
         """
         self._log = log_callback
         self._on_error = on_error
         self.initialize_hdf5_file()
         self.recording = True
+        if self._source is None:
+            # In-process sampling (unit tests, scripts). The GUI passes a
+            # hardware-process source instead.
+            from recording.sources import ThreadSource
+            self._source = ThreadSource(self.mpr121_manager,
+                                        list(self.controllers), MAX_SAMPLE_HZ)
         self._writer = threading.Thread(
             target=self._write_loop, name="cliqr-h5-writer", daemon=True)
-        self._sampler = threading.Thread(
-            target=self._sample_loop, name="cliqr-sampler", daemon=True)
         self._writer.start()
-        self._sampler.start()
+        self._started = True
+        self._source.start(self)
         self._emit("Recording started - capturing data from all sensors")
 
     def stop(self, timeout: float = 10.0) -> bool:
         """Stop sampling and block until every sample read is on disk.
 
         Idempotent, and safe on a recorder that was never started. Returns True
-        when both threads finished and nothing is left unwritten; otherwise
-        logs an ERROR and returns False (never hangs longer than ~2*timeout).
+        when sampling ended, the writer finished and nothing is left unwritten;
+        otherwise logs an ERROR and returns False (never hangs longer than
+        ~2*timeout).
         """
         if self._stop_result is not None:
             return self._stop_result
         self.recording = False
-        if self._sampler is None:
+        if not self._started:
             self._stop_result = True
             return True
 
         ok = True
-        self._stop_event.set()
-        self._sampler.join(timeout)
-        if self._sampler.is_alive():
+        if not self._source.stop(timeout):
             ok = False
-            self._emit("ERROR: sampler thread did not stop in time; "
-                       "flushing the samples read so far")
-            # Batch writes are idempotent, so racing the sampler's own final
-            # hand-off cannot duplicate data.
-            self._queue.put(self._take_pending())
+            self._emit("ERROR: sampling did not stop in time; "
+                       "flushing the samples received so far")
+        # Hand over the final partial batch. Batch writes are idempotent, so
+        # repeating a hand-off (e.g. after a fatal error) cannot duplicate data.
+        self._queue.put(self._take_pending())
         self._queue.put(None)  # writer: write what's left, then exit
         self._writer.join(timeout)
         if self._writer.is_alive():
@@ -254,86 +262,58 @@ class SensorRecorder:
                 pass
 
     # ------------------------------------------------------------------
-    # Sampler thread
+    # SampleSink (called by the source: sampler thread or receiver thread)
     # ------------------------------------------------------------------
 
-    def _sample_loop(self):
-        try:
-            # Pace the loop to MAX_SAMPLE_HZ. Use a running deadline (not a
-            # fixed per-iteration sleep) so read jitter doesn't accumulate into
-            # drift. time.sleep is high resolution (also on Windows, 3.11+).
-            sample_period = 1.0 / MAX_SAMPLE_HZ
-            with ThreadPoolExecutor(max_workers=max(1, len(self.controllers))) as executor:
-                next_deadline = time.monotonic() + sample_period
-                while not self._stop_event.is_set():
-                    sleep_for = next_deadline - time.monotonic()
-                    if sleep_for > 0:
-                        time.sleep(sleep_for)
-                        next_deadline += sample_period
-                    else:
-                        # Fell behind. Resync the deadline instead of bursting
-                        # to catch up.
-                        next_deadline = time.monotonic() + sample_period
-                    if self._stop_event.is_set():
-                        break
-                    self._sample_once(executor)
-        except Exception as e:
-            fatal = True
-            self._emit(f"ERROR in recording loop: {e}")
-            if self._on_error is not None:
-                try:
-                    self._on_error(e)
-                except Exception:
-                    pass
-        else:
-            fatal = False
-        finally:
-            # Hand over the final partial batch (also after a fatal error, so
-            # the samples read so far reach disk even if stop() comes late).
-            self._queue.put(self._take_pending())
-        if fatal:
-            # The GUI clears recording_all on a fatal error, so stop() may
-            # never be called. End the writer now: left running, its periodic
-            # volume/weight persist would write a LATER session's values into
-            # this file.
-            self._queue.put(None)
+    def on_loops(self, loops):
+        """Buffer sampling loops; each loop is [(sn, times, caps)]."""
+        for results in loops:
+            # Validate the whole loop before touching any buffer, so a
+            # malformed read can never leave a board's channels uneven.
+            for sn, times, caps in results:
+                n = len(self.board_cap_data[sn])  # KeyError: unknown board
+                if len(times) != n or len(caps) != n:
+                    raise ValueError(
+                        f"board {sn} returned {len(caps)} channels, expected {n}")
+            with self._buf_lock:
+                for sn, times, caps in results:
+                    pending = self._pending[sn]
+                    for idx, key in enumerate(self.board_cap_data[sn]):
+                        t, c = times[idx], caps[idx]
+                        self.board_time_data[sn][key].append(t)
+                        self.board_cap_data[sn][key].append(c)
+                        pending[key][1].append(t)
+                        pending[key][2].append(c)
+                        self.board_produced[sn][key] += 1
+            self.loop_counter += 1
+            if self.loop_counter % HISTORY_SIZE == 0:
+                self._queue.put(self._take_pending())
 
-    def _sample_once(self, executor):
-        """One acquisition iteration: read every board, buffer the results."""
-        futures = [(sn, executor.submit(self.mpr121_manager.read_sensor_data, sn))
-                   for sn in self.controllers.keys()]
+    def on_read_error(self, sn, message):
+        self._read_error_count += 1
+        # Log the first few, then only occasionally, to avoid flooding the log
+        # if a board goes fully offline.
+        if self._read_error_count <= 5 or self._read_error_count % 100 == 0:
+            self._emit(f"WARN: read failed on board {sn} after retries "
+                       f"(total skips={self._read_error_count}): {message}")
 
-        # A board whose read failed even after retries is skipped for THIS
-        # iteration only -- one transient USB error costs a sample on one
-        # board, never the whole run.
-        results = []
-        for sn, future in futures:
-            try:
-                results.append(future.result())
-            except Exception as e:
-                self._read_error_count += 1
-                # Log the first few, then only occasionally, to avoid flooding
-                # the log if a board goes fully offline.
-                if self._read_error_count <= 5 or self._read_error_count % 100 == 0:
-                    self._emit(
-                        f"WARN: read failed on board {sn} after retries "
-                        f"(total skips={self._read_error_count}): {e}"
-                    )
-
+    def on_fatal(self, message):
+        """Sampling died. Save what was received and end the writer."""
         with self._buf_lock:
-            for local_time, local_cap, serial_number in results:
-                pending = self._pending[serial_number]
-                for idx, key in enumerate(self.board_cap_data[serial_number]):
-                    t, c = local_time[idx], local_cap[idx]
-                    self.board_time_data[serial_number][key].append(t)
-                    self.board_cap_data[serial_number][key].append(c)
-                    pending[key][1].append(t)
-                    pending[key][2].append(c)
-                    self.board_produced[serial_number][key] += 1
-
-        self.loop_counter += 1
-        if self.loop_counter % HISTORY_SIZE == 0:
-            self._queue.put(self._take_pending())
+            if self._fatal:
+                return
+            self._fatal = True
+        self._emit(f"ERROR in recording loop: {message}")
+        if self._on_error is not None:
+            try:
+                self._on_error(RuntimeError(message))
+            except Exception:
+                pass
+        self._queue.put(self._take_pending())
+        # The GUI clears recording_all on a fatal error, so stop() may never be
+        # called. End the writer now: left running, its periodic volume/weight
+        # persist would write a LATER session's values into this file.
+        self._queue.put(None)
 
     def _take_pending(self):
         """Swap out the pending samples as a batch for the writer.

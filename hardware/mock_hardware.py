@@ -9,7 +9,7 @@ import time
 import numpy as np
 from collections import deque
 from typing import Dict, List, Tuple
-from utils.state import SERIAL_NUMBER_SENSOR_MAP, active_channels
+from utils.hw_constants import SERIAL_NUMBER_SENSOR_MAP
 
 
 class MockFT232HManager:
@@ -168,7 +168,7 @@ class MockMPR121Manager:
             messages.append(f"Board {sn} configured successfully (MOCK)")
         return messages
 
-    def read_sensor_data(self, serial_number: str) -> Tuple:
+    def read_sensor_data(self, serial_number: str, channels=None) -> Tuple:
         """
         Simulate reading sensor data.
 
@@ -182,7 +182,9 @@ class MockMPR121Manager:
             raise ValueError(f"No controller found for {serial_number}")
 
         port = self.controllers[serial_number]["port"]
-        channels = active_channels()
+        if channels is None:
+            from utils.state import active_channels
+            channels = active_channels()
         local_time_data = deque(maxlen=len(channels))
         local_cap_data = deque(maxlen=len(channels))
 

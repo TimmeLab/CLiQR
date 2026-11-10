@@ -6,7 +6,7 @@ connected via FT232H I2C interfaces.
 """
 import time
 from typing import Dict, List
-from utils.state import (
+from utils.hw_constants import (
     SOFT_RESET, CONFIG, CONFIG1, CONFIG2, CONFIG1_VALUE, CONFIG2_VALUE, DATA
 )
 
@@ -84,7 +84,7 @@ class MPR121Manager:
             print(f"Error configuring sensor on {serial_number}: {e}")
             return False
 
-    def read_sensor_data(self, serial_number: str) -> tuple:
+    def read_sensor_data(self, serial_number: str, channels=None) -> tuple:
         """
         Read capacitance data from all channels of a sensor.
 
@@ -95,13 +95,16 @@ class MPR121Manager:
             Tuple of (time_data, cap_data, serial_number)
         """
         from collections import deque
-        from utils.state import active_channels, READ_RETRIES, READ_RETRY_DELAY
+        from utils.hw_constants import READ_RETRIES, READ_RETRY_DELAY
 
         if serial_number not in self.controllers:
             raise ValueError(f"No controller found for {serial_number}")
 
         port = self.controllers[serial_number]["port"]
-        channels = active_channels()
+        if channels is None:
+            # Legacy in-process path (GUI / unit tests): current mode's channels.
+            from utils.state import active_channels
+            channels = active_channels()
         local_time_data = deque(maxlen=len(channels))
         local_cap_data = deque(maxlen=len(channels))
 
