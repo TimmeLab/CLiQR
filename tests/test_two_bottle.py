@@ -1,7 +1,7 @@
 """2-bottle choice mode: each sensor (cage) records an adjacent channel pair,
 (fluid 1, fluid 2), into sensor_<id>/fluid1 and sensor_<id>/fluid2. Start/stop
 times and weight stay at the sensor level; volumes go in the fluid subgroups."""
-import asyncio
+import time
 from dataclasses import replace
 
 import h5py
@@ -88,13 +88,9 @@ def test_recorder_writes_fluid_subgroups(tmp_path, monkeypatch):
                          controllers={"BOARD": object()},
                          two_bottle=True)
 
-    async def run():
-        task = asyncio.create_task(rec.record_sensors())
-        await asyncio.sleep(0.3)
-        rec.stop()
-        await task
-
-    asyncio.run(run())
+    rec.start()
+    time.sleep(0.3)
+    assert rec.stop() is True
 
     with h5py.File(rec.filename, "r") as h5f:
         assert bool(h5f.attrs["two_bottle"]) is True

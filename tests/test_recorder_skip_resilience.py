@@ -16,7 +16,7 @@ These tests exercise both layers and assert the on-disk data is intact after a
 board suffers periodic skips: sensors within a board stay length-matched, the
 healthy board is unaffected, and no stale/duplicate samples are injected.
 """
-import asyncio
+import time
 from collections import defaultdict
 
 import h5py
@@ -120,14 +120,12 @@ def test_recording_survives_periodic_board_skips(tmp_path, monkeypatch):
 
     logs = []
 
-    async def run():
-        task = asyncio.create_task(rec.record_sensors(log_callback=logs.append))
-        await asyncio.sleep(0.6)   # hundreds of loops -> many flushes + skips
-        rec.stop()
-        # If a skip had propagated, awaiting the task would re-raise here.
-        await task
-
-    asyncio.run(run())
+    errors = []
+    rec.start(log_callback=logs.append, on_error=errors.append)
+    time.sleep(0.6)   # hundreds of loops -> many flushes + skips
+    assert rec.stop() is True
+    # A propagated skip would have killed the sampler and reported here.
+    assert errors == []
 
     # The run survived and actually exercised skips.
     assert rec._read_error_count > 0
@@ -150,13 +148,10 @@ def test_recording_survives_periodic_board_skips(tmp_path, monkeypatch):
         assert len(set(ok_lens)) == 1, ok_lens
         assert len(set(flaky_lens)) == 1, flaky_lens
 
-        # The healthy board was not starved by the flaky board's skips: it has
-        # strictly more samples on disk. (The gap equals the number of skips
-        # that occurred before the last flush -- skips landing in the final
-        # unflushed tail aren't on disk yet -- so it is positive and bounded by
-        # the total skip count. The exact per-skip accounting is verified above
-        # on the produced counters.)
-        assert 0 < ok_lens[0] - flaky_lens[0] <= rec._read_error_count
+        # The healthy board was not starved by the flaky board's skips, and
+        # stop() flushed every sample read: on disk, the gap is exactly the
+        # number of skips.
+        assert ok_lens[0] - flaky_lens[0] == rec._read_error_count
 
         for board, sensors in _TEST_MAP.items():
             for s in sensors:
