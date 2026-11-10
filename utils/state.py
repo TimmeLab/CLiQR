@@ -3,6 +3,8 @@ Reactive state management for CLiQR Solara GUI.
 
 This module defines all reactive state variables used throughout the application.
 """
+import threading
+
 import solara
 import pandas as pd
 from typing import Dict, List
@@ -109,6 +111,9 @@ volumes. Fixed for the whole session (the toggle is locked while recording)."""
 # held here in a plain dict and MIRRORED into the reactives, and Page rehydrates
 # the reactives from here on mount. This is what survives a mid-run reconnect.
 session = {
+    # Activity log (see add_log_message): kept here so lines logged by
+    # background threads while a tab was disconnected show after a refresh.
+    "log_messages": [],
     "recording_all": False,
     "filename": "",
     "comments": "",
@@ -170,16 +175,40 @@ def rehydrate_reactives_from_session():
 # ============================================================================
 
 log_messages = solara.reactive([])
-"""List of timestamped log messages for the activity log."""
+"""List of timestamped log messages for the activity log (mirror of
+session["log_messages"])."""
+_REACTIVE_FOR["log_messages"] = log_messages
+
+# Lines kept in memory; the GUI shows the last 20. Bounded so a long outage
+# that logs every second can't grow the per-message copy without limit.
+LOG_MAX = 5000
+_log_lock = threading.Lock()
+
+
+def _mirror_log():
+    # Mirror into this context's reactive. From a background thread whose
+    # browser context is gone this may fail; the session copy is what counts.
+    try:
+        log_messages.set(session["log_messages"])
+    except Exception:
+        pass
 
 
 def add_log_message(message: str):
-    """Add a timestamped message to the activity log."""
+    """Add a timestamped message to the activity log. Thread-safe."""
     import datetime
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    current = log_messages.value.copy()
-    current.append(f"[{timestamp}] {message}")
-    log_messages.set(current)
+    with _log_lock:
+        log = session["log_messages"] + [f"[{timestamp}] {message}"]
+        session["log_messages"] = log[-LOG_MAX:]
+    _mirror_log()
+
+
+def clear_log():
+    """Clear the activity log."""
+    with _log_lock:
+        session["log_messages"] = []
+    _mirror_log()
 
 
 # ============================================================================
