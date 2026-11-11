@@ -64,8 +64,11 @@ def test_pipeline_writes_combined_file(combined):
         g = f["T-1"]["0"]
         for key in ('consumed_vols', 'weights', 'lick_indices', 'lick_times', 'cap_data',
                     'time_data', 'used_start_idx', 'used_stop_idx', 'ILIs',
-                    'bout_lick_counts', 'bout_durations', 'bout_start_times'):
+                    'bout_lick_counts', 'bout_durations', 'bout_start_times',
+                    'lick_durations', 'lick_depths', 'lick_onsets', 'lick_offsets',
+                    'bout_median_lick_durations'):
             assert key in g, key
+        assert g['lick_durations'].shape == g['lick_indices'].shape
         assert g.attrs['raw_h5'] == sorted(raws)[0]
         assert g['lick_indices'].shape[0] > 0
         assert 'weights' not in f["Control1"]["0"]
@@ -89,6 +92,11 @@ def test_load_combined_and_analyses(combined, tmp_path):
     s = core.metric_summary(m)
     # synthetic licks are at 7 Hz
     assert 130 < s['median_ili_ms'] < 155
+    # synthetic dips are a graded 4-sample shape at 110 Hz -> ~20-40 ms at half depth
+    assert 15 < s['median_lick_duration_ms'] < 45
+    assert s['n_lick_durations'] > 0.9 * len(m['ILIs'])
+    licked = ~res.sessions['is_control'] & (res.sessions['n_licks'] > 0)
+    assert res.sessions.loc[licked, 'median_lick_duration_ms'].notna().all()
 
     tc = core.timecourse(res, bin_s=60, length_s=res.recording_length)
     assert tc['licks'].shape == (12, 6)
@@ -118,6 +126,8 @@ def test_load_combined_and_analyses(combined, tmp_path):
     cum = pd.read_csv(os.path.join(out, "cliqr_cumulative_licks.csv"))
     assert list(cum.columns) == ["Time (min)", "Cumulative Licks", "Standard Error"]
     assert pd.read_csv(os.path.join(out, "cliqr_ILIs_outliers_removed.csv")).columns[0] == "ILI (ms)"
+    assert pd.read_csv(os.path.join(out, "cliqr_lick_durations_outliers_removed.csv")).columns[0] \
+        == "Lick Duration (ms)"
 
 
 def test_session_window_decimates_and_keeps_dips(combined):
@@ -396,3 +406,60 @@ def test_gui_tabs_render_two_bottle(combined2, cohort2):
         solara.render(comp(res), handle_error=False)
     solara.render(gui.MetricsBlock(res, frozenset(), "", ""), handle_error=False)
     gui.two_bottle.set(False)
+
+
+def test_lick_durations_computed_for_old_combined_files(combined, tmp_path):
+    """Combined files made before lick durations existed get them on the fly."""
+    import shutil
+    path, _, _ = combined
+    old = str(tmp_path / "results_combined_old.h5")
+    shutil.copy(path, old)
+    with h5py.File(old, 'a') as f:
+        for a in f:
+            for k in f[a]:
+                for key in ('lick_durations', 'lick_depths', 'lick_onsets', 'lick_offsets',
+                            'bout_median_lick_durations'):
+                    if key in f[a][k]:
+                        del f[a][k][key]
+    new_m = core.pooled_metrics(core.load_combined(path))
+    old_res = core.load_combined(old)
+    old_m = core.pooled_metrics(old_res)
+    np.testing.assert_allclose(np.sort(old_m['lick_durations']), np.sort(new_m['lick_durations']))
+    assert old_res.sessions['median_lick_duration_ms'].isna().all()
+
+
+def test_lick_events_table_and_export(combined, tmp_path):
+    path, _, _ = combined
+    res = core.load_combined(path)
+    ev = core.lick_events(res)
+    assert list(ev.columns) == ['animal_id', 'session', 'date', 'lick_number', 'detected_s',
+                                'start_s', 'end_s', 'duration_ms', 'start_lead_ms',
+                                'depth_counts', 'duration_valid']
+    # every non-control lick, nothing from controls
+    assert len(ev) == res.animals['n_licks'].sum()
+    assert not ev['animal_id'].str.startswith('Control').any()
+    ok = ev['duration_valid']
+    assert ok.mean() > 0.9
+    # start before the detected (deepest) sample, end after it
+    assert (ev.loc[ok, 'start_s'] < ev.loc[ok, 'detected_s']).all()
+    assert (ev.loc[ok, 'end_s'] > ev.loc[ok, 'detected_s']).all()
+    assert 0 < ev.loc[ok, 'start_lead_ms'].median() < 40
+    # exclusions drop that session's licks
+    excl = {(0, "T-1", 0)}
+    ev2 = core.lick_events(res, excl)
+    assert not ((ev2['animal_id'] == "T-1") & (ev2['session'] == 0)).any()
+    p, = core.export_lick_events(ev, str(tmp_path), "_outliers_removed")
+    assert os.path.basename(p) == "cliqr_lick_events_outliers_removed.csv"
+    back = pd.read_csv(p)
+    assert len(back) == len(ev)
+    np.testing.assert_allclose(back['start_s'], ev['start_s'], atol=1e-4)
+
+
+def test_lick_events_two_bottle(combined2):
+    path, _, _ = combined2
+    res = core.load_combined(path)
+    ev = core.lick_events(res)
+    assert 'fluid' in ev.columns and set(ev['fluid']) <= {1, 2}
+    only1 = core.lick_events(res, fluid=1)
+    assert set(only1['fluid']) == {1}
+    assert len(only1) == res.animals.query("fluid == 1")['n_licks'].sum()

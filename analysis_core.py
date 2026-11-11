@@ -39,8 +39,8 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from data_analysis import (FLUIDS, SENSOR_BOARD_MAP, filter_data, fluid_group_name,
-                           is_control)
+from data_analysis import (FLUIDS, SENSOR_BOARD_MAP, compute_lick_durations, filter_data,
+                           fluid_group_name, is_control)
 
 LAYOUT_NAMES = ("layout_w_controls.csv", "layout.csv")
 RAW_PATTERN = "raw_data_*.h5"
@@ -55,7 +55,9 @@ ALGORITHMS = {
 # Big per-session datasets copied file-to-file inside HDF5 (never through numpy).
 _SESSION_DATASETS = ('lick_indices', 'lick_times', 'cap_data', 'time_data',
                      'used_start_idx', 'used_stop_idx')
-_OPTIONAL_DATASETS = ('ILIs', 'bout_lick_counts', 'bout_durations', 'bout_start_times')
+_OPTIONAL_DATASETS = ('ILIs', 'bout_lick_counts', 'bout_durations', 'bout_start_times',
+                      'lick_durations', 'lick_depths', 'lick_onsets', 'lick_offsets',
+                      'bout_median_lick_durations')
 
 DEFAULT_FLUID_NAMES = {1: "Fluid 1", 2: "Fluid 2"}
 
@@ -418,6 +420,35 @@ def _scalar(ds):
     return float(np.asarray(v).ravel()[0]) if np.size(v) else float('nan')
 
 
+def _median_ms(ds) -> float:
+    """Median of the finite values of a durations dataset, in ms (NaN if none)."""
+    if ds is None:
+        return float('nan')
+    a = ds[()]
+    a = a[np.isfinite(a)]
+    return float(np.median(a) * 1000) if a.size else float('nan')
+
+
+_LICK_MEASURES = ('lick_durations', 'lick_depths', 'lick_onsets', 'lick_offsets')
+
+
+def _lick_measures(g, keys=_LICK_MEASURES) -> dict:
+    """Per-lick duration/depth/onset/offset arrays for one channel group. Read from
+    the file when stored; otherwise (combined files made before these were added)
+    measured from the stored trace and lick indices, so older results still get them."""
+    if all(k in g for k in keys):
+        return {k: g[k][()] for k in keys}
+    if not all(k in g for k in ('cap_data', 'time_data', 'lick_indices')):
+        return {k: np.array([]) for k in keys}
+    m = compute_lick_durations(g['cap_data'][()], g['time_data'][()], g['lick_indices'][()])
+    return {k: m[k] for k in keys}
+
+
+def _lick_durations(g) -> np.ndarray:
+    """Per-lick durations (s) for one channel group (see _lick_measures)."""
+    return _lick_measures(g, ('lick_durations',))['lick_durations']
+
+
 def _channel(g, fluid: int):
     """The group holding one channel's data: the session group itself
     (1-bottle, fluid 0) or its fluid1/fluid2 subgroup."""
@@ -452,6 +483,9 @@ def load_combined(path: str) -> CombinedResults:
                         'consumed_vol': _scalar(c['consumed_vols']) if 'consumed_vols' in c else np.nan,
                         'weight': weight,
                         'n_bouts': int(c['bout_lick_counts'].shape[0]) if 'bout_lick_counts' in c else 0,
+                        # NaN for combined files made before lick durations existed
+                        # (pooled_metrics computes those on the fly instead).
+                        'median_lick_duration_ms': _median_ms(c.get('lick_durations')),
                         'duration_s': duration,
                         'n_samples': n_samples,
                         'raw_h5': str(g.attrs.get('raw_h5', '')),
@@ -460,6 +494,7 @@ def load_combined(path: str) -> CombinedResults:
                     })
     sessions = pd.DataFrame(rows, columns=[
         'animal_id', 'session', 'fluid', 'n_licks', 'consumed_vol', 'weight', 'n_bouts',
+        'median_lick_duration_ms',
         'duration_s', 'n_samples', 'raw_h5', 'date_attr', 'is_control'])
     n_sessions = int(sessions['session'].max()) + 1 if len(sessions) else 0
 
@@ -548,12 +583,15 @@ def detection_summary(res: CombinedResults, fluid: int | None = None) -> dict:
 
 def pooled_metrics(res: CombinedResults, exclude: set | frozenset = frozenset(),
                    fluid: int | None = None) -> dict:
-    """ILIs, licks per bout and bout durations pooled across animals (controls excluded)."""
-    acc = {'ILIs': [], 'bout_lick_counts': [], 'bout_durations': []}
+    """ILIs, licks per bout, bout durations and lick durations pooled across animals
+    (controls excluded). Lick durations keep only measurable (finite) licks."""
+    acc = {'ILIs': [], 'bout_lick_counts': [], 'bout_durations': [], 'lick_durations': []}
     for _a, _s, _f, g in _iter_session_groups(res, res.animal_ids, exclude, fluid):
-        for key in acc:
+        for key in ('ILIs', 'bout_lick_counts', 'bout_durations'):
             if key in g:
                 acc[key].append(g[key][()])
+        d = _lick_durations(g)
+        acc['lick_durations'].append(d[np.isfinite(d)])
     return {k: (np.concatenate(v) if v else np.array([])) for k, v in acc.items()}
 
 
@@ -569,7 +607,48 @@ def metric_summary(m: dict) -> dict:
         'mean_bout_duration': _f(np.mean, m['bout_durations']),
         'median_bout_duration': _f(np.median, m['bout_durations']),
         'n_ilis': len(m['ILIs']), 'n_bouts': len(m['bout_durations']),
+        'median_lick_duration_ms': _f(np.median, m.get('lick_durations', [])) * 1000,
+        'n_lick_durations': len(m.get('lick_durations', [])),
     }
+
+
+def lick_events(res: CombinedResults, exclude: set | frozenset = frozenset(),
+                fluid: int | None = None) -> pd.DataFrame:
+    """One row per detected lick (controls excluded): its start and end time.
+
+    start_s / end_s are the half-depth crossings of the lick's dip (see
+    data_analysis.compute_lick_durations), in seconds from the session's used
+    start, the same clock as lick_times. They replace a fixed offset: the detected
+    lick time (detected_s) is the dip's deepest sample, which comes after the dip
+    has begun, and start_lead_ms is how much earlier the measured start is.
+    duration_valid is False where the duration was rejected (sampling gap inside
+    the dip, or longer than 1/6 s); start/end are still the best estimate there,
+    and are NaN only for a dip with no measurable depth.
+    """
+    cols = ['animal_id', 'session', 'date', 'fluid', 'lick_number', 'detected_s', 'start_s',
+            'end_s', 'duration_ms', 'start_lead_ms', 'depth_counts', 'duration_valid']
+    frames = []
+    for animal_id, session, f, g in _iter_session_groups(res, res.animal_ids, exclude, fluid):
+        if 'lick_indices' not in g or g['lick_indices'].shape[0] == 0:
+            continue
+        times = g['lick_times'][()]
+        lm = _lick_measures(g)
+        start, end = lm['lick_onsets'], lm['lick_offsets']
+        durs = lm['lick_durations']
+        frames.append(pd.DataFrame({
+            'animal_id': animal_id, 'session': session,
+            'date': res.dates[session] if session < len(res.dates) else str(session),
+            'fluid': f, 'lick_number': np.arange(1, len(times) + 1),
+            'detected_s': times, 'start_s': start, 'end_s': end,
+            'duration_ms': (end - start) * 1000, 'start_lead_ms': (times - start) * 1000,
+            'depth_counts': lm['lick_depths'], 'duration_valid': np.isfinite(durs),
+        }))
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=cols)
+    df = df[cols].sort_values(['animal_id', 'session', 'fluid', 'detected_s'],
+                              kind='stable').reset_index(drop=True)
+    if not res.two_bottle:
+        df = df.drop(columns=['fluid'])
+    return df
 
 
 def bin_edges_for(length_s: float, bin_s: float) -> np.ndarray:
@@ -1031,6 +1110,10 @@ def export_metrics(m: dict, out_dir: str, suffix: str = "", tag: str = "") -> li
     specs = [("cliqr_ILIs", m['ILIs'] * 1000, 700, "ILI (ms)"),
              ("cliqr_bout_durations", m['bout_durations'], 15, "Bout Duration (s)"),
              ("cliqr_licks_per_bout", m['bout_lick_counts'], 100, "Licks per Bout")]
+    if 'lick_durations' in m:
+        # Cap at the 1/6 s detection limit, same idea as the other caps.
+        specs.append(("cliqr_lick_durations", m['lick_durations'] * 1000, 1000 / 6,
+                      "Lick Duration (ms)"))
     for name, arr, cap, header in specs:
         p = os.path.join(out_dir, f"{name}{tag}{suffix}.csv")
         df = pd.DataFrame(_clip_list(arr, cap))
@@ -1040,6 +1123,13 @@ def export_metrics(m: dict, out_dir: str, suffix: str = "", tag: str = "") -> li
             df.to_csv(p, index=False)
         paths.append(p)
     return paths
+
+
+def export_lick_events(df: pd.DataFrame, out_dir: str, suffix: str = "",
+                       tag: str = "") -> list[str]:
+    p = os.path.join(out_dir, f"cliqr_lick_events{tag}{suffix}.csv")
+    df.to_csv(p, index=False, float_format="%.4f")
+    return [p]
 
 
 def export_cumulative(tc: dict, out_dir: str, suffix: str = "", tag: str = "") -> list[str]:

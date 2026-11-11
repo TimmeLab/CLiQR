@@ -638,19 +638,27 @@ def BehaviorCard(res, excl, suffix, title, fluid, label):
             f"mean licks/bout **{s['mean_licks_per_bout']:.1f}** (median "
             f"{s['median_licks_per_bout']:.0f}) · mean bout duration "
             f"**{s['mean_bout_duration']:.2f} s** (median {s['median_bout_duration']:.2f} s) · "
-            f"{s['n_bouts']} bouts")
-        fig = Figure(figsize=(13, 3.2), dpi=100)
-        a1, a2, a3 = fig.subplots(1, 3)
+            f"{s['n_bouts']} bouts · median lick duration "
+            f"**{s['median_lick_duration_ms']:.1f} ms** ({s['n_lick_durations']} licks)")
+        fig = Figure(figsize=(17, 3.2), dpi=100)
+        a1, a2, a3, a4 = fig.subplots(1, 4)
         _hist(a1, m['ILIs'] * 1000, 100, "ILI", "ILI (ms)", (0, 1000), color=color)
         max_b = int(m['bout_lick_counts'].max()) if len(m['bout_lick_counts']) else 1
         _hist(a2, m['bout_lick_counts'], np.arange(1, min(max_b, 300) + 2), "Licks per Bout",
               "Licks per Bout", color=color)
         _hist(a3, m['bout_durations'], 50, "Bout Duration", "Duration (s)", color=color)
+        _hist(a4, m['lick_durations'] * 1000, np.arange(0, 170, 4), "Lick Duration",
+              "Half-depth width (ms)", color=color)
         Plot(fig, [res, excl, fluid])
         tag = core.fluid_tag(fluid)
-        solara.Button(f"Export ILI / bout CSVs{_sfx(label)}", text=True,
+        solara.Button(f"Export ILI / bout / lick-duration CSVs{_sfx(label)}", text=True,
                       on_click=lambda: export(lambda d: core.export_metrics(m, d, suffix, tag),
                                               f"behavioral metrics{_sfx(label)}"))
+        solara.Button(f"Export individual lick start/end times{_sfx(label)}", text=True,
+                      on_click=lambda: export(
+                          lambda d: core.export_lick_events(
+                              core.lick_events(res, excl, fluid=fluid), d, suffix, tag),
+                          f"lick events{_sfx(label)}"))
 
 
 @solara.component
