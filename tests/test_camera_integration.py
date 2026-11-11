@@ -149,7 +149,6 @@ def test_global_stop_bookmarks_before_stop_session(tmp_path):
                          controllers={serial: object()})
     rec.initialize_hdf5_file()
     sc.current_recorder = rec
-    sc.recording_task = None
 
     sensors = state.sensor_states.value.copy()
     sensors[sensor_id] = replace(sensors[sensor_id], is_recording=True,

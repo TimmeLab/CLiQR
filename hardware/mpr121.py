@@ -6,7 +6,7 @@ connected via FT232H I2C interfaces.
 """
 import time
 from typing import Dict, List
-from utils.state import (
+from utils.hw_constants import (
     SOFT_RESET, CONFIG, CONFIG1, CONFIG2, CONFIG1_VALUE, CONFIG2_VALUE, DATA
 )
 
@@ -84,7 +84,7 @@ class MPR121Manager:
             print(f"Error configuring sensor on {serial_number}: {e}")
             return False
 
-    def read_sensor_data(self, serial_number: str) -> tuple:
+    def read_sensor_data(self, serial_number: str, channels=None) -> tuple:
         """
         Read capacitance data from all channels of a sensor.
 
@@ -95,13 +95,16 @@ class MPR121Manager:
             Tuple of (time_data, cap_data, serial_number)
         """
         from collections import deque
-        from utils.state import active_channels, READ_RETRIES, READ_RETRY_DELAY
+        from utils.hw_constants import READ_RETRIES, READ_RETRY_DELAY
 
         if serial_number not in self.controllers:
             raise ValueError(f"No controller found for {serial_number}")
 
         port = self.controllers[serial_number]["port"]
-        channels = active_channels()
+        if channels is None:
+            # Legacy in-process path (GUI / unit tests): current mode's channels.
+            from utils.state import active_channels
+            channels = active_channels()
         local_time_data = deque(maxlen=len(channels))
         local_cap_data = deque(maxlen=len(channels))
 
@@ -130,67 +133,3 @@ class MPR121Manager:
             local_time_data.append(time.time())
 
         return local_time_data, local_cap_data, serial_number
-
-    def get_last_reading(self, sensor_id: int, num_samples: int = 250,
-                         fluid=None) -> tuple:
-        """
-        Get the last N samples from a sensor for testing/plotting.
-
-        Args:
-            sensor_id: Sensor ID (1-24)
-            num_samples: Number of samples to retrieve
-            fluid: 1 or 2 for one bottle of a 2-bottle sensor; None otherwise
-
-        Returns:
-            Tuple of (cap_data, time_data) lists, or (None, None) if no data available
-        """
-        # Try to get data from the live recorder buffer first
-        try:
-            from components.session_controls import current_recorder
-            if current_recorder is not None:
-                cap_data, time_data = current_recorder.get_recent_samples(
-                    sensor_id, num_samples, fluid=fluid)
-                if cap_data is not None:
-                    return cap_data, time_data
-        except Exception:
-            pass  # Fall through to HDF5 reading
-
-        # If no live data, try reading from the most recent HDF5 file
-        try:
-            from utils import state
-            import h5py
-            from utils.state import SERIAL_NUMBER_SENSOR_MAP, channel_group_path
-
-            filename = state.filename.value
-            if not filename:
-                return None, None
-
-            # Find which board this sensor is on: walk the board->sensors map and
-            # take the serial number whose sensor list contains this sensor.
-            sn = None
-            for serial_number, sensor_numbers in SERIAL_NUMBER_SENSOR_MAP.items():
-                if sensor_id in sensor_numbers:
-                    sn = serial_number
-                    break
-            if sn is None:
-                return None, None
-
-            with h5py.File(filename, "r") as h5f:
-                key = (sensor_id, fluid) if fluid is not None else sensor_id
-                group_path = f"board_{sn}/{channel_group_path(key)}"
-                if group_path not in h5f:
-                    return None, None
-
-                group = h5f[group_path]
-                if "cap_data" not in group or "time_data" not in group:
-                    return None, None
-
-                # Read the last N samples
-                cap_data = group["cap_data"][:]
-                time_data = group["time_data"][:]
-
-                n = min(num_samples, len(cap_data))
-                return list(cap_data[-n:]), list(time_data[-n:])
-
-        except Exception:
-            return None, None

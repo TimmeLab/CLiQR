@@ -54,7 +54,7 @@ def Page():
 
             solara.Button(
                 label="Clear Log",
-                on_click=lambda: state.log_messages.set([]),
+                on_click=state.clear_log,
                 color="secondary"
             )
 

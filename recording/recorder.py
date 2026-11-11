@@ -1,18 +1,30 @@
 """
-Async recording functionality for continuous sensor data acquisition.
+Threaded recording for continuous sensor data acquisition.
 
-This module implements the main recording loop that reads from all sensors
-and manages the buffered writes to HDF5 files.
+Sampling and disk writes each run on their own thread, independent of the
+Solara event loop. Previously the loop was an asyncio task on the UI's event
+loop, so any slow UI work or HDF5 flush delayed the next read and every board
+silently lost samples. Now:
+
+  sample source   paces reads at MAX_SAMPLE_HZ and reads all boards in
+                  parallel -- in the hardware process (GUI; own GIL, see
+                  hardware/hw_process.py) or on an in-process thread (tests).
+                  It pushes loops into on_loops(), which appends to the plot
+                  ring buffers and per-channel pending batches.
+  writer thread   owns all recorder-initiated HDF5 writes (sample batches and
+                  the periodic volume/weight persist), fed through a queue.
+
+stop() joins both after handing over the final partial batch, so every sample
+read is on disk when it returns. See
+docs/superpowers/specs/2026-11-10-recorder-thread-design.md.
 """
-import asyncio
+import queue
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict
 import h5py
 
-from hardware.mpr121 import MPR121Manager
 from utils.state import (HISTORY_SIZE, MAX_SAMPLE_HZ, MEASUREMENT_PERSIST_SECONDS,
                          channel_keys, channel_group_path)
 
@@ -60,9 +72,9 @@ def measurement_warnings(sensor_states, two_bottle=False):
 class SensorRecorder:
     """Manages asynchronous sensor data recording."""
 
-    def __init__(self, mpr121_manager: MPR121Manager, filename: str,
+    def __init__(self, mpr121_manager, filename: str,
                  controllers: Dict, measurements_provider=None,
-                 two_bottle: bool = False):
+                 two_bottle: bool = False, source=None):
         """
         Initialize the sensor recorder.
 
@@ -73,6 +85,9 @@ class SensorRecorder:
             measurements_provider: Optional callable returning
                 {sensor_id: SensorState}, read from the context-immune session
                 global, used for periodic measurement persistence.
+            source: Sample source (see recording/sources.py). None samples
+                in-process from mpr121_manager (ThreadSource); the GUI passes
+                the hardware process's ProcessSource.
             two_bottle: 2-bottle choice mode. Each sensor then records two
                 channels (fluid 1, fluid 2) into sensor_<id>/fluid1 and
                 sensor_<id>/fluid2. Must match the channels the manager reads.
@@ -81,6 +96,7 @@ class SensorRecorder:
         self.filename = filename
         self.controllers = controllers
         self.two_bottle = two_bottle
+        self._source = source
         self.recording = False
         self.loop_counter = 0
         # Count of read failures that survived retries, for rate-limited logging.
@@ -96,6 +112,21 @@ class SensorRecorder:
         self._last_persist = 0.0
         # Last value written per sensor per dataset name, to skip unchanged writes.
         self._persisted = {}
+
+        # Thread machinery (see module docstring). _buf_lock guards the ring
+        # buffers, pending batches and produced counters, which the sampler
+        # writes and the GUI (get_recent_samples) / stop() read.
+        self._buf_lock = threading.Lock()
+        self._queue = queue.Queue()
+        self._started = False
+        self._fatal = False
+        self._writer = None
+        self._stop_result = None
+        # Batches handed to the writer but not yet on disk (failed writes are
+        # kept here and retried, never dropped).
+        self._unwritten = []
+        self._log = None
+        self._on_error = None
 
         # HDF5 does not allow two concurrent open-for-write handles in one
         # process. The periodic buffer flush runs on the recording task while
@@ -131,6 +162,15 @@ class SensorRecorder:
             self.board_produced[sn] = {s: 0 for s in self.board_cap_data[sn]}
             self.board_written[sn] = {s: 0 for s in self.board_cap_data[sn]}
 
+        # Samples read but not yet handed to the writer, per channel:
+        # [start_index, times, caps]. start_index is the channel's sample
+        # number of times[0], which makes batch writes idempotent (a retried or
+        # duplicated batch rewrites the same slice instead of appending twice).
+        self._pending = {
+            sn: {key: [0, [], []] for key in self.board_cap_data[sn]}
+            for sn in controllers.keys()
+        }
+
     def _channel_keys(self, sn):
         """Buffer keys for board sn, in the order its read returns channels."""
         from utils.state import SERIAL_NUMBER_SENSOR_MAP
@@ -147,164 +187,218 @@ class SensorRecorder:
                 for key in self._channel_keys(sn):
                     board_group.require_group(channel_group_path(key))
 
-    async def record_sensors(self, log_callback=None):
-        """
-        Main async recording loop.
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self, log_callback=None, on_error=None):
+        """Create the HDF5 file, start the writer thread and the sample source.
 
         Args:
-            log_callback: Optional callback function for logging messages
+            log_callback: Optional callable(str) for activity-log messages.
+            on_error: Optional callable(exc), called once if sampling dies
+                (board read failures are not fatal; they skip one sample on
+                that board).
         """
-        self.recording = True
-        self.loop_counter = 0
-
-        # Initialize the HDF5 file structure
+        self._log = log_callback
+        self._on_error = on_error
         self.initialize_hdf5_file()
+        self.recording = True
+        if self._source is None:
+            # In-process sampling (unit tests, scripts). The GUI passes a
+            # hardware-process source instead.
+            from recording.sources import ThreadSource
+            self._source = ThreadSource(self.mpr121_manager,
+                                        list(self.controllers), MAX_SAMPLE_HZ)
+        self._writer = threading.Thread(
+            target=self._write_loop, name="cliqr-h5-writer", daemon=True)
+        self._writer.start()
+        self._started = True
+        self._source.start(self)
+        self._emit("Recording started - capturing data from all sensors")
 
-        if log_callback:
-            log_callback("Recording started - capturing data from all sensors")
+    def stop(self, timeout: float = 10.0) -> bool:
+        """Stop sampling and block until every sample read is on disk.
 
-        # Use ThreadPoolExecutor for parallel sensor reads
-        num_boards = len(self.controllers)
-        with ThreadPoolExecutor(max_workers=num_boards) as executor:
-            try:
-                # Pace the loop to MAX_SAMPLE_HZ. Use a running deadline (not a
-                # fixed per-iteration sleep) so read/flush jitter doesn't
-                # accumulate into drift.
-                sample_period = 1.0 / MAX_SAMPLE_HZ
-                next_deadline = time.monotonic() + sample_period
-                while self.recording:
-                    # Sleep until the next scheduled sample (this also yields to
-                    # the event loop for UI updates).
-                    sleep_for = next_deadline - time.monotonic()
-                    if sleep_for > 0:
-                        await asyncio.sleep(sleep_for)
-                        next_deadline += sample_period
-                    else:
-                        # Fell behind (e.g. an HDF5 flush stall). Yield and resync
-                        # the deadline instead of bursting to catch up.
-                        await asyncio.sleep(0)
-                        next_deadline = time.monotonic() + sample_period
-
-                    # Launch parallel sensor reads on all boards
-                    futures = []
-                    for sn in self.controllers.keys():
-                        future = executor.submit(
-                            self.mpr121_manager.read_sensor_data,
-                            sn
-                        )
-                        futures.append((sn, future))
-
-                    # Collect results. A board whose read failed even after
-                    # retries is skipped for THIS iteration only -- one transient
-                    # USB error costs a sample on one board, never the whole run.
-                    results = []
-                    for sn, future in futures:
-                        try:
-                            results.append(future.result())
-                        except Exception as e:
-                            self._read_error_count += 1
-                            # Log the first few, then only occasionally, to avoid
-                            # flooding the log if a board goes fully offline.
-                            if log_callback and (self._read_error_count <= 5
-                                                 or self._read_error_count % 100 == 0):
-                                log_callback(
-                                    f"WARN: read failed on board {sn} after retries "
-                                    f"(total skips={self._read_error_count}): {e}"
-                                )
-
-                    # Append data to buffers
-                    for local_time, local_cap, serial_number in results:
-                        for idx, key in enumerate(self.board_cap_data[serial_number]):
-                            self.board_time_data[serial_number][key].append(local_time[idx])
-                            self.board_cap_data[serial_number][key].append(local_cap[idx])
-                            self.board_produced[serial_number][key] += 1
-
-                    # Write to HDF5 file every HISTORY_SIZE loops
-                    if self.loop_counter == HISTORY_SIZE:
-                        # First write - create datasets
-                        self._write_initial_data()
-                    elif self.loop_counter > 0 and self.loop_counter % HISTORY_SIZE == 0:
-                        # Subsequent writes - append data
-                        self._append_data()
-
-                    # Periodically persist volume/weight (piggybacked on the
-                    # flush cadence, gated by wall-clock so it stays ~5 min).
-                    if (self.measurements_provider is not None
-                            and time.monotonic() - self._last_persist
-                            >= MEASUREMENT_PERSIST_SECONDS):
-                        self._flush_measurements()
-                        self._last_persist = time.monotonic()
-
-                    self.loop_counter += 1
-
-            except Exception as e:
-                if log_callback:
-                    log_callback(f"ERROR in recording loop: {str(e)}")
-                raise
-
-        if log_callback:
-            log_callback("Recording stopped")
-
-    def _write_initial_data(self):
-        """Write the first batch of data to HDF5 (creates datasets).
-
-        Writes the un-flushed tail per sensor, sized from produced-vs-written
-        counters rather than a fixed HISTORY_SIZE, so a board that skipped reads
-        is handled correctly.
+        Idempotent, and safe on a recorder that was never started. Returns True
+        when sampling ended, the writer finished and nothing is left unwritten;
+        otherwise logs an ERROR and returns False (never hangs longer than
+        ~2*timeout).
         """
-        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
-            for sn in self.controllers.keys():
-                for sensor in self.board_cap_data[sn]:
-                    group = h5f[f"board_{sn}"][channel_group_path(sensor)]
-
-                    produced = self.board_produced[sn][sensor]
-                    n = produced - self.board_written[sn][sensor]
-                    time_tail = list(self.board_time_data[sn][sensor])[-n:] if n > 0 else []
-                    cap_tail = list(self.board_cap_data[sn][sensor])[-n:] if n > 0 else []
-
-                    # Create resizable datasets (dtypes pinned so an empty first
-                    # batch from an offline board doesn't drift to float).
-                    group.create_dataset(
-                        "time_data", data=time_tail, dtype="float64",
-                        chunks=(HISTORY_SIZE,), maxshape=(None,)
-                    )
-                    group.create_dataset(
-                        "cap_data", data=cap_tail, dtype="int64",
-                        chunks=(HISTORY_SIZE,), maxshape=(None,)
-                    )
-                    self.board_written[sn][sensor] = produced
-
-    def _append_data(self):
-        """Append buffered data to existing HDF5 datasets.
-
-        The number of samples written per sensor is driven by produced-vs-written
-        counters, not loop_counter, so a board that skipped reads (and thus
-        produced fewer samples) stays correctly sized and aligned. Datasets grow
-        independently per sensor.
-        """
-        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
-            for sn in self.controllers.keys():
-                for sensor in self.board_cap_data[sn]:
-                    produced = self.board_produced[sn][sensor]
-                    n = produced - self.board_written[sn][sensor]
-                    if n <= 0:
-                        continue
-
-                    group = h5f[f"board_{sn}"][channel_group_path(sensor)]
-                    time_tail = list(self.board_time_data[sn][sensor])[-n:]
-                    cap_tail = list(self.board_cap_data[sn][sensor])[-n:]
-
-                    old_size = group["time_data"].shape[0]
-                    new_size = old_size + n
-                    group["time_data"].resize((new_size,))
-                    group["cap_data"].resize((new_size,))
-                    group["time_data"][old_size:new_size] = time_tail
-                    group["cap_data"][old_size:new_size] = cap_tail
-                    self.board_written[sn][sensor] = produced
-
-    def stop(self):
-        """Signal the recording loop to stop."""
+        if self._stop_result is not None:
+            return self._stop_result
         self.recording = False
+        if not self._started:
+            self._stop_result = True
+            return True
+
+        ok = True
+        if not self._source.stop(timeout):
+            ok = False
+            self._emit("ERROR: sampling did not stop in time; "
+                       "flushing the samples received so far")
+        # Hand over the final partial batch. Batch writes are idempotent, so
+        # repeating a hand-off (e.g. after a fatal error) cannot duplicate data.
+        self._queue.put(self._take_pending())
+        self._queue.put(None)  # writer: write what's left, then exit
+        self._writer.join(timeout)
+        if self._writer.is_alive():
+            ok = False
+            self._emit("ERROR: HDF5 writer did not finish in time; "
+                       "the last samples may not be on disk")
+        elif self._unwritten:
+            ok = False
+            self._emit(f"ERROR: {len(self._unwritten)} batch(es) of samples "
+                       "could not be written to disk")
+        self._emit("Recording stopped")
+        self._stop_result = ok
+        return ok
+
+    def _emit(self, message):
+        if self._log is not None:
+            try:
+                self._log(message)
+            except Exception:  # logging must never take down acquisition
+                pass
+
+    # ------------------------------------------------------------------
+    # SampleSink (called by the source: sampler thread or receiver thread)
+    # ------------------------------------------------------------------
+
+    def on_loops(self, loops):
+        """Buffer sampling loops; each loop is [(sn, times, caps)]."""
+        for results in loops:
+            # Validate the whole loop before touching any buffer, so a
+            # malformed read can never leave a board's channels uneven.
+            for sn, times, caps in results:
+                n = len(self.board_cap_data[sn])  # KeyError: unknown board
+                if len(times) != n or len(caps) != n:
+                    raise ValueError(
+                        f"board {sn} returned {len(caps)} channels, expected {n}")
+            with self._buf_lock:
+                for sn, times, caps in results:
+                    pending = self._pending[sn]
+                    for idx, key in enumerate(self.board_cap_data[sn]):
+                        t, c = times[idx], caps[idx]
+                        self.board_time_data[sn][key].append(t)
+                        self.board_cap_data[sn][key].append(c)
+                        pending[key][1].append(t)
+                        pending[key][2].append(c)
+                        self.board_produced[sn][key] += 1
+            self.loop_counter += 1
+            if self.loop_counter % HISTORY_SIZE == 0:
+                self._queue.put(self._take_pending())
+
+    def on_read_error(self, sn, message):
+        self._read_error_count += 1
+        # Log the first few, then only occasionally, to avoid flooding the log
+        # if a board goes fully offline.
+        if self._read_error_count <= 5 or self._read_error_count % 100 == 0:
+            self._emit(f"WARN: read failed on board {sn} after retries "
+                       f"(total skips={self._read_error_count}): {message}")
+
+    def on_fatal(self, message):
+        """Sampling died. Save what was received and end the writer."""
+        with self._buf_lock:
+            if self._fatal:
+                return
+            self._fatal = True
+        self._emit(f"ERROR in recording loop: {message}")
+        if self._on_error is not None:
+            try:
+                self._on_error(RuntimeError(message))
+            except Exception:
+                pass
+        self._queue.put(self._take_pending())
+        # The GUI clears recording_all on a fatal error, so stop() may never be
+        # called. End the writer now: left running, its periodic volume/weight
+        # persist would write a LATER session's values into this file.
+        self._queue.put(None)
+
+    def _take_pending(self):
+        """Swap out the pending samples as a batch for the writer.
+
+        Returns {sn: {key: (start_index, times, caps)}}.
+        """
+        with self._buf_lock:
+            batch = {}
+            for sn, chans in self._pending.items():
+                batch[sn] = {}
+                for key, (start, times, caps) in chans.items():
+                    batch[sn][key] = (start, times, caps)
+                    chans[key] = [start + len(times), [], []]
+            return batch
+
+    # ------------------------------------------------------------------
+    # Writer thread
+    # ------------------------------------------------------------------
+
+    def _write_loop(self):
+        while True:
+            try:
+                item = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                item = False
+            done = item is None
+            if item:
+                self._unwritten.append(item)
+            self._drain()
+
+            # Periodically persist volume/weight (wall-clock gated, ~5 min).
+            if (self.measurements_provider is not None
+                    and time.monotonic() - self._last_persist
+                    >= MEASUREMENT_PERSIST_SECONDS):
+                try:
+                    self._flush_measurements()
+                except Exception as e:
+                    self._emit(f"ERROR: volume/weight persist failed: {e}")
+                self._last_persist = time.monotonic()
+
+            if done:
+                return
+
+    def _drain(self):
+        """Write queued batches in order; keep any that fail for a retry."""
+        while self._unwritten:
+            try:
+                self._write_batch(self._unwritten[0])
+            except Exception as e:
+                self._emit(f"ERROR: HDF5 write failed ({len(self._unwritten)} "
+                           f"batch(es) pending, will retry): {e}")
+                return
+            self._unwritten.pop(0)
+
+    def _write_batch(self, batch):
+        """Write one batch to HDF5 (creating datasets on first use).
+
+        Each channel's samples land at [start_index, start_index + n), so
+        rewriting a batch (retry after a partial failure) is idempotent.
+        Channels grow independently, so a board that skipped reads stays
+        correctly sized.
+        """
+        with self._h5_lock, h5py.File(self.filename, "r+") as h5f:
+            for sn, chans in batch.items():
+                for key, (start, times, caps) in chans.items():
+                    group = h5f[f"board_{sn}"][channel_group_path(key)]
+                    if "time_data" not in group:
+                        # dtypes pinned so an empty first batch from an
+                        # offline board doesn't drift to float.
+                        group.create_dataset(
+                            "time_data", shape=(0,), dtype="float64",
+                            chunks=(HISTORY_SIZE,), maxshape=(None,))
+                        group.create_dataset(
+                            "cap_data", shape=(0,), dtype="int64",
+                            chunks=(HISTORY_SIZE,), maxshape=(None,))
+                    n = len(times)
+                    if n:
+                        end = start + n
+                        if group["time_data"].shape[0] < end:
+                            group["time_data"].resize((end,))
+                            group["cap_data"].resize((end,))
+                        group["time_data"][start:end] = times
+                        group["cap_data"][start:end] = caps
+                    self.board_written[sn][key] = max(
+                        self.board_written[sn][key], start + n)
 
     def write_sensor_metadata(self, sensor_id: int, start_time=None, stop_time=None,
                               start_vol=None, stop_vol=None, weight=None, cycle=0,
@@ -520,15 +614,18 @@ class SensorRecorder:
             return None, None
 
         # Get data from the live buffer
-        cap_buffer = self.board_cap_data[sn][key]
-        time_buffer = self.board_time_data[sn][key]
+        # Snapshot under the buffer lock so cap and time stay paired while the
+        # sampler thread appends.
+        with self._buf_lock:
+            cap_buffer = list(self.board_cap_data[sn][key])
+            time_buffer = list(self.board_time_data[sn][key])
 
         if len(cap_buffer) == 0:
             return None, None
 
         # Return the requested number of samples (or all if less than requested)
         n = min(num_samples, len(cap_buffer))
-        cap_data = list(cap_buffer)[-n:]
-        time_data = list(time_buffer)[-n:]
+        cap_data = cap_buffer[-n:]
+        time_data = time_buffer[-n:]
 
         return cap_data, time_data

@@ -2,7 +2,6 @@
 Session control components for starting/stopping recordings.
 """
 import solara
-import asyncio
 import datetime
 import os
 import time
@@ -13,9 +12,9 @@ from utils import state
 from recording.recorder import SensorRecorder, measurement_warnings
 
 
-# Global recorder instance
+# Global recorder instance (its sampler/writer threads run independently of
+# the Solara event loop; see recording/recorder.py).
 current_recorder = None
-recording_task = None
 
 # Active Pi camera client for the current session (None when camera disabled or
 # when the camera failed to start).
@@ -86,7 +85,7 @@ def _start_camera(video_base):
 
 def start_recording():
     """Start a new recording session."""
-    global current_recorder, recording_task
+    global current_recorder
 
     # Clear any previous error
     state.session_error.set("")
@@ -127,30 +126,28 @@ def start_recording():
     # Fresh file -> restart every sensor's recording cycle at 0.
     _reset_sensor_lifecycle()
 
-    # Create recorder instance
-    from components.hardware_status import mpr121_manager
-    if mpr121_manager is None:
-        state.add_log_message("ERROR: MPR121 manager not initialized")
+    # Create recorder instance; samples come from the hardware process.
+    from components import hardware_status
+    client = hardware_status.hw_client
+    if client is None or not client.is_alive():
+        state.add_log_message("ERROR: hardware process not running; "
+                              "initialize hardware first")
         state.set_session("recording_all", False)
         return
 
     current_recorder = SensorRecorder(
-        mpr121_manager=mpr121_manager,
+        mpr121_manager=None,
         filename=full_path,
         controllers=state.i2c_controllers.value,
         measurements_provider=lambda: state.session["sensor_states"],
         two_bottle=state.session["two_bottle"],
+        source=client.source(state.active_channels(), state.MAX_SAMPLE_HZ),
     )
 
-    # Start async recording task
-    async def run_recording():
-        try:
-            await current_recorder.record_sensors(log_callback=state.add_log_message)
-        except Exception as e:
-            state.add_log_message(f"Recording error: {str(e)}")
-            state.set_session("recording_all", False)
-
-    recording_task = asyncio.create_task(run_recording())
+    # Start the sampler/writer threads (off the UI event loop, so rendering
+    # and button handlers can't stall acquisition).
+    current_recorder.start(log_callback=state.add_log_message,
+                           on_error=_on_recorder_error)
 
     # Optionally start concurrent Pi video pre-roll.
     if state.camera_enabled.value:
@@ -222,9 +219,30 @@ def _report_camera_stalls(resp):
         f"the capacitance trace. Check the Pi server log.")
 
 
+def _on_recorder_error(exc):
+    """Called from the sampler thread if it dies on an unexpected exception.
+
+    Samples read so far are still handed to the writer and saved.
+    """
+    state.add_log_message(f"Recording error: {exc}")
+    state.set_session("recording_all", False)
+
+
+def _safe_recorder_write(write, *args, **kwargs):
+    """Run a recorder metadata write during Stop; log failures, never raise.
+
+    A failing disk must not abort stop_recording before the recorder is
+    stopped, or the session could never be stopped.
+    """
+    try:
+        write(*args, **kwargs)
+    except Exception as exc:
+        state.add_log_message(f"ERROR: could not write session metadata: {exc}")
+
+
 def stop_recording():
     """Stop the current recording session."""
-    global current_recorder, recording_task
+    global current_recorder
 
     if not state.recording_all.value:
         state.add_log_message("ERROR: No recording in progress")
@@ -239,7 +257,7 @@ def stop_recording():
         if sensor.is_recording:
             # Write stop time for sensors still recording
             if current_recorder:
-                current_recorder.write_sensor_metadata(
+                _safe_recorder_write(current_recorder.write_sensor_metadata,
                     sensor_id=sensor_id,
                     stop_time=time.time(),
                     cycle=sensor.recording_cycle
@@ -266,7 +284,7 @@ def stop_recording():
         for sensor_id, sensor in sensors.items():
             # Write metadata for each recording cycle
             for cycle in range(sensor.recording_cycle):
-                current_recorder.write_sensor_metadata(
+                _safe_recorder_write(current_recorder.write_sensor_metadata,
                     sensor_id=sensor_id,
                     start_vol=sensor.start_volume,
                     stop_vol=sensor.stop_volume,
@@ -284,15 +302,13 @@ def stop_recording():
 
     # Write comments to file
     if current_recorder and state.comments.value:
-        current_recorder.write_comments(state.comments.value)
+        _safe_recorder_write(current_recorder.write_comments, state.comments.value)
 
-    # Stop the recorder
-    if current_recorder:
-        current_recorder.stop()
-
-    # Cancel the async task
-    if recording_task and not recording_task.done():
-        recording_task.cancel()
+    # Stop the recorder. Blocks until every sample read is on disk (the final
+    # partial batch used to be discarded here).
+    if current_recorder and not current_recorder.stop():
+        state.add_log_message(
+            "ERROR: recorder did not finish writing all data to disk")
 
     # Stop the camera and copy its files back in a background thread so GUI
     # doesn't block during multi-MB file transfer.
