@@ -740,17 +740,115 @@ def ml_algorithm(data_by_animal, filtered_h5f, logfile, checkpoint=None, nets=No
     return False
 
 
-def compute_bout_structure(lick_times, ibi_threshold=0.25, min_licks=3):
+def compute_lick_durations(trace, times, lick_indices, *, rel_height=0.5, wlen=41,
+                           max_gap=0.05, max_duration=1. / 6.):
+    """Measure how long each detected lick keeps the capacitance down.
+
+    Scientific idea
+    ---------------
+    A lick pulls the sipper capacitance into a roughly square dip. Its duration
+    is the dip's width at `rel_height` of its depth (0.5 = half depth), measured
+    between linearly interpolated crossing points so it is not limited to whole
+    samples. Measuring relative to each dip's own depth keeps durations
+    comparable across animals, sensors and CDT settings whose dips differ several
+    fold in absolute counts (checked on ACG-26-3 / ACG-26-5: ~40 ms medians for
+    dips 20-350 counts deep).
+
+    The dip's baseline is found within `wlen` samples centred on the lick (about
+    +-180 ms at ~110 Hz, enough to reach the baseline between licks at 6-10 Hz).
+    Without that window the search can run across the whole trace and use a
+    far-away outlier spike as the baseline.
+
+    Sampling is non-uniform, so crossing positions are converted to seconds
+    through `times`, never through an assumed rate. A lick gets NaN when:
+      - a gap between samples inside its span is >= `max_gap` s (a recording
+        stall would otherwise read as a long lick), or
+      - it lasts >= `max_duration` s (the same limit lick detection uses), or
+      - the dip has no measurable depth.
+    NaN keeps the outputs index-aligned with `lick_indices`.
+
+    Resolution caveat: at ~110 Hz most dips span only 2-5 samples, so absolute
+    durations shift with `rel_height` (~30/39/48 ms medians at 0.25/0.5/0.75).
+    Compare durations measured with the same setting.
+
+    The crossing times themselves are returned as each lick's start ('lick_onsets')
+    and end ('lick_offsets'), in the units of `times`. They are the better lick
+    start: the detected lick time is the dip's deepest sample, which comes after
+    the tongue has already made contact. Onsets/offsets are kept even when the
+    duration is NaN for a gap or length (they are still the best estimate there);
+    they are NaN only when the dip has no measurable depth.
+
+    Returns {'lick_durations': seconds, 'lick_depths': capacitance counts,
+    'lick_onsets', 'lick_offsets'}, all float arrays the same length and order as
+    `lick_indices`.
+    """
+    from scipy.signal import peak_prominences, peak_widths
+    import warnings
+
+    li = np.asarray(lick_indices, dtype=np.int64).ravel()
+    durations = np.full(li.shape, np.nan)
+    depths = np.full(li.shape, np.nan)
+    onsets = np.full(li.shape, np.nan)
+    offsets = np.full(li.shape, np.nan)
+    if li.size == 0:
+        return {'lick_durations': durations, 'lick_depths': depths,
+                'lick_onsets': onsets, 'lick_offsets': offsets}
+    neg = -np.asarray(trace, dtype=float)
+    times = np.asarray(times, dtype=float)
+    n = neg.size
+
+    # Snap each index to the deepest sample within +-3 samples. Basic threshold
+    # indices are already the minimum; ML/hilbert indices can sit on the edge.
+    lo = np.clip(li - 3, 0, n - 1)
+    offs = np.arange(7)
+    win = np.clip(lo[:, None] + offs[None, :], 0, n - 1)
+    peaks = win[np.arange(li.size), np.argmax(neg[win], axis=1)]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # zero-prominence peaks -> handled below
+        prom = peak_prominences(neg, peaks, wlen=wlen)[0]
+        _w, _h, left, right = peak_widths(neg, peaks, rel_height=rel_height, wlen=wlen)
+
+    idx = np.arange(n)
+    t_left = np.interp(left, idx, times)
+    t_right = np.interp(right, idx, times)
+    dur = t_right - t_left
+
+    # Largest sampling interval inside each span (from the sample before the
+    # left crossing to the sample after the right one).
+    dt = np.diff(times)
+    a = np.clip(np.floor(left).astype(np.int64), 0, n - 1)
+    b = np.clip(np.ceil(right).astype(np.int64), 0, n - 1)
+    max_dt = np.array([dt[i:j].max() if j > i else 0.0 for i, j in zip(a, b)])
+
+    ok = (prom > 0) & (max_dt < max_gap) & (dur < max_duration)
+    durations[ok] = dur[ok]
+    has_dip = prom > 0
+    depths[has_dip] = prom[has_dip]
+    onsets[has_dip] = t_left[has_dip]
+    offsets[has_dip] = t_right[has_dip]
+    return {'lick_durations': durations, 'lick_depths': depths,
+            'lick_onsets': onsets, 'lick_offsets': offsets}
+
+
+def compute_bout_structure(lick_times, ibi_threshold=0.25, min_licks=3, lick_durations=None):
     """Compute ILIs and bout structure from an array of lick timestamps.
     A bout requires >= min_licks licks with all consecutive ILIs < ibi_threshold (seconds).
-    Returned ILIs are within-bout only."""
+    Returned ILIs are within-bout only.
+
+    If `lick_durations` (aligned with lick_times, NaN = unmeasurable) is given,
+    also returns 'bout_median_lick_durations': the median measurable lick
+    duration in each bout (NaN if none were measurable)."""
     if len(lick_times) < min_licks:
-        return {
+        out = {
             'ILIs': np.array([]),
             'bout_lick_counts': np.array([], dtype=int),
             'bout_durations': np.array([]),
             'bout_start_times': np.array([]),
         }
+        if lick_durations is not None:
+            out['bout_median_lick_durations'] = np.array([])
+        return out
     all_ILIs = np.diff(lick_times)
     bout_boundaries = np.where(all_ILIs >= ibi_threshold)[0]
     bout_start_idxs = np.r_[0, bout_boundaries + 1]
@@ -763,12 +861,21 @@ def compute_bout_structure(lick_times, ibi_threshold=0.25, min_licks=3):
     lick_counts = lick_counts[valid]
 
     within_ILIs = [all_ILIs[s:e] for s, e in zip(bout_start_idxs, bout_end_idxs)]
-    return {
+    out = {
         'ILIs': np.concatenate(within_ILIs) if within_ILIs else np.array([]),
         'bout_lick_counts': lick_counts.astype(int),
         'bout_durations': lick_times[bout_end_idxs] - lick_times[bout_start_idxs],
         'bout_start_times': lick_times[bout_start_idxs],
     }
+    if lick_durations is not None:
+        durs = np.asarray(lick_durations, dtype=float)
+        meds = []
+        for s, e in zip(bout_start_idxs, bout_end_idxs):
+            d = durs[s:e + 1]
+            d = d[np.isfinite(d)]
+            meds.append(float(np.median(d)) if d.size else np.nan)
+        out['bout_median_lick_durations'] = np.array(meds, dtype=float)
+    return out
 
 
 def save_filtered_data(data, animal, filtered_h5f, logfile):
@@ -788,12 +895,28 @@ def save_filtered_data(data, animal, filtered_h5f, logfile):
             lf.write(f"Caught KeyError {e}, no licks recorded for {animal}\n")
         print(f'Caught KeyError {e}, no licks recorded for {animal}')
         missing_data = True
+    lick_durations = None
     try:
-        metrics = compute_bout_structure(data['lick_times'], ibi_threshold=1., min_licks=2)
+        # Per-lick duration/depth, index-aligned with lick_indices (NaN = unmeasurable).
+        lk = compute_lick_durations(data['cap_data'], data['time_data'], data['lick_indices'])
+        grp.create_dataset('lick_durations', data=lk['lick_durations'])
+        grp.create_dataset('lick_depths', data=lk['lick_depths'])
+        grp.create_dataset('lick_onsets', data=lk['lick_onsets'])
+        grp.create_dataset('lick_offsets', data=lk['lick_offsets'])
+        lick_durations = lk['lick_durations']
+    except Exception as e:
+        with open(logfile, 'a') as lf:
+            lf.write(f"Warning: could not measure lick durations for {animal}: {e}\n")
+    try:
+        metrics = compute_bout_structure(data['lick_times'], ibi_threshold=1., min_licks=2,
+                                         lick_durations=lick_durations)
         grp.create_dataset('ILIs', data=metrics['ILIs'])
         grp.create_dataset('bout_lick_counts', data=metrics['bout_lick_counts'])
         grp.create_dataset('bout_durations', data=metrics['bout_durations'])
         grp.create_dataset('bout_start_times', data=metrics['bout_start_times'])
+        if 'bout_median_lick_durations' in metrics:
+            grp.create_dataset('bout_median_lick_durations',
+                               data=metrics['bout_median_lick_durations'])
     except Exception as e:
         with open(logfile, 'a') as lf:
             lf.write(f"Warning: could not save supplementary metrics for {animal}: {e}\n")
